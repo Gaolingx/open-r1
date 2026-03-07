@@ -9,7 +9,7 @@ from typing import Any
 
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.utilities import rank_zero_only
 
 from lightning_grpo.configs.base import CheckpointConfig, ExperimentConfig, LoggingConfig
@@ -149,6 +149,34 @@ class PeriodicSampleGenerationCallback(Callback):
             )
 
 
+class NaNLossCallback(Callback):
+    """Immediately stop training when a NaN or Inf loss is detected."""
+
+    def on_train_batch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        """Stop training when the batch loss becomes non-finite."""
+
+        loss = None
+        if isinstance(outputs, torch.Tensor):
+            loss = outputs
+        elif isinstance(outputs, dict) and "loss" in outputs:
+            loss = outputs["loss"]
+
+        if loss is not None and not torch.isfinite(loss):
+            print(
+                f"\n[NaNLossCallback] Non-finite loss detected at "
+                f"step {trainer.global_step} (batch_idx={batch_idx}): {loss.item():.6f}. "
+                f"Stopping training."
+            )
+            trainer.should_stop = True
+
+
 class ConfigSnapshotCallback(Callback):
     """Persist the resolved experiment config next to checkpoints."""
 
@@ -189,6 +217,7 @@ def build_callbacks(config: ExperimentConfig) -> list[Callback]:
         LearningRateMonitor(logging_interval="step"),
         TrainingStateCallback(),
         EfficiencyMonitorCallback(log_every_n_steps=config.logging.log_every_n_steps),
+        NaNLossCallback(),
         ConfigSnapshotCallback(config),
     ]
     if config.logging.sample_every_n_steps > 0 and config.logging.sample_prompts:
