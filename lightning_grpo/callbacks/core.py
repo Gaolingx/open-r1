@@ -12,7 +12,7 @@ import torch
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.utilities import rank_zero_only
 
-from lightning_grpo.configs.base import CheckpointConfig, ExperimentConfig, LoggingConfig
+from lightning_grpo.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
 from lightning_grpo.utils.modeling import load_tokenizer
 
 
@@ -209,6 +209,27 @@ def build_checkpoint_callback(checkpoint_config: CheckpointConfig) -> ModelCheck
     )
 
 
+def build_early_stopping_callback(
+    early_stopping_config: EarlyStoppingConfig,
+    checkpoint_config: CheckpointConfig,
+) -> EarlyStopping | None:
+    """Create an early stopping callback when the feature is enabled."""
+
+    if not early_stopping_config.enabled:
+        return None
+
+    return EarlyStopping(
+        monitor=early_stopping_config.monitor or checkpoint_config.monitor,
+        mode=early_stopping_config.mode or checkpoint_config.mode,
+        patience=max(0, early_stopping_config.patience),
+        min_delta=early_stopping_config.min_delta,
+        check_finite=early_stopping_config.check_finite,
+        stopping_threshold=early_stopping_config.stopping_threshold,
+        divergence_threshold=early_stopping_config.divergence_threshold,
+        verbose=early_stopping_config.verbose,
+    )
+
+
 def build_callbacks(config: ExperimentConfig) -> list[Callback]:
     """Build the callback stack for Lightning training."""
 
@@ -220,6 +241,9 @@ def build_callbacks(config: ExperimentConfig) -> list[Callback]:
         NaNLossCallback(),
         ConfigSnapshotCallback(config),
     ]
+    early_stopping_callback = build_early_stopping_callback(config.early_stopping, config.checkpoint)
+    if early_stopping_callback is not None:
+        callbacks.append(early_stopping_callback)
     if config.logging.sample_every_n_steps > 0 and config.logging.sample_prompts:
         callbacks.append(
             PeriodicSampleGenerationCallback(

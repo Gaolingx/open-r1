@@ -6,6 +6,7 @@ from lightning_grpo.callbacks.core import (
     PeriodicSampleGenerationCallback,
     TrainingStateCallback,
     build_callbacks,
+    build_early_stopping_callback,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "PeriodicSampleGenerationCallback",
     "TrainingStateCallback",
     "build_callbacks",
+    "build_early_stopping_callback",
 ]

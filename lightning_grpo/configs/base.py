@@ -133,6 +133,21 @@ class CheckpointConfig:
 
 
 @dataclass
+class EarlyStoppingConfig:
+    """Early stopping behavior for monitored metrics."""
+
+    enabled: bool = False
+    monitor: Optional[str] = None
+    mode: Optional[Literal["min", "max"]] = None
+    patience: int = 3
+    min_delta: float = 0.0
+    check_finite: bool = True
+    stopping_threshold: Optional[float] = None
+    divergence_threshold: Optional[float] = None
+    verbose: bool = False
+
+
+@dataclass
 class DistributedConfig:
     """Distributed strategy configuration for Lightning."""
 
@@ -160,6 +175,7 @@ class ExperimentConfig:
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
 
     def to_dict(self) -> dict[str, Any]:
