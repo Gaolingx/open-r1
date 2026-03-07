@@ -1,0 +1,68 @@
+task: sft
+seed: 42
+output_dir: outputs/lightning_sft_demo
+
+precision:
+  parameter_dtype: bf16
+  trainer_precision: bf16-mixed
+
+model:
+  model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+  use_lora: true
+  gradient_checkpointing: true
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+data:
+  dataset_name: open-r1/Mixture-of-Thoughts
+  dataset_config: all
+  train_split: train
+  val_split: test
+  prompt_column: prompt
+  response_column: response
+  max_seq_length: 4096
+  num_workers: 4
+  preprocessing_batch_size: 128
+  mask_prompt_labels: true
+
+optimization:
+  optimizer: adamw
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  scheduler: cosine
+  max_epochs: 1
+  gradient_accumulation_steps: 8
+  gradient_clip_val: 1.0
+  train_micro_batch_size: 1
+  eval_micro_batch_size: 1
+
+logging:
+  project: open-r1-lightning
+  run_name: sft-demo
+  enable_csv: true
+  enable_wandb: false
+  log_every_n_steps: 10
+  sample_every_n_steps: 200
+  sample_prompts:
+    - Solve: What is 12 * 13?
+    - Explain why the derivative of x^2 is 2x.
+
+checkpoint:
+  dirpath: outputs/lightning_sft_demo/checkpoints
+  monitor: val/loss
+  mode: min
+  save_top_k: 2
+  save_last: true
+  every_n_train_steps: 200
+
+distributed:
+  strategy: ddp
+  accelerator: gpu
+  devices: 8
+  num_nodes: 1
+  sync_batchnorm: false

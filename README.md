@@ -3,18 +3,40 @@
 *A fully open reproduction of DeepSeek-R1. This repo is a work in progress, let's build it together!*
 
 **Table of Contents**  
-1. [Overview](#overview)  
-2. [Plan of attack](#plan-of-attack)  
-3. [Installation](#installation)  
-4. [Training models](#training-models)  
-   - [SFT](#sft)  
-   - [GRPO](#grpo)  
-5. [Evaluating models](#evaluating-models)  
-6. [Reproducing Deepseek's evaluation results](#reproducing-deepseeks-evaluation-results)  
-7. [Data generation](#data-generation)  
-   - [Generate data from a smol distilled R1 model](#generate-data-from-a-smol-distilled-r1-model)  
-   - [Generate data from DeepSeek-R1](#generate-data-from-deepseek-r1)  
-8. [Contributing](#contributing)
+- [Open R1](#open-r1)
+  - [Overview](#overview)
+    - [Plan of attack](#plan-of-attack)
+  - [News 🗞️](#news-️)
+  - [Installation](#installation)
+  - [Training models](#training-models)
+    - [Lightning training pipeline](#lightning-training-pipeline)
+    - [SFT distillation](#sft-distillation)
+    - [GRPO](#grpo)
+      - [GRPO dataset filtering](#grpo-dataset-filtering)
+      - [👨‍💻 Training with a code interpreter](#-training-with-a-code-interpreter)
+        - [E2B Provider](#e2b-provider)
+        - [Morph Provider](#morph-provider)
+        - [Dataset Requirements](#dataset-requirements)
+        - [Using Router Services](#using-router-services)
+      - [Competitive Programming problems: IOI \& CodeForces](#competitive-programming-problems-ioi--codeforces)
+        - [Piston](#piston)
+        - [Morph](#morph)
+        - [Example recipes](#example-recipes)
+    - [Launching jobs on a Slurm cluster](#launching-jobs-on-a-slurm-cluster)
+    - [Customising the dataset mixture](#customising-the-dataset-mixture)
+  - [Evaluating models](#evaluating-models)
+  - [Reproducing Deepseek's evaluation results](#reproducing-deepseeks-evaluation-results)
+    - [AIME 2024](#aime-2024)
+    - [MATH-500](#math-500)
+    - [GPQA Diamond](#gpqa-diamond)
+    - [LiveCodeBench](#livecodebench)
+  - [Data generation](#data-generation)
+    - [Generate data from a smol distilled R1 model](#generate-data-from-a-smol-distilled-r1-model)
+    - [Generate data from DeepSeek-R1](#generate-data-from-deepseek-r1)
+    - [Data decontamination](#data-decontamination)
+  - [Contributing](#contributing)
+  - [Acknowledgements](#acknowledgements)
+  - [Citation](#citation)
 
 ## Overview
 
@@ -130,6 +152,44 @@ Currently, the following tasks are supported:
 
 * Supervised Fine-Tuning `sft`
 * Group Relative Policy Optimization `grpo`
+
+### Lightning training pipeline
+
+We also provide a PyTorch Lightning reference pipeline under [`lightning_grpo/`](lightning_grpo) for users who prefer a modular trainer stack with explicit data modules, Lightning modules, and callbacks.
+
+The package is organized as follows:
+
+- [`lightning_grpo/configs/`](lightning_grpo/configs): typed dataclass configs for SFT, GRPO, optimization, precision, LoRA, and distributed training.
+- [`lightning_grpo/data/`](lightning_grpo/data): dataset loading, chat formatting, tokenization, SFT batching, and GRPO prompt rollout preparation.
+- [`lightning_grpo/models/`](lightning_grpo/models): Lightning modules for decoder-only SFT and GRPO optimization.
+- [`lightning_grpo/callbacks/`](lightning_grpo/callbacks): checkpointing, efficiency monitoring, config snapshotting, and periodic sample generation.
+- [`lightning_grpo/strategies/`](lightning_grpo/strategies): DDP and FSDP strategy builders for multi-GPU execution.
+- [`lightning_grpo/scripts/`](lightning_grpo/scripts): runnable entrypoints for SFT and GRPO jobs.
+- [`lightning_grpo/examples/`](lightning_grpo/examples): example YAML configs for LoRA+DDP SFT and full-parameter+FSDP GRPO.
+
+Key features in the Lightning pipeline:
+
+- Supports both LoRA and full-parameter fine-tuning.
+- Supports multi-GPU training with DDP and FSDP.
+- Uses callbacks for checkpointing, throughput logging, config snapshotting, and sample inspection.
+- Keeps configuration modular so SFT and GRPO can share model, tokenizer, logging, and optimizer utilities.
+
+Example commands:
+
+```shell
+# SFT with LoRA + DDP
+python lightning_grpo/scripts/train_sft.py --config lightning_grpo/examples/sft_lora_ddp.yaml
+
+# GRPO with full fine-tuning + FSDP
+python lightning_grpo/scripts/train_grpo.py --config lightning_grpo/examples/grpo_full_fsdp.yaml
+```
+
+Notes for the Lightning pipeline:
+
+- [`lightning_grpo/examples/sft_lora_ddp.yaml`](lightning_grpo/examples/sft_lora_ddp.yaml) demonstrates adapter tuning with DDP.
+- [`lightning_grpo/examples/grpo_full_fsdp.yaml`](lightning_grpo/examples/grpo_full_fsdp.yaml) demonstrates full-parameter GRPO with FSDP sharding.
+- The callback stack is assembled in [`build_callbacks()`](lightning_grpo/callbacks/core.py:153) and the trainer is created in [`build_trainer()`](lightning_grpo/utils/trainer.py:27).
+- The distributed strategy objects are created by [`build_strategy()`](lightning_grpo/strategies/factory.py:23).
 
 > [!TIP]
 > If you scale up/down the number of GPUs, we recommend also scaling up the per-device batch size or number of gradient accumulation steps to keep the global batch size constant.

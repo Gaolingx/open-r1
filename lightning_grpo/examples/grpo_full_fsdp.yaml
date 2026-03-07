@@ -1,0 +1,76 @@
+task: grpo
+seed: 42
+output_dir: outputs/lightning_grpo_demo
+
+precision:
+  parameter_dtype: bf16
+  trainer_precision: bf16-mixed
+
+model:
+  model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+  use_lora: false
+  gradient_checkpointing: true
+
+data:
+  dataset_name: open-r1/OpenR1-Math-220k
+  train_split: train
+  prompt_column: problem
+  response_column: solution
+  max_seq_length: 2048
+  num_workers: 4
+  preprocessing_batch_size: 64
+
+optimization:
+  optimizer: adamw
+  learning_rate: 1.0e-6
+  weight_decay: 0.0
+  warmup_steps: 50
+  scheduler: cosine
+  max_epochs: 1
+  gradient_accumulation_steps: 4
+  gradient_clip_val: 1.0
+  train_micro_batch_size: 1
+  eval_micro_batch_size: 1
+
+reward:
+  reward_funcs: [accuracy, format, tag_count]
+  cosine_min_value_wrong: 0.0
+  cosine_max_value_wrong: -0.5
+  cosine_min_value_correct: 0.5
+  cosine_max_value_correct: 1.0
+  cosine_max_len: 1000
+
+rollout:
+  num_generations: 4
+  max_prompt_length: 1024
+  max_completion_length: 512
+  temperature: 0.8
+  top_p: 0.95
+  kl_beta: 0.04
+  use_reference_model: true
+
+logging:
+  project: open-r1-lightning
+  run_name: grpo-demo
+  enable_csv: true
+  enable_wandb: false
+  log_every_n_steps: 5
+  sample_every_n_steps: 50
+  sample_prompts:
+    - If x + 4 = 10, what is x?
+
+checkpoint:
+  dirpath: outputs/lightning_grpo_demo/checkpoints
+  monitor: train/reward
+  mode: max
+  save_top_k: 2
+  save_last: true
+  every_n_train_steps: 100
+
+distributed:
+  strategy: fsdp
+  accelerator: gpu
+  devices: 8
+  num_nodes: 1
+  fsdp_activation_checkpointing: true
+  fsdp_sharding_strategy: FULL_SHARD
