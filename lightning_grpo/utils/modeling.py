@@ -79,7 +79,12 @@ def _apply_lora_if_needed(model: PreTrainedModel, model_config: ModelConfig) -> 
         modules_to_save=model_config.lora.modules_to_save or None,
         task_type=TaskType.CAUSAL_LM,
     )
-    return get_peft_model(model, lora_config)
+    model = get_peft_model(model, lora_config)
+
+    if model_config.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
+    return model
 
 
 def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig) -> PreTrainedModel:
@@ -96,6 +101,8 @@ def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig)
 
     if model_config.gradient_checkpointing:
         model.gradient_checkpointing_enable()
+        if hasattr(model, "config"):
+            model.config.use_cache = False
 
     _freeze_embeddings_if_needed(model, model_config.freeze_embeddings)
     model = _apply_lora_if_needed(model, model_config)
