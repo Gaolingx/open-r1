@@ -30,6 +30,16 @@ class GRPOLightningModule(L.LightningModule):
 
         self.tokenizer = load_tokenizer(config.model)
         self.reward_funcs = get_reward_funcs(self._build_reward_script_args())
+        reward_weights = config.reward.reward_weights
+        if reward_weights is not None:
+            if len(reward_weights) != len(self.reward_funcs):
+                raise ValueError(
+                    f"Number of reward weights ({len(reward_weights)}) must match number of reward functions ({len(self.reward_funcs)})"
+                )
+            reward_weight_tensor = torch.tensor(reward_weights, dtype=torch.float32)
+        else:
+            reward_weight_tensor = torch.ones(len(self.reward_funcs), dtype=torch.float32)
+        self.register_buffer("reward_weights", reward_weight_tensor, persistent=False)
         self.save_hyperparameters(config.to_dict())
 
         trainable, total = count_trainable_parameters(self.policy)
@@ -122,6 +132,17 @@ class GRPOLightningModule(L.LightningModule):
         structured_completions = [[{"role": "assistant", "content": text}] for text in completion_texts]
         return completion_texts, structured_completions, completion_id_lists
 
+    def _gather_tensor_for_metrics(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gather same-shaped tensors across ranks for exact distributed metrics."""
+
+        if self.trainer is None or getattr(self.trainer, "world_size", 1) <= 1:
+            return tensor
+
+        gathered = self.all_gather(tensor)
+        if tensor.dim() == 0:
+            return gathered.reshape(-1)
+        return gathered.reshape(-1, *tensor.shape[1:])
+
     @torch.no_grad()
     def _generate(self, batch: dict[str, Any]) -> dict[str, torch.Tensor | list[Any]]:
         """Generate grouped completions for online GRPO optimization."""
@@ -171,11 +192,18 @@ class GRPOLightningModule(L.LightningModule):
             logits_to_keep,
         )
 
+        completion_truncated = torch.tensor(
+            [len(ids) == 0 or ids[-1] != self.tokenizer.eos_token_id for ids in completion_id_lists],
+            device=completion_ids.device,
+            dtype=torch.bool,
+        )
+
         return {
             "prompt_ids": repeated_prompt_ids,
             "prompt_mask": repeated_prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
+            "completion_truncated": completion_truncated,
             "old_per_token_logps": old_per_token_logps,
             "prompts": repeated_prompts,
             "completions_text": completion_texts,
@@ -212,12 +240,12 @@ class GRPOLightningModule(L.LightningModule):
                 completion_ids=completion_id_lists,
                 **reward_kwargs,
             )
-            reward_tensor = torch.as_tensor(reward_values, device=self.device, dtype=torch.float32)
-            reward_tensor = torch.nan_to_num(reward_tensor, nan=0.0)
+            reward_values = [value if value is not None else torch.nan for value in reward_values]
+            reward_tensor = torch.tensor(reward_values, device=self.device, dtype=torch.float32)
             reward_matrix.append(reward_tensor)
 
         rewards_per_func = torch.stack(reward_matrix, dim=-1)
-        rewards = rewards_per_func.sum(dim=-1)
+        rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=-1)
         return rewards, rewards_per_func
 
     def _compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
@@ -238,6 +266,7 @@ class GRPOLightningModule(L.LightningModule):
         completion_ids = rollout_batch["completion_ids"]
         completion_mask = rollout_batch["completion_mask"]
         old_per_token_logps = rollout_batch["old_per_token_logps"]
+        completion_truncated = rollout_batch["completion_truncated"]
 
         model_input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
@@ -265,8 +294,13 @@ class GRPOLightningModule(L.LightningModule):
             completion_id_lists=rollout_batch["completion_id_lists"],
             metadata=rollout_batch["metadata"],
         )
-        advantages = self._compute_advantages(rewards)
-        advantages = advantages.unsqueeze(1)
+        global_rewards_per_func = self._gather_tensor_for_metrics(rewards_per_func.detach())
+        global_rewards = global_rewards_per_func.sum(dim=-1)
+        global_advantages = self._compute_advantages(global_rewards)
+
+        local_batch_size = rewards.shape[0]
+        rank = getattr(self, "global_rank", 0)
+        advantages = global_advantages[rank * local_batch_size : (rank + 1) * local_batch_size].unsqueeze(1)
 
         log_ratio = per_token_logps - old_per_token_logps
         importance_ratio = torch.exp(log_ratio)
@@ -288,37 +322,47 @@ class GRPOLightningModule(L.LightningModule):
         with torch.no_grad():
             entropy = entropy_from_logits(logits)
             completion_lengths = completion_mask.sum(dim=1).float()
-            clipped_sequences = (completion_ids[:, -1] != self.tokenizer.eos_token_id).to(torch.float32)
-            terminated_lengths = completion_lengths[clipped_sequences == 0]
+            global_reward_group_std = global_rewards.view(-1, self.config.rollout.num_generations).std(dim=1)
+
+            global_loss_mask = self._gather_tensor_for_metrics(loss_mask.detach())
+            global_per_token_kl = self._gather_tensor_for_metrics(per_token_kl.detach())
+            global_entropy = self._gather_tensor_for_metrics(entropy.detach())
+            global_completion_lengths = self._gather_tensor_for_metrics(completion_lengths.detach())
+            global_completion_truncated = self._gather_tensor_for_metrics(completion_truncated.to(torch.float32))
+
+            terminated_lengths = global_completion_lengths[global_completion_truncated == 0]
             if terminated_lengths.numel() == 0:
-                terminated_lengths = completion_lengths.new_zeros(1)
+                terminated_lengths = global_completion_lengths.new_zeros(1)
 
             is_low_clipped = (importance_ratio < 1.0 - clip_eps) & (advantages < 0)
             is_high_clipped = (importance_ratio > 1.0 + clip_eps) & (advantages > 0)
             is_region_clipped = is_low_clipped | is_high_clipped
+            global_is_low_clipped = self._gather_tensor_for_metrics(is_low_clipped.to(per_token_logps.dtype))
+            global_is_high_clipped = self._gather_tensor_for_metrics(is_high_clipped.to(per_token_logps.dtype))
+            global_is_region_clipped = self._gather_tensor_for_metrics(is_region_clipped.to(per_token_logps.dtype))
 
         metrics = {
-            "reward": rewards.mean(),
-            "reward_std": rewards.std(unbiased=False),
-            "advantage_mean": advantages.mean(),
-            "advantage_std": advantages.std(unbiased=False),
-            "frac_reward_zero_std": (rewards.view(-1, self.config.rollout.num_generations).std(dim=1) < 1.0e-6).float().mean(),
-            "kl": masked_mean(per_token_kl, loss_mask),
-            "entropy": masked_mean(entropy, loss_mask),
-            "completion_length": completion_lengths.mean(),
-            "completion_length_min": completion_lengths.min(),
-            "completion_length_max": completion_lengths.max(),
-            "completion_clipped_ratio": clipped_sequences.mean(),
+            "reward": global_rewards.mean(),
+            "reward_std": global_rewards.std(unbiased=False),
+            "advantage_mean": global_advantages.mean(),
+            "advantage_std": global_advantages.std(unbiased=False),
+            "frac_reward_zero_std": (global_reward_group_std < 1.0e-6).float().mean(),
+            "kl": masked_mean(global_per_token_kl, global_loss_mask),
+            "entropy": masked_mean(global_entropy, global_loss_mask),
+            "completion_length": global_completion_lengths.mean(),
+            "completion_length_min": global_completion_lengths.min(),
+            "completion_length_max": global_completion_lengths.max(),
+            "completion_clipped_ratio": global_completion_truncated.mean(),
             "terminated_length_mean": terminated_lengths.mean(),
             "terminated_length_min": terminated_lengths.min(),
             "terminated_length_max": terminated_lengths.max(),
-            "clip_ratio_low": masked_mean(is_low_clipped.to(per_token_logps.dtype), loss_mask),
-            "clip_ratio_high": masked_mean(is_high_clipped.to(per_token_logps.dtype), loss_mask),
-            "clip_ratio_region": masked_mean(is_region_clipped.to(per_token_logps.dtype), loss_mask),
+            "clip_ratio_low": masked_mean(global_is_low_clipped, global_loss_mask),
+            "clip_ratio_high": masked_mean(global_is_high_clipped, global_loss_mask),
+            "clip_ratio_region": masked_mean(global_is_region_clipped, global_loss_mask),
         }
         for index, reward_name in enumerate(self.config.reward.reward_funcs):
-            metrics[f"reward/{reward_name}"] = rewards_per_func[:, index].mean()
-            metrics[f"reward_std/{reward_name}"] = rewards_per_func[:, index].std(unbiased=False)
+            metrics[f"reward/{reward_name}"] = global_rewards_per_func[:, index].mean()
+            metrics[f"reward_std/{reward_name}"] = global_rewards_per_func[:, index].std(unbiased=False)
 
         return loss, metrics
 

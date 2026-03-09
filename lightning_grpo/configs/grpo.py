@@ -13,6 +13,7 @@ class RewardConfig:
     """Reward function configuration for GRPO."""
 
     reward_funcs: list[str] = field(default_factory=lambda: ["accuracy", "format", "tag_count"])
+    reward_weights: list[float] | None = None
     code_language: str = "python"
     repetition_n_grams: int = 3
     repetition_max_penalty: float = -1.0
