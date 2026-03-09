@@ -295,7 +295,9 @@ class GRPOLightningModule(L.LightningModule):
             metadata=rollout_batch["metadata"],
         )
         global_rewards_per_func = self._gather_tensor_for_metrics(rewards_per_func.detach())
-        global_rewards = global_rewards_per_func.sum(dim=-1)
+        global_rewards = (
+            global_rewards_per_func * self.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)
+        ).nansum(dim=-1)
         global_advantages = self._compute_advantages(global_rewards)
 
         local_batch_size = rewards.shape[0]
