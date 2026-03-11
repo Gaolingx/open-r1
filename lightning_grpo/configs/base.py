@@ -157,9 +157,12 @@ class DistributedConfig:
     accelerator: Literal["auto", "gpu", "cpu"] = "auto"
     sync_batchnorm: bool = False
     find_unused_parameters: bool = False
+    gradient_as_bucket_view: bool = True
     fsdp_cpu_offload: bool = False
     fsdp_activation_checkpointing: bool = True
     fsdp_sharding_strategy: Literal["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"] = "FULL_SHARD"
+    fsdp_auto_wrap_policy_classes: list[str] = field(default_factory=list)
+    fsdp_activation_checkpointing_policy_classes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -227,7 +230,7 @@ class ExperimentConfig:
                 kwargs[field_info.name] = None
                 continue
             if field_info.default is not MISSING and is_dataclass(field_info.default) and isinstance(value, dict):
-                kwargs[field_info.name] = type(field_info.default)(**value)
+                kwargs[field_info.name] = cls._coerce_value(field_info.type, value)
                 continue
             kwargs[field_info.name] = cls._coerce_value(field_info.type, value)
         return cls(**kwargs)

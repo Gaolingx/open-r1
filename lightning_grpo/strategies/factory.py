@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from importlib import import_module
 from typing import Any
 
 import torch
 from lightning.pytorch.strategies import DDPStrategy, FSDPStrategy
 from torch.distributed.fsdp import BackwardPrefetch, CPUOffload, ShardingStrategy
+from torch.nn import Module
 
 from lightning_grpo.configs.base import DistributedConfig
 
@@ -22,6 +24,31 @@ def _resolve_sharding_strategy(name: str) -> ShardingStrategy:
     if name not in mapping:
         raise ValueError(f"Unsupported FSDP sharding strategy: {name}")
     return mapping[name]
+
+
+def _import_module_class(path: str) -> type[Module]:
+    """Import a module class from a fully-qualified dotted path."""
+
+    module_path, _, class_name = path.rpartition(".")
+    if not module_path or not class_name:
+        raise ValueError(
+            "FSDP policy class paths must be fully-qualified, for example "
+            "`transformers.models.llama.modeling_llama.LlamaDecoderLayer`."
+        )
+
+    module = import_module(module_path)
+    class_object = getattr(module, class_name)
+    if not isinstance(class_object, type) or not issubclass(class_object, Module):
+        raise TypeError(f"FSDP policy target must be a torch.nn.Module subclass: {path}")
+    return class_object
+
+
+def _resolve_policy_classes(class_paths: list[str]) -> set[type[Module]] | None:
+    """Resolve YAML-configured class paths into an FSDP policy set."""
+
+    if not class_paths:
+        return None
+    return {_import_module_class(class_path) for class_path in class_paths}
 
 
 def resolve_parallel_devices(
@@ -59,12 +86,21 @@ def build_strategy(
         return DDPStrategy(
             parallel_devices=resolve_parallel_devices(resolved_accelerator, resolved_devices),
             find_unused_parameters=config.find_unused_parameters,
+            gradient_as_bucket_view=config.gradient_as_bucket_view,
         )
     if config.strategy == "fsdp":
+        auto_wrap_policy = _resolve_policy_classes(config.fsdp_auto_wrap_policy_classes)
+        activation_checkpointing_policy = None
+        if config.fsdp_activation_checkpointing:
+            activation_checkpointing_policy = _resolve_policy_classes(
+                config.fsdp_activation_checkpointing_policy_classes
+            )
+
         return FSDPStrategy(
             parallel_devices=resolve_parallel_devices(resolved_accelerator, resolved_devices),
             cpu_offload=CPUOffload(offload_params=config.fsdp_cpu_offload),
-            activation_checkpointing_policy=set(),
+            auto_wrap_policy=auto_wrap_policy,
+            activation_checkpointing_policy=activation_checkpointing_policy,
             sharding_strategy=_resolve_sharding_strategy(config.fsdp_sharding_strategy),
             backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
             state_dict_type="full",
