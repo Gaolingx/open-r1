@@ -39,9 +39,7 @@ def build_trainer(
 
     strategy_kwargs = trainer_strategy_kwargs(
         config.distributed,
-        devices=devices,
-        accelerator=accelerator,
-        precision_config=config.precision,
+        config.precision,
     )
     trainer_kwargs: dict[str, Any] = {
         "default_root_dir": config.output_dir,

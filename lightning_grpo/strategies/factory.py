@@ -64,15 +64,8 @@ def configure_cuda_precision(
     torch.set_float32_matmul_precision("high" if precision_config.tf32 else "highest")
 
 
-def build_strategy(
-    config: DistributedConfig,
-    devices: int | str | list[int] | None = None,
-    accelerator: str | None = None,
-) -> str | DDPStrategy | FSDPStrategy:
+def build_strategy(config: DistributedConfig) -> str | DDPStrategy | FSDPStrategy:
     """Build the Lightning strategy object from configuration."""
-
-    resolved_accelerator = accelerator or config.accelerator
-    resolved_devices = config.devices if devices is None else devices
 
     if config.strategy == "auto":
         return "auto"
@@ -101,22 +94,18 @@ def build_strategy(
 
 
 def trainer_strategy_kwargs(
-    config: DistributedConfig,
+    distributed_config: DistributedConfig,
     precision_config: PrecisionConfig | None = None,
 ) -> dict[str, Any]:
     """Build keyword arguments for [`lightning.pytorch.Trainer`](lightning_grpo/strategies/factory.py:126)."""
 
-    resolved_accelerator = config.accelerator
-    resolved_devices = config.devices
-    resolved_precision_config = precision_config or PrecisionConfig()
-
-    configure_cuda_precision(resolved_precision_config, resolved_accelerator)
+    configure_cuda_precision(precision_config, distributed_config.accelerator)
 
     return {
-        "accelerator": resolved_accelerator,
-        "devices": resolved_devices,
-        "num_nodes": config.num_nodes,
-        "strategy": build_strategy(config, devices=resolved_devices, accelerator=resolved_accelerator),
-        "precision": resolved_precision_config.trainer_precision,
-        "sync_batchnorm": config.sync_batchnorm,
+        "accelerator": distributed_config.accelerator,
+        "devices": distributed_config.devices,
+        "num_nodes": distributed_config.num_nodes,
+        "strategy": build_strategy(distributed_config),
+        "precision": precision_config.trainer_precision,
+        "sync_batchnorm": distributed_config.sync_batchnorm,
     }
