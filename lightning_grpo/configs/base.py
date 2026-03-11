@@ -14,7 +14,7 @@ class PrecisionConfig:
     """Precision and numerics settings for Lightning training."""
 
     parameter_dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
-    trainer_precision: Literal["bf16-mixed", "16-mixed", "32-true"] = "bf16-mixed"
+    trainer_precision: Literal["bf16-mixed", "16-mixed", "16-true", "bf16-true", "32-true"] = "bf16-mixed"
     tf32: bool = True
     grad_scaler_enabled: bool = False
 

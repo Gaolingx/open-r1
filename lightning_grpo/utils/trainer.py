@@ -41,10 +41,10 @@ def build_trainer(
         config.distributed,
         devices=devices,
         accelerator=accelerator,
+        precision_config=config.precision,
     )
     trainer_kwargs: dict[str, Any] = {
         "default_root_dir": config.output_dir,
-        "precision": config.precision.trainer_precision,
         "max_epochs": config.optimization.max_epochs,
         "max_steps": config.optimization.max_steps,
         "accumulate_grad_batches": config.optimization.gradient_accumulation_steps,

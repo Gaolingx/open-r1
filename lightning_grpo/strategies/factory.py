@@ -10,7 +10,7 @@ from lightning.pytorch.strategies import DDPStrategy, FSDPStrategy
 from torch.distributed.fsdp import BackwardPrefetch, CPUOffload, ShardingStrategy
 from torch.nn import Module
 
-from lightning_grpo.configs.base import DistributedConfig
+from lightning_grpo.configs.base import DistributedConfig, PrecisionConfig
 
 
 def _resolve_sharding_strategy(name: str) -> ShardingStrategy:
@@ -70,6 +70,19 @@ def resolve_parallel_devices(
     return [torch.device(f"cuda:{gpu_id}") for gpu_id in gpu_ids]
 
 
+def configure_cuda_precision(
+    precision_config: PrecisionConfig,
+    accelerator: str | None,
+) -> None:
+    """Configure TF32 and float32 matmul precision when CUDA is available."""
+
+    if accelerator not in {None, "auto", "gpu"} or not torch.cuda.is_available():
+        return
+
+    torch.backends.cudnn.allow_tf32 = precision_config.tf32
+    torch.set_float32_matmul_precision("high" if precision_config.tf32 else "highest")
+
+
 def build_strategy(
     config: DistributedConfig,
     devices: int | str | list[int] | None = None,
@@ -112,16 +125,21 @@ def trainer_strategy_kwargs(
     config: DistributedConfig,
     devices: int | str | list[int] | None = None,
     accelerator: str | None = None,
+    precision_config: PrecisionConfig | None = None,
 ) -> dict[str, Any]:
-    """Build keyword arguments for [`lightning.pytorch.Trainer`](lightning_grpo/strategies/factory.py:42)."""
+    """Build keyword arguments for [`lightning.pytorch.Trainer`](lightning_grpo/strategies/factory.py:126)."""
 
     resolved_accelerator = accelerator or config.accelerator
     resolved_devices = config.devices if devices is None else devices
+    resolved_precision_config = precision_config or PrecisionConfig()
+
+    configure_cuda_precision(resolved_precision_config, resolved_accelerator)
 
     return {
         "accelerator": resolved_accelerator,
         "devices": resolved_devices,
         "num_nodes": config.num_nodes,
         "strategy": build_strategy(config, devices=resolved_devices, accelerator=resolved_accelerator),
+        "precision": resolved_precision_config.trainer_precision,
         "sync_batchnorm": config.sync_batchnorm,
     }
