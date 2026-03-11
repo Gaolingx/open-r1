@@ -51,25 +51,6 @@ def _resolve_policy_classes(class_paths: list[str]) -> set[type[Module]] | None:
     return {_import_module_class(class_path) for class_path in class_paths}
 
 
-def resolve_parallel_devices(
-    accelerator: str,
-    devices: int | str | list[int],
-) -> list[torch.device] | None:
-    """Resolve explicit parallel devices for DDPStrategy when GPU ids are provided."""
-
-    if accelerator != "gpu":
-        return None
-
-    if isinstance(devices, list):
-        gpu_ids = devices
-    elif isinstance(devices, int):
-        gpu_ids = list(range(devices))
-    else:
-        return None
-
-    return [torch.device(f"cuda:{gpu_id}") for gpu_id in gpu_ids]
-
-
 def configure_cuda_precision(
     precision_config: PrecisionConfig,
     accelerator: str | None,
@@ -97,7 +78,6 @@ def build_strategy(
         return "auto"
     if config.strategy == "ddp":
         return DDPStrategy(
-            parallel_devices=resolve_parallel_devices(resolved_accelerator, resolved_devices),
             find_unused_parameters=config.find_unused_parameters,
             gradient_as_bucket_view=config.gradient_as_bucket_view,
         )
@@ -110,7 +90,6 @@ def build_strategy(
             )
 
         return FSDPStrategy(
-            parallel_devices=resolve_parallel_devices(resolved_accelerator, resolved_devices),
             cpu_offload=CPUOffload(offload_params=config.fsdp_cpu_offload),
             auto_wrap_policy=auto_wrap_policy,
             activation_checkpointing_policy=activation_checkpointing_policy,
@@ -123,14 +102,12 @@ def build_strategy(
 
 def trainer_strategy_kwargs(
     config: DistributedConfig,
-    devices: int | str | list[int] | None = None,
-    accelerator: str | None = None,
     precision_config: PrecisionConfig | None = None,
 ) -> dict[str, Any]:
     """Build keyword arguments for [`lightning.pytorch.Trainer`](lightning_grpo/strategies/factory.py:126)."""
 
-    resolved_accelerator = accelerator or config.accelerator
-    resolved_devices = config.devices if devices is None else devices
+    resolved_accelerator = config.accelerator
+    resolved_devices = config.devices
     resolved_precision_config = precision_config or PrecisionConfig()
 
     configure_cuda_precision(resolved_precision_config, resolved_accelerator)
