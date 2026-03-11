@@ -33,6 +33,7 @@ def build_trainer(
     config: ExperimentConfig,
     devices: int | str | list[int] | None = None,
     accelerator: str | None = None,
+    enable_validation: bool = True,
 ) -> L.Trainer:
     """Create a Lightning trainer with DDP or FSDP support."""
 
@@ -41,17 +42,21 @@ def build_trainer(
         devices=devices,
         accelerator=accelerator,
     )
-    return L.Trainer(
-        default_root_dir=config.output_dir,
-        precision=config.precision.trainer_precision,
-        max_epochs=config.optimization.max_epochs,
-        max_steps=config.optimization.max_steps,
-        accumulate_grad_batches=config.optimization.gradient_accumulation_steps,
-        gradient_clip_val=config.optimization.gradient_clip_val,
-        log_every_n_steps=config.logging.log_every_n_steps,
-        callbacks=build_callbacks(config),
-        logger=build_loggers(config),
-        benchmark=True,
-        deterministic=False,
+    trainer_kwargs: dict[str, Any] = {
+        "default_root_dir": config.output_dir,
+        "precision": config.precision.trainer_precision,
+        "max_epochs": config.optimization.max_epochs,
+        "max_steps": config.optimization.max_steps,
+        "accumulate_grad_batches": config.optimization.gradient_accumulation_steps,
+        "gradient_clip_val": config.optimization.gradient_clip_val,
+        "log_every_n_steps": config.logging.log_every_n_steps,
+        "callbacks": build_callbacks(config),
+        "logger": build_loggers(config),
+        "benchmark": True,
+        "deterministic": False,
         **strategy_kwargs,
-    )
+    }
+    if not enable_validation:
+        trainer_kwargs["limit_val_batches"] = 0
+        trainer_kwargs["num_sanity_val_steps"] = 0
+    return L.Trainer(**trainer_kwargs)

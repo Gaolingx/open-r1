@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, get_args, get_origin
+from typing import Any, Literal, Optional, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -215,13 +215,21 @@ class ExperimentConfig:
             return value
 
         if isinstance(annotation, type) and is_dataclass(annotation) and isinstance(value, dict):
-            return annotation(**{key: cls._coerce_value(sub_field.type, item) for key, item in value.items() for sub_field in fields(annotation) if sub_field.name == key})
+            nested_type_hints = get_type_hints(annotation)
+            coerced_values = {}
+            for sub_field in fields(annotation):
+                if sub_field.name not in value:
+                    continue
+                sub_annotation = nested_type_hints.get(sub_field.name, sub_field.type)
+                coerced_values[sub_field.name] = cls._coerce_value(sub_annotation, value[sub_field.name])
+            return annotation(**coerced_values)
 
         return value
 
     @classmethod
     def _from_mapping(cls, mapping: dict[str, Any]) -> "ExperimentConfig":
         kwargs: dict[str, Any] = {}
+        type_hints = get_type_hints(cls)
         for field_info in fields(cls):
             if field_info.name not in mapping:
                 continue
@@ -229,8 +237,6 @@ class ExperimentConfig:
             if value is None:
                 kwargs[field_info.name] = None
                 continue
-            if field_info.default is not MISSING and is_dataclass(field_info.default) and isinstance(value, dict):
-                kwargs[field_info.name] = cls._coerce_value(field_info.type, value)
-                continue
-            kwargs[field_info.name] = cls._coerce_value(field_info.type, value)
+            annotation = type_hints.get(field_info.name, field_info.type)
+            kwargs[field_info.name] = cls._coerce_value(annotation, value)
         return cls(**kwargs)

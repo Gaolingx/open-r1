@@ -98,8 +98,16 @@ class SFTLightningModule(L.LightningModule):
     def on_fit_start(self) -> None:
         """Log static parameter counts once training starts."""
 
-        self.log("model/trainable_parameters", float(self.trainable_parameter_count), rank_zero_only=True)
-        self.log("model/total_parameters", float(self.total_parameter_count), rank_zero_only=True)
+        if self.logger is None or not self.trainer.is_global_zero:
+            return
+
+        self.logger.log_metrics(
+            {
+                "model/trainable_parameters": float(self.trainable_parameter_count),
+                "model/total_parameters": float(self.total_parameter_count),
+            },
+            step=self.global_step,
+        )
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """Compute the next-token prediction loss."""

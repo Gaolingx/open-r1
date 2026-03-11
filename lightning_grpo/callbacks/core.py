@@ -26,7 +26,8 @@ class TrainingStateCallback(Callback):
         """Mark the beginning of the fit loop."""
 
         self.train_start_time = time.perf_counter()
-        pl_module.log("system/global_rank", float(trainer.global_rank), rank_zero_only=False)
+        if pl_module.logger is not None:
+            pl_module.logger.log_metrics({"system/global_rank": float(trainer.global_rank)}, step=trainer.global_step)
 
     def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         """Log wall-clock duration after training completes."""

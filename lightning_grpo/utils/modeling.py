@@ -95,14 +95,14 @@ def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig)
         revision=model_config.model_revision,
         trust_remote_code=model_config.trust_remote_code,
         attn_implementation=model_config.attn_implementation,
-        torch_dtype=resolve_torch_dtype(precision_config),
-        use_cache=not model_config.gradient_checkpointing,
+        dtype=resolve_torch_dtype(precision_config),
     )
+
+    if hasattr(model, "config"):
+        model.config.use_cache = not model_config.gradient_checkpointing
 
     if model_config.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-        if hasattr(model, "config"):
-            model.config.use_cache = False
 
     _freeze_embeddings_if_needed(model, model_config.freeze_embeddings)
     model = _apply_lora_if_needed(model, model_config)
