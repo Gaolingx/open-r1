@@ -22,8 +22,6 @@ class GRPOLightningModule(L.LightningModule):
         super().__init__()
         self.config = config
         self.policy = load_causal_lm(config.model, config.precision)
-        self.policy.requires_grad_(True)
-        self.policy.train()
         self.reference_model = load_causal_lm(config.model, config.precision) if config.rollout.use_reference_model else None
         if self.reference_model is not None:
             self.reference_model.requires_grad_(False)
