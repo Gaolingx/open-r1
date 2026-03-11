@@ -29,10 +29,18 @@ def build_loggers(config: ExperimentConfig) -> list[Any]:
     return loggers
 
 
-def build_trainer(config: ExperimentConfig) -> L.Trainer:
+def build_trainer(
+    config: ExperimentConfig,
+    devices: int | str | list[int] | None = None,
+    accelerator: str | None = None,
+) -> L.Trainer:
     """Create a Lightning trainer with DDP or FSDP support."""
 
-    strategy_kwargs = trainer_strategy_kwargs(config.distributed)
+    strategy_kwargs = trainer_strategy_kwargs(
+        config.distributed,
+        devices=devices,
+        accelerator=accelerator,
+    )
     return L.Trainer(
         default_root_dir=config.output_dir,
         precision=config.precision.trainer_precision,

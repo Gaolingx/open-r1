@@ -18,6 +18,13 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="Train an SFT model with PyTorch Lightning.")
     parser.add_argument("--config", type=str, required=True, help="Path to the YAML config file.")
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional explicit GPU ids to use, for example --gpus 0 1.",
+    )
     return parser.parse_args()
 
 
@@ -29,6 +36,9 @@ def main() -> None:
     if not isinstance(config, SFTConfig):
         raise TypeError("Expected an SFT config for train_sft.py")
 
+    trainer_devices = args.gpus
+    trainer_accelerator = "gpu" if trainer_devices is not None else None
+
     L.seed_everything(config.seed, workers=True)
     data_module = SFTDataModule(
         data_config=config.data,
@@ -38,7 +48,11 @@ def main() -> None:
         completion_only_loss=config.completion_only_loss,
     )
     module = SFTLightningModule(config)
-    trainer = build_trainer(config)
+    trainer = build_trainer(
+        config,
+        devices=trainer_devices,
+        accelerator=trainer_accelerator,
+    )
     trainer.fit(module, datamodule=data_module)
 
 
