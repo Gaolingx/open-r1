@@ -99,7 +99,7 @@ def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig)
     )
 
     if hasattr(model, "config"):
-        model.config.use_cache = not model_config.gradient_checkpointing
+        model.config.use_cache = model_config.use_cache
 
     if model_config.gradient_checkpointing:
         model.gradient_checkpointing_enable()

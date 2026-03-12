@@ -47,6 +47,7 @@ class ModelConfig:
     use_lora: bool = False
     freeze_embeddings: bool = False
     gradient_checkpointing: bool = True
+    use_cache: bool = False
     compile_model: bool = False
     lora: LoRAConfig = field(default_factory=LoRAConfig)
 
@@ -70,6 +71,8 @@ class DataConfig:
     dataset_config: Optional[str] = None
     train_split: str = "train"
     val_split: Optional[str] = None
+    val_split_size: Optional[float] = None
+    split_seed: int = 42
     prompt_column: str = "prompt"
     response_column: str = "response"
     messages_column: str = "messages"
@@ -81,6 +84,8 @@ class DataConfig:
     add_generation_prompt: bool = False
     mask_prompt_labels: bool = True
     pack_sequences: bool = False
+    preprocessing_use_cache: bool = True
+    preprocessing_keep_in_memory: bool = False
     train_files: list[str] = field(default_factory=list)
     val_files: list[str] = field(default_factory=list)
     dataset_mixture: list[DatasetSource] = field(default_factory=list)

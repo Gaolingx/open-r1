@@ -10,7 +10,7 @@ from typing import Any
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.utilities import rank_zero_only
+from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 
 from lightning_grpo.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
 from lightning_grpo.utils.modeling import load_tokenizer
@@ -35,7 +35,8 @@ class TrainingStateCallback(Callback):
         if self.train_start_time is None:
             return
         elapsed = time.perf_counter() - self.train_start_time
-        pl_module.log("system/train_time_seconds", elapsed, rank_zero_only=True)
+        if pl_module.logger is not None and trainer.is_global_zero:
+            pl_module.logger.log_metrics({"system/train_time_seconds": elapsed}, step=trainer.global_step)
 
 
 class EfficiencyMonitorCallback(Callback):
@@ -170,7 +171,7 @@ class NaNLossCallback(Callback):
             loss = outputs["loss"]
 
         if loss is not None and not torch.isfinite(loss):
-            print(
+            rank_zero_info(
                 f"\n[NaNLossCallback] Non-finite loss detected at "
                 f"step {trainer.global_step} (batch_idx={batch_idx}): {loss.item():.6f}. "
                 f"Stopping training."
