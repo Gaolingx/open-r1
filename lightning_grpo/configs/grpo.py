@@ -36,6 +36,8 @@ class RolloutConfig:
     """Online rollout configuration for GRPO."""
 
     num_generations: int = 8
+    num_generations_eval: int | None = None
+    eval_strategy: Literal["no", "epoch", "steps"] = "no"
     max_prompt_length: int = 2048
     max_completion_length: int = 1024
     temperature: float = 0.8

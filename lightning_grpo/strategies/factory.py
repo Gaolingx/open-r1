@@ -106,6 +106,5 @@ def trainer_strategy_kwargs(
         "devices": distributed_config.devices,
         "num_nodes": distributed_config.num_nodes,
         "strategy": build_strategy(distributed_config),
-        "precision": precision_config.trainer_precision,
         "sync_batchnorm": distributed_config.sync_batchnorm,
     }

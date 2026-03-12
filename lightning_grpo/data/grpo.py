@@ -84,9 +84,23 @@ class GRPODataModule(LightningDataModule):
             system_prompt=self.system_prompt,
         )
 
-        self.train_dataset = self._prepare_prompt_dataset(dataset_dict[self.data_config.train_split], formatter)
+        train_dataset = dataset_dict[self.data_config.train_split]
         val_split_name = resolve_validation_split_name(self.data_config, dataset_dict)
-        if val_split_name is not None:
+
+        if self.rollout_config.eval_strategy != "no" and val_split_name is None:
+            split_ratio = self.data_config.val_split_size or 0.01
+            split_dataset = train_dataset.train_test_split(
+                test_size=split_ratio,
+                seed=self.data_config.split_seed,
+            )
+            train_dataset = split_dataset["train"]
+            dataset_dict[self.data_config.train_split] = train_dataset
+            dataset_dict["validation"] = split_dataset["test"]
+            val_split_name = "validation"
+
+        self.train_dataset = self._prepare_prompt_dataset(train_dataset, formatter)
+        self.val_dataset = None
+        if self.rollout_config.eval_strategy != "no" and val_split_name is not None:
             self.val_dataset = self._prepare_prompt_dataset(dataset_dict[val_split_name], formatter)
 
     def _prepare_prompt_dataset(self, dataset: Dataset, formatter: ConversationTemplate) -> Dataset:
@@ -142,7 +156,7 @@ class GRPODataModule(LightningDataModule):
     def val_dataloader(self) -> Optional[DataLoader]:
         """Build the validation prompt dataloader when a validation split is configured."""
 
-        if self.val_dataset is None:
+        if self.rollout_config.eval_strategy == "no" or self.val_dataset is None:
             return None
         return DataLoader(
             self.val_dataset,

@@ -150,11 +150,18 @@ class GRPOLightningModule(L.LightningModule):
             return gathered.reshape(-1)
         return gathered.reshape(-1, *tensor.shape[1:])
 
+    def _resolve_num_generations(self, training: bool) -> int:
+        """Resolve the rollout multiplicity for train versus eval."""
+
+        if training:
+            return self.config.rollout.num_generations
+        return self.config.rollout.num_generations_eval or self.config.rollout.num_generations
+
     @torch.no_grad()
-    def _generate(self, batch: dict[str, Any]) -> dict[str, torch.Tensor | list[Any]]:
+    def _generate(self, batch: dict[str, Any], *, training: bool) -> dict[str, torch.Tensor | list[Any]]:
         """Generate grouped completions for online GRPO optimization."""
 
-        num_generations = self.config.rollout.num_generations
+        num_generations = self._resolve_num_generations(training)
         prompt_ids = batch["input_ids"]
         prompt_mask = batch["attention_mask"]
 
@@ -255,17 +262,16 @@ class GRPOLightningModule(L.LightningModule):
         rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=-1)
         return rewards, rewards_per_func
 
-    def _compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
+    def _compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
         """Normalize rewards within each prompt group, as in GRPO."""
 
-        num_generations = self.config.rollout.num_generations
         grouped_rewards = rewards.view(-1, num_generations)
         grouped_mean = grouped_rewards.mean(dim=1, keepdim=True)
         grouped_std = grouped_rewards.std(dim=1, keepdim=True)
         grouped_advantages = (grouped_rewards - grouped_mean) / (grouped_std + self.config.rollout.advantage_epsilon)
         return grouped_advantages.reshape(-1)
 
-    def _compute_loss(self, rollout_batch: dict[str, torch.Tensor | list[Any]]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def _compute_loss(self, rollout_batch: dict[str, torch.Tensor | list[Any]], *, training: bool) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the GRPO objective with PPO-style ratio clipping and optional KL penalty."""
 
         prompt_ids = rollout_batch["prompt_ids"]
@@ -305,7 +311,8 @@ class GRPOLightningModule(L.LightningModule):
         global_rewards = (
             global_rewards_per_func * self.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)
         ).nansum(dim=-1)
-        global_advantages = self._compute_advantages(global_rewards)
+        num_generations = self._resolve_num_generations(training)
+        global_advantages = self._compute_advantages(global_rewards, num_generations)
 
         local_batch_size = rewards.shape[0]
         rank = getattr(self, "global_rank", 0)
@@ -331,7 +338,7 @@ class GRPOLightningModule(L.LightningModule):
         with torch.no_grad():
             entropy = entropy_from_logits(logits)
             completion_lengths = completion_mask.sum(dim=1).float()
-            global_reward_group_std = global_rewards.view(-1, self.config.rollout.num_generations).std(dim=1)
+            global_reward_group_std = global_rewards.view(-1, num_generations).std(dim=1)
 
             global_loss_mask = self._gather_tensor_for_metrics(loss_mask.detach())
             global_per_token_kl = self._gather_tensor_for_metrics(per_token_kl.detach())
@@ -481,16 +488,16 @@ class GRPOLightningModule(L.LightningModule):
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         """Run one online rollout and optimization step."""
 
-        rollout_batch = self._generate(batch)
-        loss, metrics = self._compute_loss(rollout_batch)
+        rollout_batch = self._generate(batch, training=True)
+        loss, metrics = self._compute_loss(rollout_batch, training=True)
         self._log_metrics("train", loss, metrics, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         """Evaluate the current policy with a rollout batch."""
 
-        rollout_batch = self._generate(batch)
-        loss, metrics = self._compute_loss(rollout_batch)
+        rollout_batch = self._generate(batch, training=False)
+        loss, metrics = self._compute_loss(rollout_batch, training=False)
         self._log_metrics("val", loss, metrics, on_step=False, on_epoch=True)
         return loss
 

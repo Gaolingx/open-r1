@@ -183,6 +183,7 @@ class SFTDataModule(LightningDataModule):
             num_workers=self.data_config.num_workers,
             collate_fn=self.collator,
             pin_memory=True,
+            drop_last=True,
         )
 
     def val_dataloader(self) -> Optional[DataLoader]:
@@ -197,4 +198,5 @@ class SFTDataModule(LightningDataModule):
             num_workers=self.data_config.num_workers,
             collate_fn=self.collator,
             pin_memory=True,
+            drop_last=False,
         )
