@@ -85,7 +85,6 @@ def main() -> None:
         model_config=config.model,
         optimization_config=config.optimization,
         system_prompt=config.system_prompt,
-        completion_only_loss=config.completion_only_loss,
     )
     module = SFTLightningModule(config)
     trainer = build_trainer(config)

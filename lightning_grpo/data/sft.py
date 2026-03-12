@@ -64,14 +64,12 @@ class SFTDataModule(LightningDataModule):
         model_config: ModelConfig,
         optimization_config: OptimizationConfig,
         system_prompt: Optional[str] = None,
-        completion_only_loss: bool = False,
     ) -> None:
         super().__init__()
         self.data_config = data_config
         self.model_config = model_config
         self.optimization_config = optimization_config
         self.system_prompt = system_prompt
-        self.completion_only_loss = completion_only_loss
         self.tokenizer = load_tokenizer(model_config)
         self.collator = SFTBatchCollator(self.tokenizer)
         self.train_dataset: Optional[Dataset] = None
@@ -112,52 +110,54 @@ class SFTDataModule(LightningDataModule):
                 sample = {key: value[index] for key, value in batch.items()}
                 samples.append(formatter(sample))
 
-            rendered_text = [
-                apply_chat_template(
+            input_ids_batch: list[list[int]] = []
+            attention_mask_batch: list[list[int]] = []
+            labels_batch: list[list[int]] = []
+
+            for sample in samples:
+                messages = sample["messages"]
+                full_text = apply_chat_template(
                     tokenizer=self.tokenizer,
-                    messages=sample["messages"],
+                    messages=messages,
                     add_generation_prompt=False,
                 )
-                for sample in samples
-            ]
-            tokenized = self.tokenizer(
-                rendered_text,
-                truncation=True,
-                max_length=self.data_config.max_seq_length,
-                padding=False,
-            )
-
-            should_mask_prompt = self.data_config.mask_prompt_labels or self.completion_only_loss
-            labels: list[list[int]] = []
-            if should_mask_prompt:
-                prompt_text = []
-                for sample in samples:
-                    prompt_messages, completion_messages = self._split_prompt_and_completion(sample["messages"])
-                    add_generation_prompt = bool(completion_messages)
-                    prompt_text.append(
-                        apply_chat_template(
-                            tokenizer=self.tokenizer,
-                            messages=prompt_messages,
-                            add_generation_prompt=add_generation_prompt,
-                        )
-                    )
-                prompt_tokenized = self.tokenizer(
-                    prompt_text,
+                full_tokenized = self.tokenizer(
+                    full_text,
                     truncation=True,
                     max_length=self.data_config.max_seq_length,
                     padding=False,
                 )
+                full_ids = list(full_tokenized["input_ids"])
+                attention_mask = list(full_tokenized["attention_mask"])
 
-                for input_ids, prompt_ids in zip(tokenized["input_ids"], prompt_tokenized["input_ids"], strict=True):
-                    masked_labels = list(input_ids)
-                    prompt_length = min(len(masked_labels), len(prompt_ids))
-                    masked_labels[:prompt_length] = [-100] * prompt_length
-                    labels.append(masked_labels)
-            else:
-                labels = [list(input_ids) for input_ids in tokenized["input_ids"]]
+                if self.data_config.mask_prompt_labels:
+                    prompt_messages, _ = self._split_prompt_and_completion(messages)
+                    prompt_text = apply_chat_template(
+                        tokenizer=self.tokenizer,
+                        messages=prompt_messages,
+                        add_generation_prompt=True,
+                    )
+                    prompt_tokenized = self.tokenizer(
+                        prompt_text,
+                        truncation=True,
+                        max_length=self.data_config.max_seq_length,
+                        padding=False,
+                    )
+                    prompt_ids = list(prompt_tokenized["input_ids"])
+                    prompt_len = min(len(prompt_ids), len(full_ids))
+                    labels = [-100] * prompt_len + full_ids[prompt_len:]
+                else:
+                    labels = list(full_ids)
 
-            tokenized["labels"] = labels
-            return tokenized
+                input_ids_batch.append(full_ids)
+                attention_mask_batch.append(attention_mask)
+                labels_batch.append(labels)
+
+            return {
+                "input_ids": input_ids_batch,
+                "attention_mask": attention_mask_batch,
+                "labels": labels_batch,
+            }
 
         columns_to_remove = list(dataset.column_names)
         return dataset.map(

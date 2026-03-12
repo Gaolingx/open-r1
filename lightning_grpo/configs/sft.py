@@ -14,7 +14,6 @@ class SFTConfig(ExperimentConfig):
 
     task: Literal["sft"] = "sft"
     label_smoothing: float = 0.0
-    completion_only_loss: bool = False
     eval_generation_max_new_tokens: int = 256
     system_prompt: Optional[str] = None
     validation_prompts: list[str] = field(default_factory=list)

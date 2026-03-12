@@ -14,8 +14,8 @@ model:
   use_cache: false
   lora:
     enabled: true
-    r: 4
-    alpha: 8
+    r: 8
+    alpha: 16
     dropout: 0.05
     target_modules: [ q_proj, k_proj, v_proj, o_proj ]
 
@@ -26,7 +26,7 @@ data:
   response_column: solution
   max_seq_length: 2048
   num_workers: 0
-  preprocessing_batch_size: 64
+  preprocessing_batch_size: 128
   preprocessing_use_cache: false
   preprocessing_keep_in_memory: true
 

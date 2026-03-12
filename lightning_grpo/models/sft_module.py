@@ -61,19 +61,6 @@ class SFTLightningModule(L.LightningModule):
         total = mask.sum()
         return correct.to(dtype=torch.float32) / total.to(dtype=torch.float32)
 
-    @staticmethod
-    def _compute_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Compute mean entropy on valid next-token positions."""
-
-        token_entropy = entropy_from_logits(logits[..., :-1, :].contiguous())
-        mask = labels[..., 1:].contiguous() != -100
-
-        if not mask.any():
-            return token_entropy.new_tensor(0.0)
-
-        mask = mask.to(dtype=token_entropy.dtype)
-        return (token_entropy * mask).sum() / mask.sum()
-
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """Run one SFT optimization/evaluation step and log metrics."""
 
@@ -82,13 +69,11 @@ class SFTLightningModule(L.LightningModule):
         outputs = self(**model_inputs)
         loss = self._compute_loss(outputs.logits, labels)
         accuracy = self._compute_token_accuracy(outputs.logits, labels)
-        entropy = self._compute_entropy(outputs.logits, labels)
 
         on_step = stage == "train"
         prog_bar = stage in {"train", "val"}
         self.log(f"{stage}/loss", loss, prog_bar=prog_bar, on_step=on_step, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/token_accuracy", accuracy, prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/entropy", entropy, prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
 
         if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None:
             self.log(f"{stage}/aux_loss", outputs.aux_loss, prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
