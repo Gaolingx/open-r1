@@ -38,9 +38,9 @@ def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.
 
 
 def build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    optimization: OptimizationConfig,
-    estimated_stepping_batches: int,
+        optimizer: torch.optim.Optimizer,
+        optimization: OptimizationConfig,
+        estimated_stepping_batches: int,
 ) -> dict[str, Any]:
     """Create a per-step learning rate scheduler."""
 

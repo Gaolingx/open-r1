@@ -47,23 +47,23 @@ class EfficiencyMonitorCallback(Callback):
         self.step_start_time: float | None = None
 
     def on_train_batch_start(
-        self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
-        batch: dict[str, Any],
-        batch_idx: int,
+            self,
+            trainer: L.Trainer,
+            pl_module: L.LightningModule,
+            batch: dict[str, Any],
+            batch_idx: int,
     ) -> None:
         """Capture batch start time for throughput estimation."""
 
         self.step_start_time = time.perf_counter()
 
     def on_train_batch_end(
-        self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
-        outputs: Any,
-        batch: dict[str, Any],
-        batch_idx: int,
+            self,
+            trainer: L.Trainer,
+            pl_module: L.LightningModule,
+            outputs: Any,
+            batch: dict[str, Any],
+            batch_idx: int,
     ) -> None:
         """Log tokens per second and sequence statistics periodically."""
 
@@ -106,12 +106,12 @@ class PeriodicSampleGenerationCallback(Callback):
 
     @rank_zero_only
     def on_train_batch_end(
-        self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
-        outputs: Any,
-        batch: dict[str, Any],
-        batch_idx: int,
+            self,
+            trainer: L.Trainer,
+            pl_module: L.LightningModule,
+            outputs: Any,
+            batch: dict[str, Any],
+            batch_idx: int,
     ) -> None:
         """Generate periodic sample completions and save them to disk."""
 
@@ -155,12 +155,12 @@ class NaNLossCallback(Callback):
     """Immediately stop training when a NaN or Inf loss is detected."""
 
     def on_train_batch_end(
-        self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
-        outputs: Any,
-        batch: Any,
-        batch_idx: int,
+            self,
+            trainer: L.Trainer,
+            pl_module: L.LightningModule,
+            outputs: Any,
+            batch: Any,
+            batch_idx: int,
     ) -> None:
         """Stop training when the batch loss becomes non-finite."""
 
@@ -212,8 +212,8 @@ def build_checkpoint_callback(checkpoint_config: CheckpointConfig) -> ModelCheck
 
 
 def build_early_stopping_callback(
-    early_stopping_config: EarlyStoppingConfig,
-    checkpoint_config: CheckpointConfig,
+        early_stopping_config: EarlyStoppingConfig,
+        checkpoint_config: CheckpointConfig,
 ) -> EarlyStopping | None:
     """Create an early stopping callback when the feature is enabled."""
 

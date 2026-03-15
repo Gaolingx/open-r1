@@ -10,7 +10,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, P
 
 from lightning_grpo.configs.base import ModelConfig, PrecisionConfig
 
-
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,

@@ -11,7 +11,6 @@ from lightning_grpo.configs.base import ExperimentConfig
 from lightning_grpo.configs.grpo import GRPOConfig
 from lightning_grpo.configs.sft import SFTConfig
 
-
 CONFIG_REGISTRY = {
     "sft": SFTConfig,
     "grpo": GRPOConfig,

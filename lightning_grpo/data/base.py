@@ -14,11 +14,11 @@ class ConversationTemplate:
     """Convert row-based samples into chat-style message lists."""
 
     def __init__(
-        self,
-        prompt_column: str,
-        response_column: str,
-        messages_column: str = "messages",
-        system_prompt: Optional[str] = None,
+            self,
+            prompt_column: str,
+            response_column: str,
+            messages_column: str = "messages",
+            system_prompt: Optional[str] = None,
     ) -> None:
         self.prompt_column = prompt_column
         self.response_column = response_column
@@ -104,9 +104,9 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
 
 
 def apply_chat_template(
-    tokenizer: Any,
-    messages: list[dict[str, str]],
-    add_generation_prompt: bool = False,
+        tokenizer: Any,
+        messages: list[dict[str, str]],
+        add_generation_prompt: bool = False,
 ) -> str:
     """Render messages into a training string with the tokenizer template."""
 

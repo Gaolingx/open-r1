@@ -227,11 +227,11 @@ class GRPOLightningModule(L.LightningModule):
         }
 
     def _compute_rewards(
-        self,
-        prompts: list[str],
-        completions: list[list[dict[str, str]]],
-        completion_id_lists: list[list[int]],
-        metadata: list[dict[str, Any]],
+            self,
+            prompts: list[str],
+            completions: list[list[dict[str, str]]],
+            completion_id_lists: list[list[int]],
+            metadata: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute per-reward and aggregated rewards using TRL-style reward kwargs propagation."""
 
@@ -309,14 +309,14 @@ class GRPOLightningModule(L.LightningModule):
         )
         global_rewards_per_func = self._gather_tensor_for_metrics(rewards_per_func.detach())
         global_rewards = (
-            global_rewards_per_func * self.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)
+                global_rewards_per_func * self.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)
         ).nansum(dim=-1)
         num_generations = self._resolve_num_generations(training)
         global_advantages = self._compute_advantages(global_rewards, num_generations)
 
         local_batch_size = rewards.shape[0]
         rank = getattr(self, "global_rank", 0)
-        advantages = global_advantages[rank * local_batch_size : (rank + 1) * local_batch_size].unsqueeze(1)
+        advantages = global_advantages[rank * local_batch_size: (rank + 1) * local_batch_size].unsqueeze(1)
 
         log_ratio = per_token_logps - old_per_token_logps
         importance_ratio = torch.exp(log_ratio)

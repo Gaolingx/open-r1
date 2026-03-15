@@ -66,7 +66,26 @@ def parse_args() -> argparse.Namespace:
         "--resume_from_checkpoint",
         type=str,
         default=None,
-        help="Resume from a checkpoint path, checkpoint directory, or 'last'.",
+        help="Path to checkpoint to resume from",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed (overrides config)",
+    )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default=None,
+        choices=["16", "32", "bf16", "16-mixed", "bf16-mixed"],
+        help="Training precision",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs to use",
     )
     return parser.parse_args()
 
@@ -78,6 +97,13 @@ def main() -> None:
     config = load_experiment_config(args.config)
     if not isinstance(config, GRPOConfig):
         raise TypeError("Expected a GRPO config for train_grpo.py")
+
+    if args.seed is not None:
+        config.seed = args.seed
+    if args.precision is not None:
+        config.precision = args.precision
+    if args.gpus is not None:
+        config.distributed.devices = args.gpus
 
     L.seed_everything(config.seed, workers=True)
     data_module = GRPODataModule(
