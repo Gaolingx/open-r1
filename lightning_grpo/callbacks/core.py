@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import time
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,7 @@ from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 
 from lightning_grpo.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
 from lightning_grpo.utils.modeling import load_tokenizer
-from lightning_grpo.utils.config import save_config
+from lightning_grpo.utils.config import save_json_config
 
 
 class TrainingStateCallback(Callback):
@@ -143,13 +143,10 @@ class PeriodicSampleGenerationCallback(Callback):
         output_dir = Path(trainer.default_root_dir) / "samples"
         output_dir.mkdir(parents=True, exist_ok=True)
         sample_path = output_dir / f"step-{trainer.global_step:08d}.json"
-        with sample_path.open("w", encoding="utf-8") as handle:
-            json.dump(
-                [{"prompt": prompt, "generation": generation} for prompt, generation in zip(prompts, texts)],
-                handle,
-                ensure_ascii=False,
-                indent=2,
-            )
+        save_json_config(
+            [{"prompt": prompt, "generation": generation} for prompt, generation in zip(prompts, texts)],
+            sample_path,
+        )
 
 
 class NaNLossCallback(Callback):
@@ -192,8 +189,8 @@ class ConfigSnapshotCallback(Callback):
 
         output_dir = Path(trainer.default_root_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        config_path = output_dir / "resolved_config.yaml"
-        save_config(self.config, config_path)
+        config_path = output_dir / "resolved_config.json"
+        save_json_config(self.config.to_dict(), config_path)
 
 
 def build_checkpoint_callback(checkpoint_config: CheckpointConfig) -> ModelCheckpoint:
