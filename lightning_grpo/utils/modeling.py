@@ -66,7 +66,7 @@ def _freeze_embeddings_if_needed(model: PreTrainedModel, freeze_embeddings: bool
 def _apply_lora_if_needed(model: PreTrainedModel, model_config: ModelConfig) -> PreTrainedModel:
     """Wrap the model with LoRA adapters when enabled."""
 
-    if not model_config.use_lora and not model_config.lora.enabled:
+    if not model_config.lora.enabled:
         return model
 
     lora_config = LoraConfig(

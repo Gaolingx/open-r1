@@ -8,7 +8,6 @@ precision:
 
 model:
   model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
-  use_lora: true
   gradient_checkpointing: true
   use_cache: false
   lora:

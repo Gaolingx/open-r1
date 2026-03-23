@@ -44,7 +44,6 @@ class ModelConfig:
     chat_template: Optional[str] = None
     eos_token: Optional[str] = None
     pad_token: Optional[str] = None
-    use_lora: bool = False
     freeze_embeddings: bool = False
     gradient_checkpointing: bool = True
     use_cache: bool = False

@@ -9,7 +9,6 @@ precision:
 model:
   model_name_or_path: Qwen/Qwen3.5-0.8B
   attn_implementation: sdpa
-  use_lora: true
   gradient_checkpointing: true
   use_cache: false
   lora:

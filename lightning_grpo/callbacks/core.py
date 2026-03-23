@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import time
+import json
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 
 from lightning_grpo.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
 from lightning_grpo.utils.modeling import load_tokenizer
+from lightning_grpo.utils.config import save_config
 
 
 class TrainingStateCallback(Callback):
@@ -191,9 +192,8 @@ class ConfigSnapshotCallback(Callback):
 
         output_dir = Path(trainer.default_root_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        config_path = output_dir / "resolved_config.json"
-        with config_path.open("w", encoding="utf-8") as handle:
-            json.dump(self.config.to_dict(), handle, ensure_ascii=False, indent=2)
+        config_path = output_dir / "resolved_config.yaml"
+        save_config(self.config, config_path)
 
 
 def build_checkpoint_callback(checkpoint_config: CheckpointConfig) -> ModelCheckpoint:

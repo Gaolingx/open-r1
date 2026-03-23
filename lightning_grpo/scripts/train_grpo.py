@@ -87,6 +87,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Number of GPUs to use",
     )
+    parser.add_argument(
+        "--lora_init_path",
+        type=str,
+        default=None,
+        help="Optional LoRA initialization path. When provided, LoRA is enabled and initialized from this path.",
+    )
     return parser.parse_args()
 
 
@@ -104,6 +110,9 @@ def main() -> None:
         config.precision = args.precision
     if args.gpus is not None:
         config.distributed.devices = args.gpus
+    if args.lora_init_path is not None:
+        config.model.lora.enabled = True
+        setattr(config.model.lora, "init_path", args.lora_init_path)
 
     L.seed_everything(config.seed, workers=True)
     data_module = GRPODataModule(
