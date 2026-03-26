@@ -13,8 +13,43 @@ from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMon
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 
 from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
-from lightning_grpo.utils.modeling import load_tokenizer
+from lightning_grpo.utils.modeling import export_hf_model, load_tokenizer
 from lightning_grpo.utils.config import save_json_config
+
+
+class CheckpointCallback(ModelCheckpoint):
+    """ModelCheckpoint with optional Hugging Face export alongside `.ckpt` files."""
+
+    def __init__(self, *args: Any, save_hf_format: bool = True, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.save_hf_format = save_hf_format
+
+    def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
+        """Save the Lightning checkpoint, then export HF weights in safetensors format."""
+
+        super()._save_checkpoint(trainer, filepath)
+
+        if not self.save_hf_format or not trainer.is_global_zero:
+            return
+
+        pl_module = trainer.lightning_module
+        if pl_module is None:
+            return
+
+        export_model = getattr(pl_module, "policy", None) or getattr(pl_module, "model", None)
+        model_config = getattr(getattr(pl_module, "config", None), "model", None)
+        tokenizer = getattr(pl_module, "tokenizer", None)
+        if export_model is None or model_config is None:
+            return
+
+        export_dir = Path(filepath).parent / "hf_checkpoint"
+        export_hf_model(
+            export_model,
+            model_config,
+            export_dir,
+            tokenizer=tokenizer,
+            safe_serialization=True,
+        )
 
 
 class TrainingStateCallback(Callback):
@@ -196,14 +231,14 @@ class ConfigSnapshotCallback(Callback):
 def build_checkpoint_callback(checkpoint_config: CheckpointConfig) -> ModelCheckpoint:
     """Create the default checkpoint callback."""
 
-    return ModelCheckpoint(
+    return CheckpointCallback(
         dirpath=checkpoint_config.dirpath,
         monitor=checkpoint_config.monitor,
         mode=checkpoint_config.mode,
         save_top_k=checkpoint_config.save_top_k,
         save_last=checkpoint_config.save_last,
         every_n_train_steps=checkpoint_config.every_n_train_steps,
-        filename="{epoch:02d}-{step:08d}-{" + checkpoint_config.monitor.replace("/", "_") + ":.4f}",
+        filename='model-{epoch:02d}-{step:06d}-{' + checkpoint_config.monitor + ':.4f}',
         auto_insert_metric_name=False,
     )
 

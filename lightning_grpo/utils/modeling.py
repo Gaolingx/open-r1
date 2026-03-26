@@ -221,6 +221,7 @@ def export_hf_model(
     *,
     tokenizer: PreTrainedTokenizerBase | None = None,
     state_dict: dict[str, torch.Tensor] | None = None,
+    safe_serialization: bool = False,
 ) -> Path:
     export_path = Path(export_dir)
     export_path.mkdir(parents=True, exist_ok=True)
@@ -231,7 +232,7 @@ def export_hf_model(
     else:
         save_model = unwrap_model(model)
 
-    save_kwargs = {"safe_serialization": False}
+    save_kwargs = {"safe_serialization": safe_serialization}
     if state_dict is not None:
         save_kwargs["state_dict"] = state_dict
     save_model.save_pretrained(str(export_path), **save_kwargs)
