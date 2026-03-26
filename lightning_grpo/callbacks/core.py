@@ -18,38 +18,14 @@ from lightning_grpo.utils.config import save_json_config
 
 
 class CheckpointCallback(ModelCheckpoint):
-    """ModelCheckpoint with optional Hugging Face export alongside `.ckpt` files."""
+    """ModelCheckpoint Callback."""
 
-    def __init__(self, *args: Any, save_hf_format: bool = True, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.save_hf_format = save_hf_format
 
     def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
-        """Save the Lightning checkpoint, then export HF weights in safetensors format."""
 
         super()._save_checkpoint(trainer, filepath)
-
-        if not self.save_hf_format or not trainer.is_global_zero:
-            return
-
-        pl_module = trainer.lightning_module
-        if pl_module is None:
-            return
-
-        export_model = getattr(pl_module, "policy", None) or getattr(pl_module, "model", None)
-        model_config = getattr(getattr(pl_module, "config", None), "model", None)
-        tokenizer = getattr(pl_module, "tokenizer", None)
-        if export_model is None or model_config is None:
-            return
-
-        export_dir = Path(filepath).parent / "hf_checkpoint"
-        export_hf_model(
-            export_model,
-            model_config,
-            export_dir,
-            tokenizer=tokenizer,
-            safe_serialization=True,
-        )
 
 
 class TrainingStateCallback(Callback):
@@ -238,7 +214,7 @@ def build_checkpoint_callback(checkpoint_config: CheckpointConfig) -> ModelCheck
         save_top_k=checkpoint_config.save_top_k,
         save_last=checkpoint_config.save_last,
         every_n_train_steps=checkpoint_config.every_n_train_steps,
-        filename='model-{epoch:02d}-{step:06d}-{' + checkpoint_config.monitor + ':.4f}',
+        filename="model-{epoch:02d}-{step:06d}-{train/loss:.4f}",
         auto_insert_metric_name=False,
     )
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
+import lightning as L
 import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
@@ -244,3 +245,61 @@ def export_hf_model(
         resolved_tokenizer.save_pretrained(str(export_path))
 
     return export_path
+
+
+def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
+    """Extract aggregate MoE routing diagnostics from model outputs."""
+
+    metrics: dict[str, torch.Tensor] = {}
+    aux_loss = getattr(outputs, "aux_loss", None)
+    if aux_loss is not None:
+        metrics["aux_loss"] = aux_loss.detach()
+
+    router_z_loss = getattr(outputs, "router_z_loss", None)
+    if router_z_loss is not None:
+        metrics["router_z_loss"] = router_z_loss.detach()
+
+    router_logits = getattr(outputs, "router_logits", None)
+    if router_logits is None:
+        return metrics
+
+    if isinstance(router_logits, tuple):
+        valid_logits = [layer_logits for layer_logits in router_logits if layer_logits is not None]
+        if not valid_logits:
+            return metrics
+        stacked_logits = torch.cat([layer_logits.reshape(-1, layer_logits.shape[-1]) for layer_logits in valid_logits], dim=0)
+    else:
+        stacked_logits = router_logits.reshape(-1, router_logits.shape[-1])
+
+    if stacked_logits.numel() == 0:
+        return metrics
+
+    router_probs = torch.softmax(stacked_logits, dim=-1)
+    expert_prob_mean = router_probs.mean(dim=0)
+    expert_load = torch.nn.functional.one_hot(router_probs.argmax(dim=-1), num_classes=router_probs.shape[-1]).to(router_probs.dtype).mean(dim=0)
+    metrics["router_prob_max"] = expert_prob_mean.max()
+    metrics["router_prob_min"] = expert_prob_mean.min()
+    metrics["router_load_max"] = expert_load.max()
+    metrics["router_load_min"] = expert_load.min()
+    metrics["router_entropy"] = (-(router_probs * torch.log(router_probs.clamp_min(1e-12))).sum(dim=-1)).mean()
+    return metrics
+
+
+def log_moe_metrics(
+    module: L.LightningModule,
+    outputs_or_metrics: Any,
+    stage: str,
+    *,
+    on_step: bool,
+    on_epoch: bool = True,
+    sync_dist: bool = True,
+) -> None:
+    """Log shared MoE diagnostics from raw outputs or a precomputed metric dict."""
+
+    metrics = outputs_or_metrics if isinstance(outputs_or_metrics, dict) else collect_moe_metrics(outputs_or_metrics)
+    if not metrics:
+        return
+
+    for name in ("aux_loss", "router_z_loss", "router_prob_max", "router_prob_min", "router_load_max", "router_load_min", "router_entropy"):
+        if name in metrics:
+            module.log(f"{stage}/{name}", metrics[name], prog_bar=False, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)

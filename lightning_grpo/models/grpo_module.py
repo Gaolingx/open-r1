@@ -14,7 +14,7 @@ from open_r1.rewards import get_reward_funcs
 from lightning_grpo.models.rollout_engine import create_rollout_engine, compute_per_token_logps
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.models.common import build_optimizer, build_scheduler, entropy_from_logits, masked_mean
-from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, export_hf_model, load_causal_lm, load_tokenizer
+from lightning_grpo.utils.modeling import collect_moe_metrics, count_trainable_parameters, describe_model_source, export_hf_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
 class GRPOLightningModule(L.LightningModule):
@@ -280,6 +280,7 @@ class GRPOLightningModule(L.LightningModule):
         logits = outputs.logits[:, :-1, :]
         logits = logits[:, -logits_to_keep:, :] / self.config.rollout.temperature
         per_token_logps = self._selective_log_softmax(logits, completion_ids)
+        moe_metrics = collect_moe_metrics(outputs)
 
         with torch.no_grad():
             if self.reference_model is not None:
@@ -371,6 +372,7 @@ class GRPOLightningModule(L.LightningModule):
             "clip_ratio_high": masked_mean(global_is_high_clipped, global_loss_mask),
             "clip_ratio_region": masked_mean(global_is_region_clipped, global_loss_mask),
         }
+        metrics.update(moe_metrics)
         for index, reward_name in enumerate(self.config.reward.reward_funcs):
             metrics[f"reward/{reward_name}"] = global_rewards_per_func[:, index].mean()
             metrics[f"reward_std/{reward_name}"] = global_rewards_per_func[:, index].std(unbiased=False)
@@ -394,6 +396,7 @@ class GRPOLightningModule(L.LightningModule):
         self.log(f"{prefix}/advantage_std", metrics["advantage_std"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/kl", metrics["kl"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/entropy", metrics["entropy"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        log_moe_metrics(self, metrics, prefix, on_step=on_step, on_epoch=on_epoch)
         self.log(
             f"{prefix}/completions/mean_length",
             metrics["completion_length"],

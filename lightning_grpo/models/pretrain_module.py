@@ -11,7 +11,7 @@ from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
-from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, export_hf_model, load_causal_lm, load_tokenizer
+from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, export_hf_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
 class PretrainLightningModule(L.LightningModule):
@@ -57,8 +57,7 @@ class PretrainLightningModule(L.LightningModule):
         self.log(f"{stage}/entropy", stats["entropy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-        if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None:
-            self.log(f"{stage}/aux_loss", outputs.aux_loss, prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+        log_moe_metrics(self, outputs, stage, on_step=on_step)
         return loss
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:

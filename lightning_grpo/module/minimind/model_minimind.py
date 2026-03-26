@@ -1,5 +1,6 @@
 import math
 from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +54,12 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        self.router_jitter_noise = kwargs.get("router_jitter_noise", 0.0)
+        self.router_z_loss_coef = kwargs.get("router_z_loss_coef", 0.0)
+        self.expert_capacity_factor = kwargs.get("expert_capacity_factor", None)
+        self.expert_min_capacity = kwargs.get("expert_min_capacity", 4)
+        self.router_drop_tokens = kwargs.get("router_drop_tokens", False)
+        self.router_pad_routed_tokens = kwargs.get("router_pad_routed_tokens", False)
         self.initializer_range = kwargs.get("initializer_range", 0.02)
         self.pad_token_id = kwargs.get("pad_token_id", 0)
         self.output_router_logits = kwargs.get("output_router_logits", use_moe)
@@ -109,8 +116,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q * cos) + (rotate_half(q) * sin).to(q.dtype)
+    k_embed = (k * cos) + (rotate_half(k) * sin).to(k.dtype)
     return q_embed, k_embed
 
 
@@ -230,17 +237,56 @@ class MOEFeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         self.aux_loss = torch.tensor(0.0)
         self.router_logits = None
+        self.router_z_loss = torch.tensor(0.0)
+        self.tokens_per_expert = None
+
+    def _compute_expert_capacity(self, num_tokens: int) -> int | None:
+        capacity_factor = self.config.expert_capacity_factor
+        if capacity_factor is None:
+            return None
+        denom = max(self.config.num_experts, 1)
+        base_capacity = math.ceil((num_tokens * self.config.num_experts_per_tok) / denom)
+        scaled_capacity = math.ceil(base_capacity * float(capacity_factor))
+        return max(int(self.config.expert_min_capacity), scaled_capacity)
 
     def forward(self, x):
         batch_size, seq_len, hidden_dim = x.shape
         x_flat = x.view(-1, hidden_dim)
         router_logits = self.gate(x_flat)
+        if self.training and self.config.router_jitter_noise > 0:
+            router_logits = router_logits + torch.randn_like(router_logits) * self.config.router_jitter_noise
         scores = F.softmax(router_logits, dim=-1)
         topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
-        if self.config.norm_topk_prob: topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        if self.config.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+
+        dispatch_mask = F.one_hot(topk_idx, self.config.num_experts).to(torch.bool)
+        expert_capacity = self._compute_expert_capacity(x_flat.size(0))
+        if expert_capacity is not None:
+            position_in_expert = dispatch_mask.cumsum(dim=0) - 1
+            within_capacity = position_in_expert < expert_capacity
+            dispatch_mask = dispatch_mask & within_capacity
+            if self.config.router_drop_tokens:
+                topk_weight = topk_weight * dispatch_mask.any(dim=-1).to(topk_weight.dtype)
+                if self.config.norm_topk_prob:
+                    topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+            elif self.config.router_pad_routed_tokens:
+                empty_routes = dispatch_mask.sum(dim=(1, 2)) == 0
+                if empty_routes.any():
+                    fallback_experts = topk_idx[empty_routes, :1]
+                    fallback_mask = F.one_hot(fallback_experts, self.config.num_experts).to(torch.bool)
+                    dispatch_mask[empty_routes, :1, :] = fallback_mask
+                    topk_weight[empty_routes, :1] = 0.0
+
+        if self.config.router_pad_routed_tokens:
+            token_has_route = dispatch_mask.any(dim=-1)
+            empty_slots = ~token_has_route
+            if empty_slots.any():
+                topk_weight = topk_weight.masked_fill(empty_slots, 0.0)
+
         y = torch.zeros_like(x_flat)
         for i, expert in enumerate(self.experts):
-            mask = (topk_idx == i)
+            mask = dispatch_mask[..., i]
             if mask.any():
                 token_idx = mask.any(dim=-1).nonzero().flatten()
                 weight = topk_weight[mask].view(-1, 1)
@@ -252,6 +298,11 @@ class MOEFeedForward(nn.Module):
             self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
         else:
             self.aux_loss = scores.new_zeros(1).squeeze()
+        if self.training and self.config.router_z_loss_coef > 0:
+            self.router_z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1).pow(2)) * self.config.router_z_loss_coef
+        else:
+            self.router_z_loss = scores.new_zeros(1).squeeze()
+        self.tokens_per_expert = dispatch_mask.any(dim=1).sum(dim=0)
         self.router_logits = router_logits.view(batch_size, seq_len, self.config.num_experts)
         return y.view(batch_size, seq_len, hidden_dim)
 
@@ -405,15 +456,18 @@ class MiniMindModel(MiniMindPreTrainedModel, GenerationMixin):
         hidden_states = self.norm(hidden_states)
         moe_layers = [l.mlp for l in self.layers if isinstance(l.mlp, MOEFeedForward)]
         aux_loss = None
+        z_loss = None
         router_logits = None
         if moe_layers:
             aux_loss = sum((layer.aux_loss for layer in moe_layers), hidden_states.new_zeros(1).squeeze())
+            z_loss = sum((layer.router_z_loss for layer in moe_layers), hidden_states.new_zeros(1).squeeze())
             router_logits = tuple(layer.router_logits for layer in moe_layers)
         model_output = {
             "last_hidden_state": hidden_states,
             "past_key_values": past_key_values,
             "router_logits": router_logits,
             "aux_loss": aux_loss,
+            "router_z_loss": z_loss,
         }
         return model_output
 
@@ -461,11 +515,14 @@ class MiniMindForCausalLM(MiniMindPreTrainedModel, GenerationMixin):
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         aux_loss = outputs.get("aux_loss")
+        router_z_loss = outputs.get("router_z_loss")
         if labels is not None and aux_loss is not None:
             loss = loss + aux_loss.to(loss.device)
+        if labels is not None and router_z_loss is not None:
+            loss = loss + router_z_loss.to(loss.device)
         return MoeCausalLMOutputWithPast(
             loss=loss,
-            aux_loss=aux_loss,
+            aux_loss=(aux_loss if router_z_loss is None else aux_loss + router_z_loss),
             logits=logits,
             past_key_values=outputs.get("past_key_values"),
             hidden_states=hidden_states,
