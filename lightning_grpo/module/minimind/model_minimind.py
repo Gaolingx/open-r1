@@ -1,5 +1,6 @@
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -11,8 +12,19 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+
+@dataclass
+class MiniMindModelOutputWithPast(MoeModelOutputWithPast):
+    aux_loss: torch.FloatTensor | None = None
+    router_z_loss: torch.FloatTensor | None = None
+
+
+@dataclass
+class MiniMindCausalLMOutputWithPast(MoeCausalLMOutputWithPast):
+    router_z_loss: torch.FloatTensor | None = None
 
 
 # MiniMind Config
@@ -462,13 +474,13 @@ class MiniMindModel(MiniMindPreTrainedModel, GenerationMixin):
             aux_loss = sum((layer.aux_loss for layer in moe_layers), hidden_states.new_zeros(1).squeeze())
             z_loss = sum((layer.router_z_loss for layer in moe_layers), hidden_states.new_zeros(1).squeeze())
             router_logits = tuple(layer.router_logits for layer in moe_layers)
-        model_output = {
-            "last_hidden_state": hidden_states,
-            "past_key_values": past_key_values,
-            "router_logits": router_logits,
-            "aux_loss": aux_loss,
-            "router_z_loss": z_loss,
-        }
+        model_output = MiniMindModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+            router_logits=router_logits,
+            aux_loss=aux_loss,
+            router_z_loss=z_loss,
+        )
         return model_output
 
 
@@ -504,7 +516,7 @@ class MiniMindForCausalLM(MiniMindPreTrainedModel, GenerationMixin):
     def forward(self, input_ids=None, attention_mask=None, past_key_values=None, inputs_embeds=None, use_cache=None, logits_to_keep=0, labels=None, output_router_logits=None, **kwargs):
         output_router_logits = output_router_logits if output_router_logits is not None else self.config.output_router_logits
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
-        hidden_states = outputs["last_hidden_state"]
+        hidden_states = outputs.last_hidden_state
         if isinstance(logits_to_keep, int):
             slice_indices = slice(None) if logits_to_keep == 0 else slice(-logits_to_keep, None)
         else:
@@ -514,20 +526,22 @@ class MiniMindForCausalLM(MiniMindPreTrainedModel, GenerationMixin):
         if labels is not None:
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
-        aux_loss = outputs.get("aux_loss")
-        router_z_loss = outputs.get("router_z_loss")
+        aux_loss = outputs.aux_loss if output_router_logits else None
+        router_z_loss = outputs.router_z_loss
         if labels is not None and aux_loss is not None:
             loss = loss + aux_loss.to(loss.device)
         if labels is not None and router_z_loss is not None:
             loss = loss + router_z_loss.to(loss.device)
-        return MoeCausalLMOutputWithPast(
+        output = MiniMindCausalLMOutputWithPast(
             loss=loss,
-            aux_loss=(aux_loss if router_z_loss is None else aux_loss + router_z_loss),
+            aux_loss=aux_loss,
             logits=logits,
-            past_key_values=outputs.get("past_key_values"),
+            past_key_values=outputs.past_key_values,
             hidden_states=hidden_states,
-            router_logits=outputs.get("router_logits") if output_router_logits else None,
+            router_logits=outputs.router_logits if output_router_logits else None,
+            router_z_loss=router_z_loss,
         )
+        return output
 
 
 def register_minimind_for_auto_class():

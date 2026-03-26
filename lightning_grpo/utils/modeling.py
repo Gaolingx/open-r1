@@ -8,9 +8,9 @@ from typing import Any, Callable, Optional
 import lightning as L
 import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from lightning.pytorch.utilities import rank_zero_info
-from lightning_grpo.module.minimind.model_minimind import MiniMindConfig, MiniMindForCausalLM, register_minimind_for_auto_class
+from lightning_grpo.module.minimind.model_minimind import MiniMindForCausalLM, register_minimind_for_auto_class
 
 from lightning_grpo.utils.config import load_json_config
 from lightning_grpo.utils.configs.base import ModelConfig, PrecisionConfig
@@ -33,8 +33,8 @@ def resolve_torch_dtype(precision_config: PrecisionConfig) -> torch.dtype:
 def load_tokenizer(model_config: ModelConfig) -> PreTrainedTokenizerBase:
     """Load and normalize the tokenizer."""
 
-    if model_config.model_family == "minimind" and not model_config.tokenizer_name_or_path:
-        raise ValueError("MiniMind requires `tokenizer_name_or_path` for tokenizer loading and HF export.")
+    if not model_config.model_family and not model_config.tokenizer_name_or_path:
+        raise ValueError(f"{model_config.model_family} requires `tokenizer_name_or_path` for tokenizer loading.")
 
     tokenizer_name = model_config.tokenizer_name_or_path or model_config.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(
@@ -216,13 +216,13 @@ def unwrap_model(model: PreTrainedModel) -> PreTrainedModel:
 
 
 def export_hf_model(
-    model: PreTrainedModel,
-    model_config: ModelConfig,
-    export_dir: str | Path,
-    *,
-    tokenizer: PreTrainedTokenizerBase | None = None,
-    state_dict: dict[str, torch.Tensor] | None = None,
-    safe_serialization: bool = False,
+        model: PreTrainedModel,
+        model_config: ModelConfig,
+        export_dir: str | Path,
+        *,
+        tokenizer: PreTrainedTokenizerBase | None = None,
+        state_dict: dict[str, torch.Tensor] | None = None,
+        safe_serialization: bool = False,
 ) -> Path:
     export_path = Path(export_dir)
     export_path.mkdir(parents=True, exist_ok=True)
@@ -247,59 +247,113 @@ def export_hf_model(
     return export_path
 
 
+@staticmethod
+def format_metric_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            return None
+        return float(value.detach().float().cpu().item())
+    return float(value)
+
+
 def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
     """Extract aggregate MoE routing diagnostics from model outputs."""
 
     metrics: dict[str, torch.Tensor] = {}
-    aux_loss = getattr(outputs, "aux_loss", None)
-    if aux_loss is not None:
-        metrics["aux_loss"] = aux_loss.detach()
 
-    router_z_loss = getattr(outputs, "router_z_loss", None)
-    if router_z_loss is not None:
-        metrics["router_z_loss"] = router_z_loss.detach()
+    if outputs is None:
+        return metrics
 
     router_logits = getattr(outputs, "router_logits", None)
+    if router_logits is None and isinstance(outputs, dict):
+        router_logits = outputs.get("router_logits")
+
+    aux_loss = getattr(outputs, "aux_loss", None)
+    if aux_loss is None and isinstance(outputs, dict):
+        aux_loss = outputs.get("aux_loss")
+
+    router_z_loss = getattr(outputs, "router_z_loss", None)
+    if router_z_loss is None and isinstance(outputs, dict):
+        router_z_loss = outputs.get("router_z_loss")
+
+    if aux_loss is not None:
+        metrics["aux_loss"] = aux_loss.detach().to(dtype=torch.float32)
+    if router_z_loss is not None:
+        metrics["z_loss"] = router_z_loss.detach().to(dtype=torch.float32)
+
     if router_logits is None:
         return metrics
 
-    if isinstance(router_logits, tuple):
-        valid_logits = [layer_logits for layer_logits in router_logits if layer_logits is not None]
-        if not valid_logits:
-            return metrics
-        stacked_logits = torch.cat([layer_logits.reshape(-1, layer_logits.shape[-1]) for layer_logits in valid_logits], dim=0)
-    else:
-        stacked_logits = router_logits.reshape(-1, router_logits.shape[-1])
-
-    if stacked_logits.numel() == 0:
+    if torch.is_tensor(router_logits):
+        router_logits = (router_logits,)
+    elif not isinstance(router_logits, (tuple, list)):
         return metrics
 
-    router_probs = torch.softmax(stacked_logits, dim=-1)
-    expert_prob_mean = router_probs.mean(dim=0)
-    expert_load = torch.nn.functional.one_hot(router_probs.argmax(dim=-1), num_classes=router_probs.shape[-1]).to(router_probs.dtype).mean(dim=0)
-    metrics["router_prob_max"] = expert_prob_mean.max()
-    metrics["router_prob_min"] = expert_prob_mean.min()
-    metrics["router_load_max"] = expert_load.max()
-    metrics["router_load_min"] = expert_load.min()
-    metrics["router_entropy"] = (-(router_probs * torch.log(router_probs.clamp_min(1e-12))).sum(dim=-1)).mean()
+    valid_router_logits = [layer_logits for layer_logits in router_logits if torch.is_tensor(layer_logits)]
+    if not valid_router_logits:
+        return metrics
+
+    layer_entropies: list[torch.Tensor] = []
+    layer_max_probs: list[torch.Tensor] = []
+    layer_load_std: list[torch.Tensor] = []
+    layer_load_imbalance: list[torch.Tensor] = []
+
+    for layer_logits in valid_router_logits:
+        probs = torch.softmax(layer_logits.detach().to(dtype=torch.float32), dim=-1)
+        mean_probs = probs.mean(dim=(0, 1))
+        entropy = -(probs * torch.log(probs.clamp_min(1.0e-8))).sum(dim=-1).mean()
+        max_prob = probs.max(dim=-1).values.mean()
+        load_std = mean_probs.std(unbiased=False)
+        uniform_prob = 1.0 / max(mean_probs.numel(), 1)
+        load_imbalance = torch.mean(torch.abs(mean_probs - uniform_prob))
+
+        layer_entropies.append(entropy)
+        layer_max_probs.append(max_prob)
+        layer_load_std.append(load_std)
+        layer_load_imbalance.append(load_imbalance)
+
+    if layer_entropies:
+        metrics["router_entropy"] = torch.stack(layer_entropies).mean()
+        metrics["router_max_prob"] = torch.stack(layer_max_probs).mean()
+        metrics["expert_load_std"] = torch.stack(layer_load_std).mean()
+        metrics["expert_load_imbalance"] = torch.stack(layer_load_imbalance).mean()
+
     return metrics
 
 
 def log_moe_metrics(
-    module: L.LightningModule,
-    outputs_or_metrics: Any,
-    stage: str,
-    *,
-    on_step: bool,
-    on_epoch: bool = True,
-    sync_dist: bool = True,
+        module: L.LightningModule,
+        outputs_or_metrics: Any,
+        stage: str,
+        *,
+        on_step: bool,
+        on_epoch: bool = True,
+        sync_dist: bool = True,
 ) -> None:
     """Log shared MoE diagnostics from raw outputs or a precomputed metric dict."""
 
-    metrics = outputs_or_metrics if isinstance(outputs_or_metrics, dict) else collect_moe_metrics(outputs_or_metrics)
+    metrics = collect_moe_metrics(outputs_or_metrics)
+
+    if isinstance(outputs_or_metrics, dict):
+        get_metric = outputs_or_metrics.get
+        metrics.update({
+            "aux_loss": get_metric("aux_loss", metrics.get("aux_loss")),
+            "z_loss": get_metric("router_z_loss", metrics.get("z_loss")),
+            "router_entropy": get_metric("router_entropy", metrics.get("router_entropy")),
+            "router_max_prob": get_metric("router_max_prob", metrics.get("router_max_prob")),
+            "expert_load_std": get_metric("expert_load_std", metrics.get("expert_load_std")),
+            "expert_load_imbalance": get_metric("expert_load_imbalance", metrics.get("expert_load_imbalance")),
+        })
+        metrics = {key: value for key, value in metrics.items() if value is not None}
+
     if not metrics:
         return
 
-    for name in ("aux_loss", "router_z_loss", "router_prob_max", "router_prob_min", "router_load_max", "router_load_min", "router_entropy"):
-        if name in metrics:
-            module.log(f"{stage}/{name}", metrics[name], prog_bar=False, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
+    log_kwargs = {"prog_bar": False, "on_step": on_step, "on_epoch": on_epoch, "sync_dist": sync_dist}
+
+    for key, value in metrics.items():
+        formatted_value = format_metric_value(value)
+        if formatted_value is not None:
+            module.log(f"{stage}/moe_{key}", formatted_value, **log_kwargs)
