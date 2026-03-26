@@ -72,6 +72,7 @@ class DatasetSource:
 class DataConfig:
     """Dataset, formatting, and tokenization configuration."""
 
+    cache_dir: str = "./.cache/huggingface"
     dataset_name: Optional[str] = None
     dataset_config: Optional[str] = None
     train_split: str = "train"

@@ -5,11 +5,12 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import torch
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import Dataset
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader
 
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
+from lightning_grpo.data.base import load_dataset_from_config, resolve_validation_split_name
 from lightning_grpo.utils.modeling import load_tokenizer
 
 
@@ -43,14 +44,6 @@ class PretrainDataModule(LightningDataModule):
         self.collator = PretrainBatchCollator(self.tokenizer.pad_token_id)
         self.train_dataset: Optional[Dataset] = None
         self.val_dataset: Optional[Dataset] = None
-
-    def _load_json_or_named_dataset(self, files: list[str], split_name: str) -> Dataset:
-        if files:
-            datasets_list = [load_dataset("json", data_files=path, split="train") for path in files]
-            return concatenate_datasets(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
-
-        dataset_dict = load_dataset(self.config.data.dataset_name, self.config.data.dataset_config)
-        return dataset_dict[split_name]
 
     def _tokenize_dataset(self, dataset: Dataset) -> Dataset:
         text_column = self.config.data.text_column
@@ -100,20 +93,23 @@ class PretrainDataModule(LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         """Load and tokenize the pretraining dataset."""
 
-        if not self.config.data.train_files and not self.config.data.dataset_name:
-            raise ValueError("Either data.train_files or data.dataset_name must be configured for pretraining.")
+        if (
+                not self.config.data.train_files
+                and not self.config.data.dataset_name
+                and not self.config.data.dataset_mixture
+        ):
+            raise ValueError(
+                "One of data.train_files, data.dataset_name, or data.dataset_mixture must be configured for pretraining."
+            )
         if stage in (None, "fit"):
-            train_dataset = self._load_json_or_named_dataset(self.config.data.train_files, self.config.data.train_split)
+            dataset_dict = load_dataset_from_config(self.config.data)
+            train_dataset = dataset_dict[self.config.data.train_split]
             self.train_dataset = self._tokenize_dataset(train_dataset)
 
             self.val_dataset = None
-            if self.config.data.val_files:
-                val_dataset = self._load_json_or_named_dataset(self.config.data.val_files, "train")
-                self.val_dataset = self._tokenize_dataset(val_dataset)
-            elif self.config.data.dataset_name and self.config.data.val_split:
-                dataset_dict = load_dataset(self.config.data.dataset_name, self.config.data.dataset_config)
-                if self.config.data.val_split in dataset_dict:
-                    self.val_dataset = self._tokenize_dataset(dataset_dict[self.config.data.val_split])
+            val_split_name = resolve_validation_split_name(self.config.data, dataset_dict)
+            if val_split_name is not None:
+                self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name])
 
     def train_dataloader(self) -> DataLoader:
         """Build the training dataloader."""

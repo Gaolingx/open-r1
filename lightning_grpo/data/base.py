@@ -105,10 +105,15 @@ def normalize_conversation_messages(messages: list[dict[str, Any]]) -> tuple[lis
 DEFAULT_VAL_SPLIT_NAME = "test"
 
 
-def _load_single_dataset(source: DatasetSource, seed: int) -> Dataset:
+def _load_single_dataset(source: DatasetSource, seed: int, cache_dir: str) -> Dataset:
     """Load one dataset source from the Hugging Face hub."""
 
-    dataset = load_dataset(source.path, source.config_name, split=source.split)
+    dataset = load_dataset(
+        source.path,
+        source.config_name,
+        split=source.split,
+        cache_dir=cache_dir,
+    )
     if source.columns:
         dataset = dataset.select_columns(source.columns)
     if source.weight < 1.0:
@@ -117,10 +122,10 @@ def _load_single_dataset(source: DatasetSource, seed: int) -> Dataset:
     return dataset
 
 
-def _load_local_json_datasets(files: list[str]) -> Dataset:
+def _load_local_json_datasets(files: list[str], cache_dir: str) -> Dataset:
     """Load one or more local JSON/JSONL files as a single training split."""
 
-    datasets = [load_dataset("json", data_files=path, split="train") for path in files]
+    datasets = [load_dataset("json", data_files=path, split="train", cache_dir=cache_dir) for path in files]
     return concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
 
 
@@ -157,16 +162,25 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
     """Load a dataset or dataset mixture from configuration."""
 
     if data_config.train_files:
-        dataset_dict = DatasetDict({data_config.train_split: _load_local_json_datasets(data_config.train_files)})
+        dataset_dict = DatasetDict({
+            data_config.train_split: _load_local_json_datasets(data_config.train_files, data_config.cache_dir)
+        })
         if data_config.val_files:
             val_split_name = data_config.val_split or DEFAULT_VAL_SPLIT_NAME
-            dataset_dict[val_split_name] = _load_local_json_datasets(data_config.val_files)
+            dataset_dict[val_split_name] = _load_local_json_datasets(data_config.val_files, data_config.cache_dir)
     elif data_config.dataset_mixture:
-        datasets = [_load_single_dataset(source, seed=data_config.split_seed) for source in data_config.dataset_mixture]
+        datasets = [
+            _load_single_dataset(source, seed=data_config.split_seed, cache_dir=data_config.cache_dir)
+            for source in data_config.dataset_mixture
+        ]
         combined_dataset = concatenate_datasets(datasets).shuffle(seed=data_config.split_seed)
         dataset_dict = DatasetDict({data_config.train_split: combined_dataset})
     elif data_config.dataset_name:
-        dataset_dict = load_dataset(data_config.dataset_name, data_config.dataset_config)
+        dataset_dict = load_dataset(
+            data_config.dataset_name,
+            data_config.dataset_config,
+            cache_dir=data_config.cache_dir,
+        )
     else:
         raise ValueError("One of data.train_files, data.dataset_name, or data.dataset_mixture must be configured.")
 
