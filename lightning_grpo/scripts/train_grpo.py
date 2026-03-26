@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -16,45 +15,11 @@ for path in (PROJECT_ROOT, SRC_ROOT):
 
 import lightning as L
 
-from lightning_grpo.configs.grpo import GRPOConfig
+from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.data.grpo import GRPODataModule
 from lightning_grpo.models.grpo_module import GRPOLightningModule
 from lightning_grpo.utils.config import load_experiment_config
-from lightning_grpo.utils.trainer import build_trainer
-
-
-def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[str]:
-    """Resolve a checkpoint path for resuming training."""
-
-    if not resume_arg:
-        return None
-
-    if resume_arg.lower() == "last":
-        last_ckpt = Path(default_ckpt_dir) / "last.ckpt"
-        if last_ckpt.exists():
-            print(f"Resuming from latest checkpoint: {last_ckpt}")
-            return str(last_ckpt)
-        return None
-
-    p = Path(resume_arg)
-    if p.is_file() and p.suffix == ".ckpt":
-        print(f"Resuming from checkpoint file: {p}")
-        return str(p)
-    if p.is_dir():
-        candidates = sorted(
-            [x for x in p.rglob("*.ckpt") if x.name != "last.ckpt"],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )
-        if candidates:
-            print(f"Resuming from checkpoint in dir: {candidates[0]}")
-            return str(candidates[0])
-
-        last_ckpt = p / "last.ckpt"
-        if last_ckpt.exists():
-            print(f"Resuming from last checkpoint in dir: {last_ckpt}")
-            return str(last_ckpt)
-    return None
+from lightning_grpo.utils.trainer import build_trainer, find_resume_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +58,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional LoRA initialization path. When provided, LoRA is enabled and initialized from this path.",
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory",
+    )
     return parser.parse_args()
 
 
@@ -113,6 +84,8 @@ def main() -> None:
     if args.lora_init_path is not None:
         config.model.lora.enabled = True
         setattr(config.model.lora, "init_path", args.lora_init_path)
+    if args.output_dir is not None:
+        config.output_dir = args.output_dir
 
     L.seed_everything(config.seed, workers=True)
     data_module = GRPODataModule(

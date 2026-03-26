@@ -8,11 +8,13 @@ from typing import Any
 import lightning as L
 import torch
 import torch.nn.functional as F
+from lightning.pytorch.utilities import rank_zero_info
 
 from open_r1.rewards import get_reward_funcs
-from lightning_grpo.configs.grpo import GRPOConfig
+from lightning_grpo.models.rollout_engine import create_rollout_engine, compute_per_token_logps
+from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.models.common import build_optimizer, build_scheduler, entropy_from_logits, masked_mean
-from lightning_grpo.utils.modeling import count_trainable_parameters, load_causal_lm, load_tokenizer
+from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, load_causal_lm, load_tokenizer
 
 
 class GRPOLightningModule(L.LightningModule):
@@ -23,11 +25,22 @@ class GRPOLightningModule(L.LightningModule):
         self.config = config
         self.policy = load_causal_lm(config.model, config.precision)
         self.reference_model = load_causal_lm(config.model, config.precision) if config.rollout.use_reference_model else None
+        rank_zero_info(f"Loaded GRPO model from {describe_model_source(config.model)}")
         if self.reference_model is not None:
             self.reference_model.requires_grad_(False)
             self.reference_model.eval()
 
         self.tokenizer = load_tokenizer(config.model)
+        self.rollout_engine = create_rollout_engine(
+            engine_type=config.rollout.engine.engine_type,
+            policy_model=self.policy,
+            tokenizer=self.tokenizer,
+            temperature=config.rollout.temperature,
+            sglang_base_url=config.rollout.engine.sglang_base_url,
+            sglang_model_path=config.rollout.engine.sglang_model_path,
+            sglang_shared_path=config.rollout.engine.sglang_shared_path,
+            request_timeout=config.rollout.engine.request_timeout,
+        )
         self.reward_funcs = get_reward_funcs(self._build_reward_script_args())
         reward_weights = config.reward.reward_weights
         if reward_weights is not None:
@@ -103,41 +116,19 @@ class GRPOLightningModule(L.LightningModule):
     def _get_per_token_logps(self, model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, logits_to_keep: int) -> torch.Tensor:
         """Compute per-token log-probabilities over the completion region only."""
 
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-        logits = outputs.logits[:, :-1, :]
-        logits = logits[:, -logits_to_keep:, :]
-        logits = logits / self.config.rollout.temperature
-        completion_ids = input_ids[:, -logits_to_keep:]
-        return self._selective_log_softmax(logits, completion_ids)
-
-    def _truncate_completions(self, completion_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mask tokens after the first EOS token, following the TRL GRPO generation path."""
-
-        is_eos = completion_ids == self.tokenizer.eos_token_id
-        eos_idx = torch.full(
-            (completion_ids.size(0),),
-            completion_ids.size(1),
-            dtype=torch.long,
-            device=completion_ids.device,
+        return compute_per_token_logps(
+            model,
+            input_ids,
+            logits_to_keep,
+            attention_mask=attention_mask,
+            temperature=self.config.rollout.temperature,
         )
-        has_eos = is_eos.any(dim=1)
-        eos_idx[has_eos] = is_eos.int().argmax(dim=1)[has_eos]
-        token_positions = torch.arange(completion_ids.size(1), device=completion_ids.device).expand(completion_ids.size(0), -1)
-        completion_mask = (token_positions <= eos_idx.unsqueeze(1)).long()
-        completion_ids = completion_ids.masked_fill(completion_mask == 0, self.tokenizer.pad_token_id)
-        return completion_ids, completion_mask
 
-    def _decode_completion_ids(self, completion_ids: torch.Tensor, completion_mask: torch.Tensor) -> tuple[list[str], list[list[dict[str, str]]], list[list[int]]]:
-        """Decode completions into both plain-text and reward-compatible chat formats."""
+    def _decode_completion_ids(self, completion_texts: list[str]) -> tuple[list[str], list[list[dict[str, str]]]]:
+        """Convert decoded completions into reward-compatible chat formats."""
 
-        completion_id_lists: list[list[int]] = []
-        for ids, mask in zip(completion_ids, completion_mask, strict=True):
-            valid_ids = ids[mask.bool()].tolist()
-            completion_id_lists.append(valid_ids)
-
-        completion_texts = self.tokenizer.batch_decode(completion_id_lists, skip_special_tokens=True)
         structured_completions = [[{"role": "assistant", "content": text}] for text in completion_texts]
-        return completion_texts, structured_completions, completion_id_lists
+        return completion_texts, structured_completions
 
     def _gather_tensor_for_metrics(self, tensor: torch.Tensor) -> torch.Tensor:
         """Gather same-shaped tensors across ranks for exact distributed metrics."""
@@ -162,69 +153,68 @@ class GRPOLightningModule(L.LightningModule):
         """Generate grouped completions for online GRPO optimization."""
 
         num_generations = self._resolve_num_generations(training)
-        prompt_ids = batch["input_ids"]
-        prompt_mask = batch["attention_mask"]
-
-        original_padding_side = self.tokenizer.padding_side
-        if original_padding_side != "left":
-            self.tokenizer.padding_side = "left"
-
-        try:
-            generated = self.policy.generate(
-                input_ids=prompt_ids,
-                attention_mask=prompt_mask,
-                do_sample=True,
-                temperature=self.config.rollout.temperature,
-                top_p=self.config.rollout.top_p,
-                max_new_tokens=self.config.rollout.max_completion_length,
-                num_return_sequences=num_generations,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True,
-            )
-        finally:
-            self.tokenizer.padding_side = original_padding_side
-
-        repeated_prompt_ids = self._repeat_interleave_rows(prompt_ids, num_generations)
-        repeated_prompt_mask = self._repeat_interleave_rows(prompt_mask, num_generations)
-        prompt_length = repeated_prompt_ids.shape[1]
-
-        completion_ids = generated[:, prompt_length:]
-        completion_ids, completion_mask = self._truncate_completions(completion_ids)
-        completion_texts, structured_completions, completion_id_lists = self._decode_completion_ids(completion_ids, completion_mask)
+        rollout = self.rollout_engine.rollout(
+            prompt_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            num_generations=num_generations,
+            max_new_tokens=self.config.rollout.max_completion_length,
+            temperature=self.config.rollout.temperature,
+            top_p=self.config.rollout.top_p,
+        )
+        completion_texts, structured_completions = self._decode_completion_ids(rollout.completions_text)
 
         repeated_prompts = [prompt for prompt in batch["prompt_text"] for _ in range(num_generations)]
         repeated_metadata = [meta for meta in batch["metadata"] for _ in range(num_generations)]
 
-        model_input_ids = torch.cat([repeated_prompt_ids, completion_ids], dim=1)
-        model_attention_mask = torch.cat([repeated_prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.shape[1]
-        old_per_token_logps = self._get_per_token_logps(
-            self.policy,
-            model_input_ids,
-            model_attention_mask,
-            logits_to_keep,
-        )
-
-        completion_truncated = torch.tensor(
-            [len(ids) == 0 or ids[-1] != self.tokenizer.eos_token_id for ids in completion_id_lists],
-            device=completion_ids.device,
-            dtype=torch.bool,
-        )
-
         return {
-            "prompt_ids": repeated_prompt_ids,
-            "prompt_mask": repeated_prompt_mask,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            "completion_truncated": completion_truncated,
-            "old_per_token_logps": old_per_token_logps,
+            "prompt_ids": rollout.prompt_ids,
+            "prompt_mask": rollout.prompt_mask,
+            "completion_ids": rollout.completion_ids,
+            "completion_mask": rollout.completion_mask,
+            "completion_truncated": rollout.completion_truncated,
+            "old_per_token_logps": rollout.per_token_logps,
             "prompts": repeated_prompts,
             "completions_text": completion_texts,
             "completions": structured_completions,
-            "completion_id_lists": completion_id_lists,
+            "completion_id_lists": rollout.completion_id_lists,
             "metadata": repeated_metadata,
         }
+
+    @torch.no_grad()
+    def _emit_debug_samples(self) -> None:
+        """Emit sample-level debug generations for configured prompts."""
+
+        debug_config = self.config.rollout.debug
+        if not debug_config.enabled or not debug_config.questions:
+            return
+        if not self.trainer.is_global_zero:
+            return
+
+        self.policy.eval()
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        try:
+            for index, question in enumerate(debug_config.questions):
+                tokenized = self.tokenizer([question], return_tensors="pt", padding=True, truncation=True).to(self.device)
+                generated = self.policy.generate(
+                    input_ids=tokenized["input_ids"],
+                    attention_mask=tokenized["attention_mask"],
+                    do_sample=True,
+                    temperature=self.config.rollout.temperature,
+                    top_p=self.config.rollout.top_p,
+                    max_new_tokens=debug_config.max_new_tokens,
+                    num_return_sequences=1,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
+                )
+                completion = generated[:, tokenized["input_ids"].shape[1]:]
+                text = self.tokenizer.batch_decode(completion, skip_special_tokens=True)[0]
+                rank_zero_info(f"[GRPO DEBUG][{index}] question: {question}")
+                rank_zero_info(f"[GRPO DEBUG][{index}] completion: {text}")
+        finally:
+            self.tokenizer.padding_side = original_padding_side
+            self.policy.train()
 
     def _compute_rewards(
             self,
@@ -321,10 +311,14 @@ class GRPOLightningModule(L.LightningModule):
         log_ratio = per_token_logps - old_per_token_logps
         importance_ratio = torch.exp(log_ratio)
         clip_eps = getattr(self.config.rollout, "epsilon", 0.2)
-        clipped_ratio = torch.clamp(importance_ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-        surrogate_unclipped = importance_ratio * advantages
-        surrogate_clipped = clipped_ratio * advantages
-        surrogate = torch.minimum(surrogate_unclipped, surrogate_clipped)
+        if self.config.rollout.loss_type == "cispo":
+            clipped_ratio = torch.clamp(importance_ratio, max=self.config.rollout.epsilon_high).detach()
+            surrogate = clipped_ratio * advantages * per_token_logps
+        else:
+            clipped_ratio = torch.clamp(importance_ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+            surrogate_unclipped = importance_ratio * advantages
+            surrogate_clipped = clipped_ratio * advantages
+            surrogate = torch.minimum(surrogate_unclipped, surrogate_clipped)
 
         if ref_per_token_logps is not None:
             per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1.0
@@ -488,6 +482,10 @@ class GRPOLightningModule(L.LightningModule):
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         """Run one online rollout and optimization step."""
 
+        debug_every = self.config.rollout.debug.every_n_steps
+        if self.config.rollout.debug.enabled and debug_every > 0 and self.global_step % debug_every == 0:
+            self._emit_debug_samples()
+
         rollout_batch = self._generate(batch, training=True)
         loss, metrics = self._compute_loss(rollout_batch, training=True)
         self._log_metrics("train", loss, metrics, on_step=True, on_epoch=True)
@@ -507,3 +505,9 @@ class GRPOLightningModule(L.LightningModule):
         optimizer = build_optimizer(self.policy.parameters(), self.config.optimization)
         scheduler = build_scheduler(optimizer, self.config.optimization, self.trainer.estimated_stepping_batches)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
+    def on_train_batch_end(self, outputs: Any, batch: dict[str, Any], batch_idx: int) -> None:
+        """Sync rollout backend after optimizer updates."""
+
+        if self.config.rollout.engine.engine_type == "policy":
+            self.rollout_engine.update_policy(self.policy)

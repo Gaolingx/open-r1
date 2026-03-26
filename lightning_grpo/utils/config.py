@@ -8,13 +8,15 @@ from typing import Any, Dict
 import yaml
 import json
 
-from lightning_grpo.configs.base import ExperimentConfig
-from lightning_grpo.configs.grpo import GRPOConfig
-from lightning_grpo.configs.sft import SFTConfig
+from lightning_grpo.utils.configs.base import ExperimentConfig
+from lightning_grpo.utils.configs.grpo import GRPOConfig
+from lightning_grpo.utils.configs.pretrain import PretrainConfig
+from lightning_grpo.utils.configs.sft import SFTConfig
 
 CONFIG_REGISTRY = {
     "sft": SFTConfig,
     "grpo": GRPOConfig,
+    "pretrain": PretrainConfig,
 }
 
 

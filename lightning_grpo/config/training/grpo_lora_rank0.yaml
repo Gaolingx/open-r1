@@ -4,7 +4,7 @@ output_dir: outputs/lightning_grpo_demo
 
 precision:
   parameter_dtype: bf16
-  trainer_precision: bf16-true
+  trainer_precision: bf16-mixed
 
 model:
   model_name_or_path: Qwen/Qwen3.5-0.8B
@@ -56,7 +56,19 @@ rollout:
   temperature: 0.8
   top_p: 0.95
   kl_beta: 0.04
+  loss_type: grpo
+  epsilon: 0.2
+  epsilon_high: 5.0
   use_reference_model: true
+  engine:
+    engine_type: policy
+    request_timeout: 120
+  debug:
+    enabled: false
+    every_n_steps: 50
+    questions:
+      - If x + 4 = 10, what is x?
+    max_new_tokens: 256
 
 logging:
   project: open-r1-lightning
@@ -64,9 +76,6 @@ logging:
   enable_csv: true
   enable_wandb: false
   log_every_n_steps: 5
-  sample_every_n_steps: 50
-  sample_prompts:
-    - If x + 4 = 10, what is x?
 
 checkpoint:
   dirpath: outputs/lightning_grpo_demo/checkpoints

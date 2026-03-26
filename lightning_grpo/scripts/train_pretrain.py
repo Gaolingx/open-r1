@@ -1,4 +1,4 @@
-"""CLI entrypoint for Lightning-based supervised fine-tuning."""
+"""CLI entrypoint for Lightning-based causal language model pretraining."""
 
 from __future__ import annotations
 
@@ -14,18 +14,18 @@ for path in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, path_str)
 
 import lightning as L
-
-from lightning_grpo.utils.configs.sft import SFTConfig
-from lightning_grpo.data.sft import SFTDataModule
-from lightning_grpo.models.sft_module import SFTLightningModule
+ 
+from lightning_grpo.data.pretrain_module import PretrainDataModule
+from lightning_grpo.models.pretrain_module import PretrainLightningModule
 from lightning_grpo.utils.config import load_experiment_config
+from lightning_grpo.utils.configs.pretrain import PretrainConfig
 from lightning_grpo.utils.trainer import build_trainer, find_resume_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
 
-    parser = argparse.ArgumentParser(description="Train an SFT model with PyTorch Lightning.")
+    parser = argparse.ArgumentParser(description="Train a pretraining model with PyTorch Lightning.")
     parser.add_argument("--config", type=str, required=True, help="Path to the YAML config file.")
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -72,13 +72,13 @@ def main() -> None:
 
     args = parse_args()
     config = load_experiment_config(args.config)
-    if not isinstance(config, SFTConfig):
-        raise TypeError("Expected an SFT config for train_sft.py")
+    if not isinstance(config, PretrainConfig):
+        raise TypeError("Expected a pretrain config for train_pretrain.py")
 
     if args.seed is not None:
         config.seed = args.seed
     if args.precision is not None:
-        config.precision = args.precision
+        config.precision.trainer_precision = args.precision
     if args.gpus is not None:
         config.distributed.devices = args.gpus
     if args.lora_init_path is not None:
@@ -88,13 +88,8 @@ def main() -> None:
         config.output_dir = args.output_dir
 
     L.seed_everything(config.seed, workers=True)
-    data_module = SFTDataModule(
-        data_config=config.data,
-        model_config=config.model,
-        optimization_config=config.optimization,
-        system_prompt=config.system_prompt,
-    )
-    module = SFTLightningModule(config)
+    data_module = PretrainDataModule(config)
+    module = PretrainLightningModule(config)
     trainer = build_trainer(config)
     ckpt_path = find_resume_checkpoint(args.resume_from_checkpoint, config.checkpoint.dirpath)
     trainer.fit(module, datamodule=data_module, ckpt_path=ckpt_path)

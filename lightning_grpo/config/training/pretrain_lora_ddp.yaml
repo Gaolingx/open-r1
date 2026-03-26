@@ -1,0 +1,69 @@
+task: pretrain
+seed: 42
+output_dir: outputs/lightning_pretrain_demo
+
+precision:
+  parameter_dtype: bf16
+  trainer_precision: bf16-mixed
+
+model:
+  model_family: minimind
+  model_name_or_path: MiniMind
+  model_config_path: lightning_grpo/config/model/model_config.json
+  pretrained_weight: none
+  custom_weight_dir: outputs
+  gradient_checkpointing: true
+  use_cache: false
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+data:
+  train_files:
+    - lightning_grpo/dataset/pretrain_t2t_mini.jsonl
+  text_column: text
+  train_split: train
+  max_seq_length: 340
+  num_workers: 4
+  preprocessing_batch_size: 128
+  preprocessing_use_cache: false
+  preprocessing_keep_in_memory: true
+
+optimization:
+  optimizer: adamw
+  learning_rate: 5.0e-4
+  weight_decay: 0.01
+  warmup_steps: 100
+  scheduler: cosine
+  max_epochs: 2
+  gradient_accumulation_steps: 8
+  gradient_clip_val: 1.0
+  train_micro_batch_size: 32
+  eval_micro_batch_size: 1
+
+logging:
+  project: open-r1-lightning
+  run_name: pretrain-demo
+  enable_csv: true
+  enable_wandb: false
+  log_every_n_steps: 100
+  sample_every_n_steps: 0
+  sample_prompts: []
+
+checkpoint:
+  dirpath: outputs/lightning_pretrain_demo/checkpoints
+  monitor: train/loss
+  mode: min
+  save_top_k: 2
+  save_last: true
+  every_n_train_steps: 1000
+
+distributed:
+  strategy: ddp
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  sync_batchnorm: false

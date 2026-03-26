@@ -10,7 +10,7 @@ from lightning.pytorch.strategies import DDPStrategy, FSDPStrategy
 from torch.distributed.fsdp import BackwardPrefetch, CPUOffload, ShardingStrategy
 from torch.nn import Module
 
-from lightning_grpo.configs.base import DistributedConfig, PrecisionConfig
+from lightning_grpo.utils.configs.base import DistributedConfig, PrecisionConfig
 
 
 def _resolve_sharding_strategy(name: str) -> ShardingStrategy:

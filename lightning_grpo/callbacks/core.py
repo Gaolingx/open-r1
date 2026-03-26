@@ -12,7 +12,7 @@ import torch
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 
-from lightning_grpo.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
+from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
 from lightning_grpo.utils.modeling import load_tokenizer
 from lightning_grpo.utils.config import save_json_config
 

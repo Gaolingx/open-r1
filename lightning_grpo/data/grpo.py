@@ -9,8 +9,8 @@ from lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 
-from lightning_grpo.configs.base import DataConfig, ModelConfig, OptimizationConfig
-from lightning_grpo.configs.grpo import RolloutConfig
+from lightning_grpo.utils.configs.base import DataConfig, ModelConfig, OptimizationConfig
+from lightning_grpo.utils.configs.grpo import RolloutConfig
 from lightning_grpo.data.base import (
     ConversationTemplate,
     apply_chat_template,

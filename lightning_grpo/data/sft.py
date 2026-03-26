@@ -10,11 +10,14 @@ from lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 
-from lightning_grpo.configs.base import DataConfig, ModelConfig, OptimizationConfig
+from lightning_grpo.utils.configs.base import DataConfig, ModelConfig, OptimizationConfig
 from lightning_grpo.data.base import (
     ConversationTemplate,
     apply_chat_template,
     load_dataset_from_config,
+    normalize_conversation_messages,
+    postprocess_chat_text,
+    preprocess_chat_messages,
     resolve_validation_split_name,
 )
 from lightning_grpo.utils.modeling import load_tokenizer
@@ -75,6 +78,11 @@ class SFTDataModule(LightningDataModule):
         self.train_dataset: Optional[Dataset] = None
         self.val_dataset: Optional[Dataset] = None
 
+    def _build_assistant_mask_from_labels(self, labels: list[int]) -> list[int]:
+        """Derive a dense assistant token mask from labels."""
+
+        return [0 if token_id == -100 else 1 for token_id in labels]
+
     def setup(self, stage: Optional[str] = None) -> None:
         """Load and preprocess train and validation datasets."""
 
@@ -115,39 +123,75 @@ class SFTDataModule(LightningDataModule):
             labels_batch: list[list[int]] = []
 
             for sample in samples:
-                messages = sample["messages"]
-                full_text = apply_chat_template(
-                    tokenizer=self.tokenizer,
-                    messages=messages,
-                    add_generation_prompt=False,
-                )
-                full_tokenized = self.tokenizer(
-                    full_text,
-                    truncation=True,
-                    max_length=self.data_config.max_seq_length,
-                    padding=False,
-                )
-                full_ids = list(full_tokenized["input_ids"])
-                attention_mask = list(full_tokenized["attention_mask"])
+                raw_messages = sample["messages"]
+                messages, tools = normalize_conversation_messages(raw_messages)
+                messages = preprocess_chat_messages(messages)
 
-                if self.data_config.mask_prompt_labels:
-                    prompt_messages, _ = self._split_prompt_and_completion(messages)
-                    prompt_text = apply_chat_template(
+                processed = None
+                if self.data_config.assistant_only_loss and hasattr(self.tokenizer, "apply_chat_template"):
+                    try:
+                        processed = self.tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=True,
+                            add_generation_prompt=False,
+                            tools=tools,
+                            return_dict=True,
+                            return_assistant_tokens_mask=True,
+                        )
+                    except TypeError:
+                        processed = None
+
+                if processed is not None:
+                    full_ids = list(processed["input_ids"])
+                    attention_mask = list(processed.get("attention_mask", [1] * len(full_ids)))
+                    assistant_mask = list(processed.get("assistant_masks", []))
+                    labels = list(full_ids)
+                    if self.data_config.mask_prompt_labels or self.data_config.assistant_only_loss:
+                        if assistant_mask:
+                            labels = [token_id if mask else -100 for token_id, mask in zip(full_ids, assistant_mask)]
+                        elif self.data_config.assistant_only_loss:
+                            raise RuntimeError(
+                                "assistant_only_loss=True but tokenizer did not return assistant token masks."
+                            )
+                else:
+                    full_text = apply_chat_template(
                         tokenizer=self.tokenizer,
-                        messages=prompt_messages,
-                        add_generation_prompt=True,
+                        messages=messages,
+                        add_generation_prompt=False,
+                        tools=tools,
                     )
-                    prompt_tokenized = self.tokenizer(
-                        prompt_text,
+                    full_text = postprocess_chat_text(full_text)
+                    full_tokenized = self.tokenizer(
+                        full_text,
                         truncation=True,
                         max_length=self.data_config.max_seq_length,
                         padding=False,
+                        add_special_tokens=False,
                     )
-                    prompt_ids = list(prompt_tokenized["input_ids"])
-                    prompt_len = min(len(prompt_ids), len(full_ids))
-                    labels = [-100] * prompt_len + full_ids[prompt_len:]
-                else:
-                    labels = list(full_ids)
+                    full_ids = list(full_tokenized["input_ids"])
+                    attention_mask = list(full_tokenized["attention_mask"])
+
+                    if self.data_config.mask_prompt_labels:
+                        prompt_messages, _ = self._split_prompt_and_completion(messages)
+                        prompt_text = apply_chat_template(
+                            tokenizer=self.tokenizer,
+                            messages=prompt_messages,
+                            add_generation_prompt=True,
+                            tools=tools,
+                        )
+                        prompt_text = postprocess_chat_text(prompt_text)
+                        prompt_tokenized = self.tokenizer(
+                            prompt_text,
+                            truncation=True,
+                            max_length=self.data_config.max_seq_length,
+                            padding=False,
+                            add_special_tokens=False,
+                        )
+                        prompt_ids = list(prompt_tokenized["input_ids"])
+                        prompt_len = min(len(prompt_ids), len(full_ids))
+                        labels = [-100] * prompt_len + full_ids[prompt_len:]
+                    else:
+                        labels = list(full_ids)
 
                 input_ids_batch.append(full_ids)
                 attention_mask_batch.append(attention_mask)

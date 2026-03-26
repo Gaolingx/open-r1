@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from lightning_grpo.configs.base import ExperimentConfig
+from lightning_grpo.utils.configs.base import ExperimentConfig
 
 
 @dataclass
@@ -32,6 +32,27 @@ class RewardConfig:
 
 
 @dataclass
+class RolloutEngineConfig:
+    """Pluggable rollout backend configuration."""
+
+    engine_type: Literal["policy", "sglang"] = "policy"
+    sglang_base_url: str = "http://localhost:8996"
+    sglang_model_path: Optional[str] = None
+    sglang_shared_path: str = "./sglang_ckpt_grpo"
+    request_timeout: int = 120
+
+
+@dataclass
+class DebugConfig:
+    """Sample-level debug configuration for GRPO training."""
+
+    enabled: bool = False
+    every_n_steps: int = 0
+    questions: list[str] = field(default_factory=list)
+    max_new_tokens: int = 256
+
+
+@dataclass
 class RolloutConfig:
     """Online rollout configuration for GRPO."""
 
@@ -44,9 +65,13 @@ class RolloutConfig:
     top_p: float = 0.95
     kl_beta: float = 0.04
     epsilon: float = 0.2
+    epsilon_high: float = 5.0
+    loss_type: Literal["grpo", "cispo"] = "grpo"
     advantage_epsilon: float = 1.0e-6
     use_reference_model: bool = True
     generation_batch_size: int = 1
+    engine: RolloutEngineConfig = field(default_factory=RolloutEngineConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
 
 
 @dataclass

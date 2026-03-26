@@ -2,14 +2,49 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
+from pathlib import Path
 
 import lightning as L
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from lightning_grpo.callbacks import build_callbacks
-from lightning_grpo.configs.base import ExperimentConfig
+from lightning_grpo.utils.configs.base import ExperimentConfig
 from lightning_grpo.strategies import trainer_strategy_kwargs
+
+
+def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[str]:
+    """Resolve a checkpoint path for resuming training."""
+
+    if not resume_arg:
+        return None
+
+    if resume_arg.lower() == "last":
+        last_ckpt = Path(default_ckpt_dir) / "last.ckpt"
+        if last_ckpt.exists():
+            print(f"Resuming from latest checkpoint: {last_ckpt}")
+            return str(last_ckpt)
+        return None
+
+    p = Path(resume_arg)
+    if p.is_file() and p.suffix == ".ckpt":
+        print(f"Resuming from checkpoint file: {p}")
+        return str(p)
+    if p.is_dir():
+        candidates = sorted(
+            [x for x in p.rglob("*.ckpt") if x.name != "last.ckpt"],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            print(f"Resuming from checkpoint in dir: {candidates[0]}")
+            return str(candidates[0])
+
+        last_ckpt = p / "last.ckpt"
+        if last_ckpt.exists():
+            print(f"Resuming from last checkpoint in dir: {last_ckpt}")
+            return str(last_ckpt)
+    return None
 
 
 def build_loggers(config: ExperimentConfig) -> list[Any]:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from lightning_grpo.configs.base import ExperimentConfig
+from lightning_grpo.utils.configs.base import ExperimentConfig
 
 
 @dataclass

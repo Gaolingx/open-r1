@@ -36,9 +36,14 @@ class LoRAConfig:
 class ModelConfig:
     """Model loading and architecture adaptation settings."""
 
+    model_family: Literal["auto", "minimind"] = "auto"
     model_name_or_path: str = "Qwen/Qwen2.5-1.5B-Instruct"
     model_revision: str = "main"
     tokenizer_name_or_path: Optional[str] = None
+    model_config_path: Optional[str] = None
+    model_init_kwargs: dict[str, Any] = field(default_factory=dict)
+    pretrained_weight: str = "none"
+    custom_weight_dir: str = "outputs"
     trust_remote_code: bool = False
     attn_implementation: Optional[str] = "flash_attention_2"
     chat_template: Optional[str] = None
@@ -82,12 +87,14 @@ class DataConfig:
     streaming: bool = False
     add_generation_prompt: bool = False
     mask_prompt_labels: bool = True
+    assistant_only_loss: bool = False
     pack_sequences: bool = False
     preprocessing_use_cache: bool = True
     preprocessing_keep_in_memory: bool = False
     train_files: list[str] = field(default_factory=list)
     val_files: list[str] = field(default_factory=list)
     dataset_mixture: list[DatasetSource] = field(default_factory=list)
+    text_column: str = "text"
 
 
 @dataclass
@@ -174,7 +181,7 @@ class ExperimentConfig:
     """Top-level configuration consumed by Lightning entrypoints."""
 
     seed: int = 42
-    task: Literal["sft", "grpo"] = "sft"
+    task: Literal["sft", "grpo", "pretrain"] = "sft"
     output_dir: str = "outputs/default"
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
     model: ModelConfig = field(default_factory=ModelConfig)

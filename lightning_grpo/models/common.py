@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 
-from lightning_grpo.configs.base import OptimizationConfig
+from lightning_grpo.utils.configs.base import OptimizationConfig
 
 
 def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.optim.Optimizer:
@@ -92,3 +92,39 @@ def approx_kl_divergence(log_probs: torch.Tensor, ref_log_probs: torch.Tensor) -
     """Approximate KL divergence between policy and reference log-probabilities."""
 
     return torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1.0
+
+
+def selective_log_softmax(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+    """Gather token log-probabilities for target ids."""
+
+    log_probs = torch.log_softmax(logits, dim=-1)
+    return torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+
+
+def masked_token_stats(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Compute reusable masked token-level metrics for LM training."""
+
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    mask = shift_labels != -100
+    if not mask.any():
+        zero = shift_logits.new_tensor(0.0)
+        return {
+            "token_accuracy": zero,
+            "entropy": zero,
+            "mean_logprob": zero,
+            "perplexity": torch.exp(zero),
+        }
+
+    predictions = shift_logits.argmax(dim=-1)
+    token_accuracy = (((predictions == shift_labels) & mask).sum().to(dtype=torch.float32) / mask.sum().to(dtype=torch.float32))
+    entropy = masked_mean(entropy_from_logits(shift_logits), mask)
+    per_token_logps = selective_log_softmax(shift_logits, shift_labels.masked_fill(~mask, 0))
+    mean_logprob = masked_mean(per_token_logps, mask)
+    perplexity = torch.exp(-mean_logprob)
+    return {
+        "token_accuracy": token_accuracy,
+        "entropy": entropy,
+        "mean_logprob": mean_logprob,
+        "perplexity": perplexity,
+    }
