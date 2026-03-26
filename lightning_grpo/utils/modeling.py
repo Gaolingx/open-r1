@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import torch
-from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from lightning.pytorch.utilities import rank_zero_info
-from module.minimind import MiniMindForCausalLM
+from lightning_grpo.module.minimind.model_minimind import MiniMindConfig, MiniMindForCausalLM, register_minimind_for_auto_class
 
 from lightning_grpo.utils.config import load_json_config
 from lightning_grpo.utils.configs.base import ModelConfig, PrecisionConfig
@@ -31,6 +31,9 @@ def resolve_torch_dtype(precision_config: PrecisionConfig) -> torch.dtype:
 
 def load_tokenizer(model_config: ModelConfig) -> PreTrainedTokenizerBase:
     """Load and normalize the tokenizer."""
+
+    if model_config.model_family == "minimind" and not model_config.tokenizer_name_or_path:
+        raise ValueError("MiniMind requires `tokenizer_name_or_path` for tokenizer loading and HF export.")
 
     tokenizer_name = model_config.tokenizer_name_or_path or model_config.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(
@@ -73,6 +76,16 @@ def _apply_lora_if_needed(model: PreTrainedModel, model_config: ModelConfig) -> 
     """Wrap the model with LoRA adapters when enabled."""
 
     if not model_config.lora.enabled:
+        return model
+
+    if model_config.lora.init_path:
+        lora_path = Path(model_config.lora.init_path).expanduser()
+        rank_zero_info(f"Loading LoRA adapters from {lora_path}")
+        model = PeftModel.from_pretrained(model, str(lora_path), is_trainable=True)
+
+        if model_config.gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
         return model
 
     lora_config = LoraConfig(
@@ -195,3 +208,38 @@ def describe_model_source(model_config: ModelConfig) -> str:
     if model_config.model_family == "auto":
         return model_config.model_name_or_path
     return f"{model_config.model_family}:{model_config.pretrained_weight or 'none'}"
+
+
+def unwrap_model(model: PreTrainedModel) -> PreTrainedModel:
+    return model.get_base_model() if isinstance(model, PeftModel) else model
+
+
+def export_hf_model(
+    model: PreTrainedModel,
+    model_config: ModelConfig,
+    export_dir: str | Path,
+    *,
+    tokenizer: PreTrainedTokenizerBase | None = None,
+    state_dict: dict[str, torch.Tensor] | None = None,
+) -> Path:
+    export_path = Path(export_dir)
+    export_path.mkdir(parents=True, exist_ok=True)
+
+    save_model = model
+    if isinstance(model, PeftModel):
+        save_model = model
+    else:
+        save_model = unwrap_model(model)
+
+    save_kwargs = {"safe_serialization": False}
+    if state_dict is not None:
+        save_kwargs["state_dict"] = state_dict
+    save_model.save_pretrained(str(export_path), **save_kwargs)
+
+    resolved_tokenizer = tokenizer
+    if resolved_tokenizer is None and model_config.tokenizer_name_or_path:
+        resolved_tokenizer = load_tokenizer(model_config)
+    if resolved_tokenizer is not None:
+        resolved_tokenizer.save_pretrained(str(export_path))
+
+    return export_path

@@ -14,6 +14,7 @@ class RewardConfig:
 
     reward_funcs: list[str] = field(default_factory=lambda: ["accuracy", "format", "tag_count"])
     reward_weights: list[float] | None = None
+    format_mode: Literal["strict", "compatible", "no_answer_tag"] = "strict"
     code_language: str = "python"
     repetition_n_grams: int = 3
     repetition_max_penalty: float = -1.0

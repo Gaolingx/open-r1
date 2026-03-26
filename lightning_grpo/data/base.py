@@ -32,6 +32,8 @@ class ConversationTemplate:
 
         if self.messages_column in sample and sample[self.messages_column] is not None:
             return {"messages": sample[self.messages_column]}
+        if "conversations" in sample and sample["conversations"] is not None:
+            return {"messages": sample["conversations"]}
 
         messages: list[dict[str, str]] = []
         if self.system_prompt:
@@ -115,6 +117,13 @@ def _load_single_dataset(source: DatasetSource, seed: int) -> Dataset:
     return dataset
 
 
+def _load_local_json_datasets(files: list[str]) -> Dataset:
+    """Load one or more local JSON/JSONL files as a single training split."""
+
+    datasets = [load_dataset("json", data_files=path, split="train") for path in files]
+    return concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
+
+
 def _with_optional_validation_split(dataset_dict: DatasetDict, data_config: DataConfig) -> DatasetDict:
     """Add a derived validation split when requested and one is not already present."""
 
@@ -147,14 +156,19 @@ def resolve_validation_split_name(data_config: DataConfig, dataset_dict: Dataset
 def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
     """Load a dataset or dataset mixture from configuration."""
 
-    if data_config.dataset_mixture:
+    if data_config.train_files:
+        dataset_dict = DatasetDict({data_config.train_split: _load_local_json_datasets(data_config.train_files)})
+        if data_config.val_files:
+            val_split_name = data_config.val_split or DEFAULT_VAL_SPLIT_NAME
+            dataset_dict[val_split_name] = _load_local_json_datasets(data_config.val_files)
+    elif data_config.dataset_mixture:
         datasets = [_load_single_dataset(source, seed=data_config.split_seed) for source in data_config.dataset_mixture]
         combined_dataset = concatenate_datasets(datasets).shuffle(seed=data_config.split_seed)
         dataset_dict = DatasetDict({data_config.train_split: combined_dataset})
     elif data_config.dataset_name:
         dataset_dict = load_dataset(data_config.dataset_name, data_config.dataset_config)
     else:
-        raise ValueError("Either dataset_name or dataset_mixture must be configured.")
+        raise ValueError("One of data.train_files, data.dataset_name, or data.dataset_mixture must be configured.")
 
     return _with_optional_validation_split(dataset_dict, data_config)
 

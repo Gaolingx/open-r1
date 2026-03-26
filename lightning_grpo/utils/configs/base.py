@@ -24,6 +24,7 @@ class LoRAConfig:
     """PEFT settings for adapter-based fine-tuning."""
 
     enabled: bool = False
+    init_path: Optional[str] = None
     r: int = 16
     alpha: int = 32
     dropout: float = 0.05

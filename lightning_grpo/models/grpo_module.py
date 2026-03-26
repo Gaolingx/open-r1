@@ -14,7 +14,7 @@ from open_r1.rewards import get_reward_funcs
 from lightning_grpo.models.rollout_engine import create_rollout_engine, compute_per_token_logps
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.models.common import build_optimizer, build_scheduler, entropy_from_logits, masked_mean
-from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, load_causal_lm, load_tokenizer
+from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, export_hf_model, load_causal_lm, load_tokenizer
 
 
 class GRPOLightningModule(L.LightningModule):
@@ -65,6 +65,7 @@ class GRPOLightningModule(L.LightningModule):
         rollout = self.config.rollout
         return SimpleNamespace(
             reward_funcs=reward.reward_funcs,
+            format_mode=getattr(reward, "format_mode", "strict"),
             code_language=reward.code_language,
             repetition_n_grams=reward.repetition_n_grams,
             repetition_max_penalty=reward.repetition_max_penalty,
@@ -511,3 +512,13 @@ class GRPOLightningModule(L.LightningModule):
 
         if self.config.rollout.engine.engine_type == "policy":
             self.rollout_engine.update_policy(self.policy)
+
+    def on_train_end(self) -> None:
+        """Export a Hugging Face-compatible model directory after training."""
+
+        if not self.trainer.is_global_zero:
+            return
+
+        export_dir = self.config.output_dir + "/hf_final"
+        export_hf_model(self.policy, self.config.model, export_dir, tokenizer=self.tokenizer)
+        rank_zero_info(f"Exported HF model to {export_dir}")

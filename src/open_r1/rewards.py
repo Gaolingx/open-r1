@@ -37,75 +37,179 @@ from .utils.competitive_programming import score_submission as cf_score_submissi
 from .utils.competitive_programming import score_subtask
 
 
+FORMAT_MODE_STRICT = "strict"
+FORMAT_MODE_COMPATIBLE = "compatible"
+FORMAT_MODE_NO_ANSWER_TAG = "no_answer_tag"
+FORMAT_MODES = {FORMAT_MODE_STRICT, FORMAT_MODE_COMPATIBLE, FORMAT_MODE_NO_ANSWER_TAG}
+
+
+def _parse_gold_solution(solution: str):
+    """Parse a gold solution using the permissive extraction behavior expected by legacy rewards."""
+
+    parsed = parse(
+        solution,
+        extraction_mode="first_match",
+    )
+    if len(parsed) != 0:
+        return parsed
+
+    stripped = solution.strip()
+    if stripped:
+        return [stripped]
+    return []
+
+
+def _parse_completion_answer(content: str):
+    """Parse a model completion answer, preferring boxed LaTeX when present."""
+
+    parsed = parse(
+        content,
+        extraction_config=[
+            LatexExtractionConfig(
+                normalization_config=NormalizationConfig(
+                    nits=False,
+                    malformed_operators=False,
+                    basic_latex=True,
+                    equations=True,
+                    boxed="all",
+                    units=True,
+                ),
+                boxed_match_priority=0,
+                try_extract_without_anchor=False,
+            )
+        ],
+        extraction_mode="first_match",
+    )
+    if len(parsed) != 0:
+        return parsed
+
+    boxed_match = re.search(r"\\boxed\{(.+?)\}", content, re.DOTALL)
+    if boxed_match is not None:
+        return [boxed_match.group(1).strip()]
+
+    stripped = content.strip()
+    if stripped:
+        return [stripped]
+    return []
+
+
+def _is_correct_completion(content: str, solution: str) -> Optional[bool]:
+    """Return correctness for a completion, or None when the gold solution is unparsable."""
+
+    gold_parsed = _parse_gold_solution(solution)
+    if len(gold_parsed) == 0:
+        print("Failed to parse gold solution: ", solution)
+        return None
+
+    answer_parsed = _parse_completion_answer(content)
+    try:
+        return bool(verify(answer_parsed, gold_parsed))
+    except Exception:
+        return answer_parsed == gold_parsed
+
+
+def _normalize_format_mode(mode: str | None) -> str:
+    """Normalize reward formatting mode and validate supported values."""
+
+    normalized = (mode or FORMAT_MODE_STRICT).strip().lower()
+    if normalized not in FORMAT_MODES:
+        raise ValueError(f"Unsupported format mode '{mode}'. Expected one of {sorted(FORMAT_MODES)}.")
+    return normalized
+
+
+def _has_single_think_block(text: str) -> bool:
+    """Return whether text contains exactly one well-formed think block."""
+
+    return bool(re.fullmatch(r"<think>\n.*?\n</think>(?:\n.*)?", text, re.DOTALL))
+
+
+def _has_strict_answer_block(text: str) -> bool:
+    """Return whether text matches the strict think+answer-tag format."""
+
+    return bool(re.fullmatch(r"<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>", text, re.DOTALL))
+
+
+def _has_plain_answer_after_think(text: str) -> bool:
+    """Return whether text contains a think block followed by plain answer content."""
+
+    match = re.fullmatch(r"<think>\n.*?\n</think>\n+(.*)", text, re.DOTALL)
+    if match is None:
+        return False
+    trailing = match.group(1)
+    return bool(trailing.strip()) and "<answer>" not in trailing and "</answer>" not in trailing
+
+
 def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
     for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-        )
-        if len(gold_parsed) != 0:
-            # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        # Ensures that boxed is tried first
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-            # Compute binary rewards if verifiable, `None` otherwise to skip this example
+        gold_parsed = _parse_gold_solution(sol)
+        if len(gold_parsed) == 0:
+            reward = None
+            print("Failed to parse gold solution: ", sol)
+        else:
+            answer_parsed = _parse_completion_answer(content)
             try:
                 reward = float(verify(gold_parsed, answer_parsed))
             except Exception as e:
                 print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
                 reward = None
-        else:
-            # If the gold solution is not parseable, we assign `None` to skip this example
-            reward = None
-            print("Failed to parse gold solution: ", sol)
         rewards.append(reward)
 
     return rewards
 
 
-def format_reward(completions, **kwargs):
-    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
-    pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
+def format_reward(completions, format_mode: str = FORMAT_MODE_STRICT, **kwargs):
+    """Reward function for configurable reasoning/answer formatting contracts."""
+
+    mode = _normalize_format_mode(format_mode)
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
-    return [1.0 if match else 0.0 for match in matches]
+    rewards: list[float] = []
+    for content in completion_contents:
+        if mode == FORMAT_MODE_STRICT:
+            rewards.append(1.0 if _has_strict_answer_block(content) else 0.0)
+        elif mode == FORMAT_MODE_NO_ANSWER_TAG:
+            rewards.append(1.0 if _has_plain_answer_after_think(content) else 0.0)
+        else:
+            rewards.append(1.0 if (_has_strict_answer_block(content) or _has_plain_answer_after_think(content)) else 0.0)
+    return rewards
 
 
-def tag_count_reward(completions, **kwargs) -> list[float]:
-    """Reward function that checks if we produce the desired number of think and answer tags associated with `format_reward()`.
+def tag_count_reward(completions, format_mode: str = FORMAT_MODE_STRICT, **kwargs) -> list[float]:
+    """Reward function that checks configurable tag usage associated with `format_reward()`.
 
     Adapted from: https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb#file-grpo_demo-py-L90
     """
 
+    mode = _normalize_format_mode(format_mode)
+
     def count_tags(text: str) -> float:
+        if mode == FORMAT_MODE_STRICT:
+            count = 0.0
+            if text.count("<think>\n") == 1:
+                count += 0.25
+            if text.count("\n</think>\n") == 1:
+                count += 0.25
+            if text.count("\n<answer>\n") == 1:
+                count += 0.25
+            if text.count("\n</answer>") == 1:
+                count += 0.25
+            return count
+
         count = 0.0
         if text.count("<think>\n") == 1:
-            count += 0.25
-        if text.count("\n</think>\n") == 1:
-            count += 0.25
-        if text.count("\n<answer>\n") == 1:
-            count += 0.25
-        if text.count("\n</answer>") == 1:
-            count += 0.25
+            count += 0.5
+        if text.count("\n</think>") == 1:
+            count += 0.5
+
+        if mode == FORMAT_MODE_COMPATIBLE:
+            has_answer_begin = text.count("\n<answer>\n") == 1
+            has_answer_end = text.count("\n</answer>") == 1
+            if has_answer_begin:
+                count += 0.25
+            if has_answer_end:
+                count += 0.25
         return count
 
     contents = [completion[0]["content"] for completion in completions]
@@ -148,36 +252,12 @@ def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs)
     # First check correctness of answers
     correctness = []
     for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
-        if len(gold_parsed) == 0:
+        is_correct = _is_correct_completion(content, sol)
+        if is_correct is None:
             # Skip unparseable examples
             correctness.append(True)  # Treat as correct to avoid penalizing
-            print("Failed to parse gold solution: ", sol)
             continue
-
-        answer_parsed = parse(
-            content,
-            extraction_config=[
-                LatexExtractionConfig(
-                    normalization_config=NormalizationConfig(
-                        nits=False,
-                        malformed_operators=False,
-                        basic_latex=True,
-                        equations=True,
-                        boxed=True,
-                        units=True,
-                    ),
-                    boxed_match_priority=0,
-                    try_extract_without_anchor=False,
-                )
-            ],
-            extraction_mode="first_match",
-        )
-        correctness.append(verify(answer_parsed, gold_parsed))
+        correctness.append(is_correct)
 
     # Calculate lengths
     lengths = [len(content) for content in contents]
@@ -230,36 +310,10 @@ def get_cosine_scaled_reward(
         rewards = []
 
         for content, sol in zip(contents, solution):
-            gold_parsed = parse(
-                sol,
-                extraction_mode="first_match",
-                extraction_config=[LatexExtractionConfig()],
-            )
-            if len(gold_parsed) == 0:
+            is_correct = _is_correct_completion(content, sol)
+            if is_correct is None:
                 rewards.append(1.0)  # Skip unparseable examples
-                print("Failed to parse gold solution: ", sol)
                 continue
-
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed=True,
-                            units=True,
-                        ),
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-
-            is_correct = verify(answer_parsed, gold_parsed)
             gen_len = len(content)
 
             # Apply cosine scaling based on length
@@ -592,7 +646,7 @@ def code_reward(
     return execution_provider.execute_scripts(scripts, ["python"] * len(scripts))
 
 
-def get_code_format_reward(language: str = "python"):
+def get_code_format_reward(language: str = "python", format_mode: str = FORMAT_MODE_STRICT):
     """Format reward function specifically for code responses.
 
     Args:
@@ -600,19 +654,35 @@ def get_code_format_reward(language: str = "python"):
     """
 
     def code_format_reward(completions, **kwargs):
+        mode = _normalize_format_mode(format_mode)
         # if there is a language field, use it instead of the default language. This way we can have mixed language training.
         languages = kwargs["language"] if "language" in kwargs else [language] * len(completions)
 
         completion_contents = [completion[0]["content"] for completion in completions]
-        matches = [
-            re.match(
-                rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{sample_language}.*?```.*?\n</answer>$",
-                content,
-                re.DOTALL | re.MULTILINE,
+        rewards = []
+        for content, sample_language in zip(completion_contents, languages):
+            strict_match = bool(
+                re.fullmatch(
+                    rf"<think>\n.*?\n</think>\n<answer>\n.*?```{sample_language}.*?```.*?\n</answer>",
+                    content,
+                    re.DOTALL,
+                )
             )
-            for content, sample_language in zip(completion_contents, languages)
-        ]
-        return [1.0 if match else 0.0 for match in matches]
+            plain_match = bool(
+                re.fullmatch(
+                    rf"<think>\n.*?\n</think>\n+.*?```{sample_language}.*?```.*",
+                    content,
+                    re.DOTALL,
+                )
+            ) and "<answer>" not in content and "</answer>" not in content
+
+            if mode == FORMAT_MODE_STRICT:
+                rewards.append(1.0 if strict_match else 0.0)
+            elif mode == FORMAT_MODE_NO_ANSWER_TAG:
+                rewards.append(1.0 if plain_match else 0.0)
+            else:
+                rewards.append(1.0 if (strict_match or plain_match) else 0.0)
+        return rewards
 
     return code_format_reward
 
@@ -644,9 +714,10 @@ def get_soft_overlong_punishment(max_completion_len, soft_punish_cache):
 
 
 def get_reward_funcs(script_args) -> list[Callable]:
+    format_mode = getattr(script_args, "format_mode", FORMAT_MODE_STRICT)
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
-        "format": format_reward,
+        "format": update_wrapper(partial(format_reward, format_mode=format_mode), format_reward),
         "reasoning_steps": reasoning_steps_reward,
         "cosine": get_cosine_scaled_reward(
             min_value_wrong=script_args.cosine_min_value_wrong,
@@ -694,8 +765,11 @@ def get_reward_funcs(script_args) -> list[Callable]:
             ),
             cf_code_reward,
         ),
-        "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
+        "code_format": get_code_format_reward(
+            language=script_args.code_language,
+            format_mode=format_mode,
+        ),
+        "tag_count": update_wrapper(partial(tag_count_reward, format_mode=format_mode), tag_count_reward),
         "soft_overlong_punishment": get_soft_overlong_punishment(
             max_completion_len=script_args.max_completion_len,
             soft_punish_cache=script_args.soft_punish_cache,

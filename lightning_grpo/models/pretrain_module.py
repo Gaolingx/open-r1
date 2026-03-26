@@ -11,7 +11,7 @@ from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
-from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, load_causal_lm
+from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, export_hf_model, load_causal_lm, load_tokenizer
 
 
 class PretrainLightningModule(L.LightningModule):
@@ -27,6 +27,7 @@ class PretrainLightningModule(L.LightningModule):
         trainable, total = count_trainable_parameters(self.model)
         self.trainable_parameter_count = trainable
         self.total_parameter_count = total
+        self.tokenizer = load_tokenizer(config.model) if config.model.tokenizer_name_or_path else None
 
     def forward(self, **batch: torch.Tensor) -> Any:
         """Forward tokens through the wrapped language model."""
@@ -90,3 +91,13 @@ class PretrainLightningModule(L.LightningModule):
         optimizer = build_optimizer(self.parameters(), self.config.optimization)
         scheduler = build_scheduler(optimizer, self.config.optimization, self.trainer.estimated_stepping_batches)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
+    def on_train_end(self) -> None:
+        """Export a Hugging Face-compatible model directory after training."""
+
+        if not self.trainer.is_global_zero:
+            return
+
+        export_dir = self.config.output_dir + "/hf_final"
+        export_hf_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
+        rank_zero_info(f"Exported HF model to {export_dir}")

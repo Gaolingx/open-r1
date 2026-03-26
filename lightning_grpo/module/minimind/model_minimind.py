@@ -1,10 +1,14 @@
 import math, torch, torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
+from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 
-# MiniMind Config
+
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                     MiniMind Config
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
     def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
@@ -40,8 +44,14 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        self.initializer_range = kwargs.get("initializer_range", 0.02)
+        self.pad_token_id = kwargs.get("pad_token_id", 0)
+        self.output_router_logits = kwargs.get("output_router_logits", use_moe)
+        self.use_cache = kwargs.get("use_cache", True)
 
-# MiniMind Model
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                     MiniMind Model
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -187,89 +197,130 @@ class MiniMindBlock(nn.Module):
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
-class MiniMindModel(nn.Module):
+class MiniMindPreTrainedModel(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["MiniMindBlock"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_sdpa = True
+    _supports_flash_attn = True
+
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, RMSNorm):
+            module.weight.data.fill_(1.0)
+
+class MiniMindModel(MiniMindPreTrainedModel):
     def __init__(self, config: MiniMindConfig):
-        super().__init__()
+        super().__init__(config)
         self.config = config
+        self.padding_idx = config.pad_token_id
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.gradient_checkpointing = False
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        self.post_init()
 
-    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
-        batch_size, seq_length = input_ids.shape
+    def forward(self, input_ids=None, attention_mask=None, past_key_values=None, inputs_embeds=None, use_cache=None, **kwargs):
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
         if hasattr(past_key_values, 'layers'): past_key_values = None
+        use_cache = self.config.use_cache if use_cache is None else use_cache
+        if self.gradient_checkpointing and self.training and use_cache:
+            use_cache = False
+
+        if inputs_embeds is None:
+            batch_size, seq_length = input_ids.shape
+            hidden_states = self.dropout(self.embed_tokens(input_ids))
+        else:
+            batch_size, seq_length = inputs_embeds.shape[:2]
+            hidden_states = self.dropout(inputs_embeds)
+
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
         for layer, past_key_value in zip(self.layers, past_key_values):
-            hidden_states, present = layer(
-                hidden_states,
-                position_embeddings,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attention_mask=attention_mask
-            )
+            if self.gradient_checkpointing and self.training:
+                hidden_states, present = checkpoint(
+                    layer,
+                    hidden_states,
+                    position_embeddings,
+                    past_key_value,
+                    False,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states, present = layer(
+                    hidden_states,
+                    position_embeddings,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                    attention_mask=attention_mask
+                )
             presents.append(present)
         hidden_states = self.norm(hidden_states)
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
-        return hidden_states, presents, aux_loss
+        return MoeModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=presents, router_logits=aux_loss)
 
-class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
-    config_class = MiniMindConfig
+class MiniMindForCausalLM(MiniMindPreTrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = {"lm_head": "colwise_rep"}
+
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.model.embed_tokens.weight = self.lm_head.weight
+        self.post_init()
     
-    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
-        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+    
+    def forward(self, input_ids=None, attention_mask=None, past_key_values=None, inputs_embeds=None, use_cache=None, logits_to_keep=0, labels=None, output_router_logits=None, **kwargs):
+        output_router_logits = output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+        hidden_states = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
-        return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
-    
-    # https://github.com/jingyaogong/minimind/discussions/611
-    @torch.inference_mode()
-    def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
-        input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
-        attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
-        past_key_values = kwargs.pop("past_key_values", None)
-        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
-        if streamer: streamer.put(input_ids.cpu())
-        for _ in range(max_new_tokens):
-            past_len = past_key_values[0][0].shape[1] if past_key_values else 0
-            outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
-            attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
-            logits = outputs.logits[:, -1, :] / temperature
-            if repetition_penalty != 1.0:
-                for i in range(input_ids.shape[0]): logits[i, torch.unique(input_ids[i])] /= repetition_penalty
-            if top_k > 0: 
-                logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
-                mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
-                logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
-            next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
-            if eos_token_id is not None: next_token = torch.where(finished.unsqueeze(-1), next_token.new_full((next_token.shape[0], 1), eos_token_id), next_token)
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            past_key_values = outputs.past_key_values if use_cache else None
-            if streamer: streamer.put(next_token.cpu())
-            if eos_token_id is not None:
-                finished |= next_token.squeeze(-1).eq(eos_token_id)
-                if finished.all(): break
-        if streamer: streamer.end()
-        if kwargs.get("return_kv"): return {'generated_ids': input_ids, 'past_kv': past_key_values}
-        return input_ids
+        aux_loss = outputs.router_logits if output_router_logits else None
+        if labels is not None and aux_loss is not None:
+            loss = loss + aux_loss.to(loss.device)
+        return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=outputs.past_key_values, hidden_states=hidden_states)
+
+
+def register_minimind_for_auto_class():
+    MiniMindConfig.register_for_auto_class()
+    MiniMindModel.register_for_auto_class("AutoModel")
+    MiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")

@@ -78,7 +78,7 @@ def main() -> None:
     if args.seed is not None:
         config.seed = args.seed
     if args.precision is not None:
-        config.precision = args.precision
+        config.precision.trainer_precision = args.precision
     if args.gpus is not None:
         config.distributed.devices = args.gpus
     if args.lora_init_path is not None:
