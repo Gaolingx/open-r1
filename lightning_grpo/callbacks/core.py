@@ -34,7 +34,9 @@ class CheckpointCallback(ModelCheckpoint):
             return
 
         save_path = Path(filepath).parent / "pt_checkpoint"
-        save_pth_weights(trainer.lightning_module, save_path)
+        save_path.mkdir(parents=True, exist_ok=True)
+        save_file = save_path / "pretrain_model"
+        save_pth_weights(trainer.lightning_module, save_file)
 
 
 class EfficiencyMonitorCallback(Callback):

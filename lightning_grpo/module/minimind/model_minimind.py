@@ -1,156 +1,92 @@
-import math
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.checkpoint import checkpoint
-from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
+
+import transformers.initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask
+from transformers.generation import GenerationMixin
+from transformers.integrations import (
+    use_experts_implementation,
+    use_kernel_forward_from_hub,
+    use_kernel_func_from_hub,
+    use_kernelized_func,
+)
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_layers import (
+    GenericForQuestionAnswering,
+    GenericForSequenceClassification,
+    GenericForTokenClassification,
+    GradientCheckpointingLayer,
+)
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
+from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
+from transformers.utils.output_capturing import OutputRecorder, capture_outputs
+from .configuration_minimind_moe import MiniMindMoeConfig
 
 
-@dataclass
-class MiniMindModelOutputWithPast(MoeModelOutputWithPast):
-    aux_loss: torch.FloatTensor | None = None
-    router_z_loss: torch.FloatTensor | None = None
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
-@dataclass
-class MiniMindCausalLMOutputWithPast(MoeCausalLMOutputWithPast):
-    router_z_loss: torch.FloatTensor | None = None
-
-
-# MiniMind Config
-class MiniMindConfig(PretrainedConfig):
-    model_type = "minimind"
-
-    def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
-        super().__init__(**kwargs)
-        self.hidden_size = hidden_size
-        self.num_hidden_layers = num_hidden_layers
-        self.use_moe = use_moe
-        self.dropout = kwargs.get("dropout", 0.0)
-        self.attention_dropout = kwargs.get("attention_dropout", self.dropout)
-        self.attention_bias = kwargs.get("attention_bias", False)
-        self.vocab_size = kwargs.get("vocab_size", 6400)
-        self.bos_token_id = kwargs.get("bos_token_id", 1)
-        self.eos_token_id = kwargs.get("eos_token_id", 2)
-        self.flash_attn = kwargs.get("flash_attn", True)
-        self.num_attention_heads = kwargs.get("num_attention_heads", 8)
-        self.num_key_value_heads = kwargs.get("num_key_value_heads", 4)
-        self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_attention_heads)
-        self.hidden_act = kwargs.get("hidden_act", 'silu')
-        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
-        self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
-        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
-        self.rope_theta = kwargs.get("rope_theta", 1e6)
-        self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
-        self.rope_scaling = {
-            "beta_fast": 32,
-            "beta_slow": 1,
-            "factor": 16,
-            "original_max_position_embeddings": 2048,
-            "attention_factor": 1.0,
-            "type": "yarn"
-        } if self.inference_rope_scaling else None
-        ### MoE specific configs (ignored if use_moe = False)
-        self.num_experts = kwargs.get("num_experts", 4)
-        self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)
-        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
-        self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
-        self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
-        self.router_jitter_noise = kwargs.get("router_jitter_noise", 0.0)
-        self.router_z_loss_coef = kwargs.get("router_z_loss_coef", 0.0)
-        self.expert_capacity_factor = kwargs.get("expert_capacity_factor", None)
-        self.expert_min_capacity = kwargs.get("expert_min_capacity", 4)
-        self.router_drop_tokens = kwargs.get("router_drop_tokens", False)
-        self.router_pad_routed_tokens = kwargs.get("router_pad_routed_tokens", False)
-        self.initializer_range = kwargs.get("initializer_range", 0.02)
-        self.pad_token_id = kwargs.get("pad_token_id", 0)
-        self.output_router_logits = kwargs.get("output_router_logits", use_moe)
-        self.use_cache = kwargs.get("use_cache", True)
-        self.attn_implementation = kwargs.get("attn_implementation", kwargs.get("_attn_implementation", "sdpa"))
-        self.sliding_window = kwargs.get("sliding_window", None)
-        self.decoder_sparse_step = kwargs.get("decoder_sparse_step", 1)
-        self.mlp_only_layers = list(kwargs.get("mlp_only_layers", []))
-
-    def layer_uses_moe(self, layer_idx: int) -> bool:
-        if not self.use_moe or self.num_experts <= 0:
-            return False
-        if layer_idx in self.mlp_only_layers:
-            return False
-        step = max(int(self.decoder_sparse_step), 1)
-        return (layer_idx + 1) % step == 0
-
-
-# MiniMind Model
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        return (self.weight * self.norm(x.float())).type_as(x)
-
-
-def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
-    freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
-    if rope_scaling is not None:  # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
-        orig_max, factor, beta_fast, beta_slow, attn_factor = (
-            rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
-            rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
-        )
-        if end / orig_max > 1.0:
-            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
-            low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
-            ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
-            freqs = freqs * (1 - ramp + ramp / factor)
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
-    return freqs_cos, freqs_sin
-
-
+@use_kernel_func_from_hub("rotary_pos_emb")
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+    """Applies Rotary Position Embedding to the query and key tensors.
 
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin).to(q.dtype)
-    k_embed = (k * cos) + (rotate_half(k) * sin).to(k.dtype)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    batch, num_key_value_heads, slen, head_dim = x.shape
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
-        return x
-    return x[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim).reshape(
-        batch, num_key_value_heads * n_rep, slen, head_dim
-    )
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 def eager_attention_forward(
-        module: nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-        scaling: float,
-        dropout: float = 0.0,
-        **kwargs,
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
@@ -163,272 +99,391 @@ def eager_attention_forward(
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
+
     return attn_output, attn_weights
 
 
-class Attention(nn.Module):
-    def __init__(self, config: MiniMindConfig, layer_idx: int):
+@use_kernelized_func(apply_rotary_pos_emb)
+class MiniMindMoeAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config: MiniMindMoeConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
-        self.num_heads = config.num_attention_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.head_dim = config.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+        self.q_norm = MiniMindMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.k_norm = MiniMindMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = getattr(config, "sliding_window", None)
 
     def forward(
-            self,
-            hidden_states,
-            position_embeddings,
-            attention_mask=None,
-            past_key_values: Cache | None = None,
-            cache_position: torch.LongTensor | None = None,
-            **kwargs: FlashAttentionKwargs,
-    ):
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        xq = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        xk = self.k_norm(self.k_proj(hidden_states).view((*input_shape, self.num_key_value_heads, self.head_dim))).transpose(1, 2)
-        xv = self.v_proj(hidden_states).view((*input_shape, self.num_key_value_heads, self.head_dim)).transpose(1, 2)
+
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
         cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            xk, xv = past_key_values.update(xk, xv, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
         )
-        output, attn_weights = attention_interface(
+
+        attn_output, attn_weights = attention_interface(
             self,
-            xq,
-            xk,
-            xv,
+            query_states,
+            key_states,
+            value_states,
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,
+            sliding_window=self.sliding_window,  # diff with Llama
             **kwargs,
         )
-        output = output.reshape(*input_shape, -1).contiguous()
-        output = self.resid_dropout(self.o_proj(output))
-        return output, attn_weights
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
 
 
-class FeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig, intermediate_size: int = None):
-        super().__init__()
-        intermediate_size = intermediate_size or config.intermediate_size
-        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-class MOEFeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+class MiniMindMoeMLP(nn.Module):
+    def __init__(self, config, intermediate_size=None):
         super().__init__()
         self.config = config
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.aux_loss = torch.tensor(0.0)
-        self.router_logits = None
-        self.router_z_loss = torch.tensor(0.0)
-        self.tokens_per_expert = None
-
-    def _compute_expert_capacity(self, num_tokens: int) -> int | None:
-        capacity_factor = self.config.expert_capacity_factor
-        if capacity_factor is None:
-            return None
-        denom = max(self.config.num_experts, 1)
-        base_capacity = math.ceil((num_tokens * self.config.num_experts_per_tok) / denom)
-        scaled_capacity = math.ceil(base_capacity * float(capacity_factor))
-        return max(int(self.config.expert_min_capacity), scaled_capacity)
 
     def forward(self, x):
-        batch_size, seq_len, hidden_dim = x.shape
-        x_flat = x.view(-1, hidden_dim)
-        router_logits = self.gate(x_flat)
-        if self.training and self.config.router_jitter_noise > 0:
-            router_logits = router_logits + torch.randn_like(router_logits) * self.config.router_jitter_noise
-        scores = F.softmax(router_logits, dim=-1)
-        topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
-        if self.config.norm_topk_prob:
-            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
-
-        dispatch_mask = F.one_hot(topk_idx, self.config.num_experts).to(torch.bool)
-        expert_capacity = self._compute_expert_capacity(x_flat.size(0))
-        if expert_capacity is not None:
-            position_in_expert = dispatch_mask.cumsum(dim=0) - 1
-            within_capacity = position_in_expert < expert_capacity
-            dispatch_mask = dispatch_mask & within_capacity
-            if self.config.router_drop_tokens:
-                topk_weight = topk_weight * dispatch_mask.any(dim=-1).to(topk_weight.dtype)
-                if self.config.norm_topk_prob:
-                    topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
-            elif self.config.router_pad_routed_tokens:
-                empty_routes = dispatch_mask.sum(dim=(1, 2)) == 0
-                if empty_routes.any():
-                    fallback_experts = topk_idx[empty_routes, :1]
-                    fallback_mask = F.one_hot(fallback_experts, self.config.num_experts).to(torch.bool)
-                    dispatch_mask[empty_routes, :1, :] = fallback_mask
-                    topk_weight[empty_routes, :1] = 0.0
-
-        if self.config.router_pad_routed_tokens:
-            token_has_route = dispatch_mask.any(dim=-1)
-            empty_slots = ~token_has_route
-            if empty_slots.any():
-                topk_weight = topk_weight.masked_fill(empty_slots, 0.0)
-
-        y = torch.zeros_like(x_flat)
-        for i, expert in enumerate(self.experts):
-            mask = dispatch_mask[..., i]
-            if mask.any():
-                token_idx = mask.any(dim=-1).nonzero().flatten()
-                weight = topk_weight[mask].view(-1, 1)
-                y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
-            elif self.training:
-                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
-        if self.training and self.config.router_aux_loss_coef > 0:
-            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
-            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
-        else:
-            self.aux_loss = scores.new_zeros(1).squeeze()
-        if self.training and self.config.router_z_loss_coef > 0:
-            self.router_z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1).pow(2)) * self.config.router_z_loss_coef
-        else:
-            self.router_z_loss = scores.new_zeros(1).squeeze()
-        self.tokens_per_expert = dispatch_mask.any(dim=1).sum(dim=0)
-        self.router_logits = router_logits.view(batch_size, seq_len, self.config.num_experts)
-        return y.view(batch_size, seq_len, hidden_dim)
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
 
 
-class MiniMindBlock(nn.Module):
-    def __init__(self, layer_id: int, config: MiniMindConfig):
+@use_experts_implementation
+class MiniMindMoeExperts(nn.Module):
+    """Collection of expert weights stored as 3D tensors."""
+
+    def __init__(self, config):
         super().__init__()
-        self.self_attn = Attention(config, layer_id)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = MOEFeedForward(config) if config.layer_uses_moe(layer_id) else FeedForward(config)
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(
-            self,
-            hidden_states,
-            attention_mask=None,
-            position_ids=None,
-            past_key_values: Cache | None = None,
-            use_cache=False,
-            cache_position: torch.LongTensor | None = None,
-            position_embeddings=None,
-            **kwargs,
-    ):
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+
+class MiniMindMoeTopKRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.norm_topk_prob = config.norm_topk_prob
+        self.hidden_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
+        router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+        if self.norm_topk_prob:
+            router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
+        router_top_value = router_top_value.to(router_logits.dtype)
+        router_scores = router_top_value
+        return router_logits, router_scores, router_indices
+
+
+class MiniMindMoeSparseMoeBlock(nn.Module):
+    def __init__(self, config: MiniMindMoeConfig):
+        super().__init__()
+        self.experts = MiniMindMoeExperts(config)
+        self.gate = MiniMindMoeTopKRouter(config)
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class MiniMindMoeRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        MiniMindMoeRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class MiniMindMoeDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: MiniMindMoeConfig, layer_idx: int):
+        super().__init__()
+        self.self_attn = MiniMindMoeAttention(config, layer_idx)
+        if (layer_idx not in config.mlp_only_layers) and (
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+        ):
+            self.mlp = MiniMindMoeSparseMoeBlock(config)
+        else:
+            self.mlp = MiniMindMoeMLP(config, intermediate_size=config.intermediate_size)
+        self.input_layernorm = MiniMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = MiniMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hidden_size = config.hidden_size
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
         residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention
         hidden_states, _ = self.self_attn(
-            hidden_states=self.input_layernorm(hidden_states),
-            position_embeddings=position_embeddings,
+            hidden_states=hidden_states,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-            use_cache=use_cache,
             position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states += residual
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
         return hidden_states
 
 
-class MiniMindPreTrainedModel(PreTrainedModel):
-    config_class = MiniMindConfig
+@auto_docstring
+class MiniMindMoePreTrainedModel(PreTrainedModel):
+    config: MiniMindMoeConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["MiniMindBlock"]
+    _no_split_modules = ["MiniMindMoeDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
-    _supports_sdpa = True
     _supports_flash_attn = True
+    _supports_sdpa = True
     _supports_flex_attn = True
+
+    _can_compile_fullgraph = True
     _supports_attention_backend = True
+    _can_record_outputs = {
+        "router_logits": OutputRecorder(MiniMindMoeTopKRouter, index=0),
+        "hidden_states": MiniMindMoeDecoderLayer,
+        "attentions": MiniMindMoeAttention,
+    }
 
+    @torch.no_grad()
     def _init_weights(self, module):
+        super()._init_weights(module)
         std = self.config.initializer_range
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, RMSNorm):
-            module.weight.data.fill_(1.0)
+        if isinstance(module, MiniMindMoeExperts):
+            init.normal_(module.gate_up_proj, mean=0.0, std=std)
+            init.normal_(module.down_proj, mean=0.0, std=std)
+        elif isinstance(module, MiniMindMoeTopKRouter):
+            init.normal_(module.weight, mean=0.0, std=std)
 
 
-class MiniMindModel(MiniMindPreTrainedModel, GenerationMixin):
-    def __init__(self, config: MiniMindConfig):
-        super().__init__(config)
+class MiniMindMoeRotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
+    def __init__(self, config: MiniMindMoeConfig, device=None):
+        super().__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
         self.config = config
+
+        self.rope_type = self.config.rope_parameters["rope_type"]
+        rope_init_fn: Callable = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    @staticmethod
+    def compute_default_rope_parameters(
+        config: MiniMindMoeConfig | None = None,
+        device: Optional["torch.device"] = None,
+        seq_len: int | None = None,
+    ) -> tuple["torch.Tensor", float]:
+        """
+        Computes the inverse frequencies according to the original RoPE implementation
+        Args:
+            config ([`~transformers.PreTrainedConfig`]):
+                The model configuration.
+            device (`torch.device`):
+                The device to use for initialization of the inverse frequencies.
+            seq_len (`int`, *optional*):
+                The current sequence length. Unused for this type of RoPE.
+        Returns:
+            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+        """
+        base = config.rope_parameters["rope_theta"]
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+
+        attention_factor = 1.0  # Unused in this type of RoPE
+
+        # Compute the inverse frequencies
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, attention_factor
+
+    @torch.no_grad()
+    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    def forward(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with maybe_autocast(device_type=device_type, enabled=False):  # Force float32
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+@auto_docstring
+class MiniMindMoeModel(MiniMindMoePreTrainedModel):
+    def __init__(self, config: MiniMindMoeConfig):
+        super().__init__(config)
         self.padding_idx = config.pad_token_id
-        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        self.vocab_size = config.vocab_size
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.dropout = nn.Dropout(config.dropout)
-        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList(
+            [MiniMindMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = MiniMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = MiniMindMoeRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+        # Initialize weights and apply final processing
         self.post_init()
 
+    @merge_with_config_defaults
+    @capture_outputs
+    @auto_docstring
     def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            position_ids=None,
-            past_key_values: Cache | None = None,
-            inputs_embeds=None,
-            use_cache=None,
-            cache_position: torch.LongTensor | None = None,
-            **kwargs,
-    ):
-        if (input_ids is None) == (inputs_embeds is None):
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> MoeModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        use_cache = self.config.use_cache if use_cache is None else use_cache
-        if self.gradient_checkpointing and self.training and use_cache:
-            use_cache = False
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
-        hidden_states = self.dropout(inputs_embeds)
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
-
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
+        mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+        causal_mask = mask_function(
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -437,106 +492,233 @@ class MiniMindModel(MiniMindPreTrainedModel, GenerationMixin):
             position_ids=position_ids,
         )
 
-        position_embeddings = (
-            self.freqs_cos[position_ids],
-            self.freqs_sin[position_ids],
-        )
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                hidden_states = checkpoint(
-                    layer,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    False,
-                    cache_position,
-                    position_embeddings,
-                    use_reentrant=False,
-                )
-            else:
-                hidden_states = layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
         hidden_states = self.norm(hidden_states)
-        moe_layers = [l.mlp for l in self.layers if isinstance(l.mlp, MOEFeedForward)]
-        aux_loss = None
-        z_loss = None
-        router_logits = None
-        if moe_layers:
-            aux_loss = sum((layer.aux_loss for layer in moe_layers), hidden_states.new_zeros(1).squeeze())
-            z_loss = sum((layer.router_z_loss for layer in moe_layers), hidden_states.new_zeros(1).squeeze())
-            router_logits = tuple(layer.router_logits for layer in moe_layers)
-        return MiniMindModelOutputWithPast(
+
+        return MoeModelOutputWithPast(  # only diff with Mistral is the output type, we need MoE
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
-            router_logits=router_logits,
-            aux_loss=aux_loss,
-            router_z_loss=z_loss,
         )
 
 
-class MiniMindForCausalLM(MiniMindPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _tp_plan = {"lm_head": "colwise_rep"}
+def load_balancing_loss_func(
+    gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
+    num_experts: int | None = None,
+    top_k=2,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor | int:
+    r"""
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
 
-    def __init__(self, config: MiniMindConfig = None):
-        self.config = config or MiniMindConfig()
-        super().__init__(self.config)
-        self.model = MiniMindModel(self.config)
-        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+    See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+
+    Args:
+        gate_logits:
+            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
+            shape [batch_size X sequence_length, num_experts].
+        num_experts:
+            Number of experts
+        top_k:
+            The number of experts to route per-token, can be also interpreted as the `top-k` routing
+            parameter.
+        attention_mask (`torch.Tensor`, *optional*):
+            The attention_mask used in forward function
+            shape [batch_size X sequence_length] if not None.
+
+    Returns:
+        The auxiliary loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    if isinstance(gate_logits, tuple):
+        compute_device = gate_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+
+    if attention_mask is None:
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
+        expert_attention_mask = (
+            attention_mask[None, :, :, None, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+            .reshape(-1, top_k, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+            expert_attention_mask, dim=0
+        )
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
+        router_per_expert_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .reshape(-1, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts
+
+
+@auto_docstring
+class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tp_plan = {"lm_head": "colwise_gather_output"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = MiniMindMoeModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.router_aux_loss_coef = config.router_aux_loss_coef
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+
+        # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_router_logits: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> MoeCausalLMOutputWithPast:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
 
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
+        Example:
 
-    def get_output_embeddings(self):
-        return self.lm_head
+        ```python
+        >>> from transformers import AutoTokenizer, MiniMindMoeForCausalLM
 
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
+        >>> model = MiniMindMoeForCausalLM.from_pretrained("Qwen/Qwen3-MoE-15B-A2B")
+        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-MoE-15B-A2B")
 
-    def set_decoder(self, decoder):
-        self.model = decoder
+        >>> prompt = "Hey, are you conscious? Can you talk to me?"
+        >>> inputs = tokenizer(prompt, return_tensors="pt")
 
-    def get_decoder(self):
-        return self.model
+        >>> # Generate
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        ```"""
 
-    def forward(self, input_ids=None, attention_mask=None, past_key_values=None, inputs_embeds=None, use_cache=None, logits_to_keep=0, labels=None, output_router_logits=None, **kwargs):
-        output_router_logits = output_router_logits if output_router_logits is not None else self.config.output_router_logits
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs: MoeModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_router_logits=output_router_logits,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
         hidden_states = outputs.last_hidden_state
-        if isinstance(logits_to_keep, int):
-            slice_indices = slice(None) if logits_to_keep == 0 else slice(-logits_to_keep, None)
-        else:
-            slice_indices = logits_to_keep
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+
         loss = None
         if labels is not None:
-            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
-            loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
-        aux_loss = outputs.aux_loss if output_router_logits else None
-        router_z_loss = outputs.router_z_loss
-        if labels is not None and aux_loss is not None:
-            loss = loss + aux_loss.to(loss.device)
-        if labels is not None and router_z_loss is not None:
-            loss = loss + router_z_loss.to(loss.device)
-        return MiniMindCausalLMOutputWithPast(
+            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+
+        aux_loss = None
+        if output_router_logits:
+            aux_loss = load_balancing_loss_func(
+                outputs.router_logits,
+                self.num_experts,
+                self.num_experts_per_tok,
+                attention_mask,
+            )
+            if labels is not None:
+                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
+
+        return MoeCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=hidden_states,
-            router_logits=outputs.router_logits if output_router_logits else None,
-            router_z_loss=router_z_loss,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            router_logits=outputs.router_logits,
         )
+
+
+class MiniMindMoeForSequenceClassification(GenericForSequenceClassification, MiniMindMoePreTrainedModel):
+    pass
+
+
+class MiniMindMoeForTokenClassification(GenericForTokenClassification, MiniMindMoePreTrainedModel):
+    pass
+
+
+class MiniMindMoeForQuestionAnswering(GenericForQuestionAnswering, MiniMindMoePreTrainedModel):
+    base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
+
+
+__all__ = [
+    "MiniMindMoeForCausalLM",
+    "MiniMindMoeForQuestionAnswering",
+    "MiniMindMoeModel",
+    "MiniMindMoePreTrainedModel",
+    "MiniMindMoeForSequenceClassification",
+    "MiniMindMoeForTokenClassification",
+]

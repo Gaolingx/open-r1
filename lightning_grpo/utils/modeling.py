@@ -10,7 +10,7 @@ import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from lightning.pytorch.utilities import rank_zero_info
-from lightning_grpo.module.minimind.model_minimind import MiniMindForCausalLM
+from lightning_grpo.module.minimind.model_minimind import MiniMindMoeForCausalLM
 
 from lightning_grpo.utils.config import load_json_config
 from lightning_grpo.utils.configs.base import ModelConfig, PrecisionConfig
@@ -127,12 +127,12 @@ def _build_minimind_model(model_config: ModelConfig, precision_config: Precision
     init_kwargs.setdefault("num_hidden_layers", 8)
     init_kwargs.setdefault("use_moe", False)
 
-    config_cls = getattr(MiniMindForCausalLM, "config_class", None)
+    config_cls = getattr(MiniMindMoeForCausalLM, "config_class", None)
     if config_cls is None:
-        raise ValueError("MiniMindForCausalLM.config_class is required for MiniMind initialization.")
+        raise ValueError("MiniMindMoeForCausalLM.config_class is required for MiniMind initialization.")
 
     minimind_config = config_cls(**init_kwargs)
-    model = MiniMindForCausalLM(minimind_config)
+    model = MiniMindMoeForCausalLM(minimind_config)
     model = model.to(dtype=resolve_torch_dtype(precision_config))
 
     if model_config.pretrained_weight and model_config.pretrained_weight.lower() != "none":
@@ -294,14 +294,8 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
     if aux_loss is None and isinstance(outputs, dict):
         aux_loss = outputs.get("aux_loss")
 
-    router_z_loss = getattr(outputs, "router_z_loss", None)
-    if router_z_loss is None and isinstance(outputs, dict):
-        router_z_loss = outputs.get("router_z_loss")
-
     if aux_loss is not None:
         metrics["aux_loss"] = aux_loss.detach().to(dtype=torch.float32)
-    if router_z_loss is not None:
-        metrics["z_loss"] = router_z_loss.detach().to(dtype=torch.float32)
 
     if router_logits is None:
         return metrics
@@ -360,7 +354,6 @@ def log_moe_metrics(
         get_metric = outputs_or_metrics.get
         metrics.update({
             "aux_loss": get_metric("aux_loss", metrics.get("aux_loss")),
-            "z_loss": get_metric("router_z_loss", metrics.get("z_loss")),
             "router_entropy": get_metric("router_entropy", metrics.get("router_entropy")),
             "router_max_prob": get_metric("router_max_prob", metrics.get("router_max_prob")),
             "expert_load_std": get_metric("expert_load_std", metrics.get("expert_load_std")),
