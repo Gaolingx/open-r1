@@ -22,40 +22,19 @@ from lightning_grpo.utils.config import save_json_config
 class CheckpointCallback(ModelCheckpoint):
     """ModelCheckpoint Callback."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, save_pt_format: bool = True, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+
+        self.save_pt_format = save_pt_format
 
     def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
         super()._save_checkpoint(trainer, filepath)
-        if not trainer.is_global_zero:
+
+        if not self.save_pt_format or not trainer.is_global_zero:
             return
 
         save_path = Path(filepath).parent / "pt_checkpoint"
         save_pth_weights(trainer.lightning_module, save_path)
-
-
-class TrainingStateCallback(Callback):
-    """Track coarse training lifecycle events and global progress."""
-
-    def __init__(self) -> None:
-        self.train_start_time: float | None = None
-
-    def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
-        """Mark the beginning of the fit loop."""
-
-        self.train_start_time = time.perf_counter()
-        if pl_module.logger is not None:
-            pl_module.logger.log_metrics({"system/global_rank": float(trainer.global_rank)}, step=trainer.global_step)
-
-    def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
-        """Log wall-clock duration after training completes."""
-
-        if self.train_start_time is None:
-            return
-
-        elapsed = time.perf_counter() - self.train_start_time
-        if pl_module.logger is not None and trainer.is_global_zero:
-            pl_module.logger.log_metrics({"system/train_time_seconds": elapsed}, step=trainer.global_step)
 
 
 class EfficiencyMonitorCallback(Callback):
@@ -384,13 +363,13 @@ def build_checkpoint_callback(checkpoint_config: CheckpointConfig) -> ModelCheck
 
     return CheckpointCallback(
         dirpath=checkpoint_config.dirpath,
+        filename="model-{epoch:02d}-{step:06d}-{train/loss:.4f}",
         monitor=checkpoint_config.monitor,
         mode=checkpoint_config.mode,
         save_top_k=checkpoint_config.save_top_k,
         save_last=checkpoint_config.save_last,
         every_n_train_steps=checkpoint_config.every_n_train_steps,
-        filename="model-{epoch:02d}-{step:06d}-{train/loss:.4f}",
-        auto_insert_metric_name=False,
+        save_pt_format=True,
     )
 
 
@@ -421,7 +400,6 @@ def build_callbacks(config: ExperimentConfig) -> list[Callback]:
     callbacks: list[Callback] = [
         build_checkpoint_callback(config.checkpoint),
         LearningRateMonitor(logging_interval="step"),
-        TrainingStateCallback(),
         EfficiencyMonitorCallback(log_every_n_steps=config.logging.log_every_n_steps),
         GradParamNormCallback(log_every_n_steps=config.logging.log_every_n_steps),
         NaNLossCallback(),
