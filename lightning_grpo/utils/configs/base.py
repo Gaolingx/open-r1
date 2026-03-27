@@ -131,6 +131,12 @@ class LoggingConfig:
     enable_csv: bool = True
     sample_prompts: list[str] = field(default_factory=list)
     sample_every_n_steps: int = 0
+    sample_max_new_tokens: int = 128
+    sample_do_sample: bool = True
+    sample_temperature: float = 0.7
+    sample_top_p: float = 0.95
+    sample_top_k: int = 0
+    sample_num_beams: int = 1
 
 
 @dataclass

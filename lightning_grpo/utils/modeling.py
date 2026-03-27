@@ -211,6 +211,20 @@ def describe_model_source(model_config: ModelConfig) -> str:
     return f"{model_config.model_family}:{model_config.pretrained_weight or 'none'}"
 
 
+def save_pth_weights(cls, pl_module: L.LightningModule, filepath: str) -> Path | None:
+    """Persist a plain PyTorch state dict next to the Lightning checkpoint."""
+
+    model = cls._resolve_export_model(pl_module)
+    if model is None:
+        return None
+
+    checkpoint_path = Path(filepath)
+    pth_path = checkpoint_path.with_suffix(".pth")
+    state_dict = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+    torch.save(state_dict, pth_path)
+    return pth_path
+
+
 def unwrap_model(model: PreTrainedModel) -> PreTrainedModel:
     return model.get_base_model() if isinstance(model, PeftModel) else model
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import time
 from pathlib import Path
@@ -10,10 +11,11 @@ from typing import Any
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 
 from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
-from lightning_grpo.utils.modeling import export_hf_model, load_tokenizer
+from lightning_grpo.utils.modeling import load_tokenizer, save_pth_weights
 from lightning_grpo.utils.config import save_json_config
 
 
@@ -23,9 +25,19 @@ class CheckpointCallback(ModelCheckpoint):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
-    def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
+    @staticmethod
+    def _resolve_export_model(pl_module: L.LightningModule) -> torch.nn.Module | None:
+        """Return the underlying trainable model that should be exported."""
 
+        return getattr(pl_module, "policy", None) or getattr(pl_module, "model", None)
+
+    def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
         super()._save_checkpoint(trainer, filepath)
+        if not trainer.is_global_zero:
+            return
+
+        save_path = Path(filepath).parent / "pt_checkpoint"
+        save_pth_weights(trainer.lightning_module, save_path)
 
 
 class TrainingStateCallback(Callback):
@@ -46,6 +58,7 @@ class TrainingStateCallback(Callback):
 
         if self.train_start_time is None:
             return
+
         elapsed = time.perf_counter() - self.train_start_time
         if pl_module.logger is not None and trainer.is_global_zero:
             pl_module.logger.log_metrics({"system/train_time_seconds": elapsed}, step=trainer.global_step)
@@ -99,6 +112,47 @@ class EfficiencyMonitorCallback(Callback):
         pl_module.log("perf/batch_time_seconds", elapsed, on_step=True, sync_dist=True)
 
 
+class GradParamNormCallback(Callback):
+    """Log global parameter/gradient L2 norms as training metrics."""
+
+    def __init__(self, log_every_n_steps: int = 1) -> None:
+        super().__init__()
+        self.log_every_n_steps = max(1, int(log_every_n_steps))
+
+    @staticmethod
+    def _compute_global_norm(pl_module: L.LightningModule, *, use_grad: bool) -> torch.Tensor:
+        reference = None
+        total = None
+
+        for param in pl_module.parameters():
+            if not param.requires_grad:
+                continue
+
+            tensor = param.grad if use_grad else param.detach()
+            if tensor is None:
+                continue
+
+            reference = tensor
+            part = tensor.detach().float().pow(2).sum()
+            total = part if total is None else total + part
+
+        if total is None:
+            if reference is not None:
+                return torch.tensor(0.0, device=reference.device)
+            return torch.tensor(0.0, device=pl_module.device)
+
+        return total.sqrt()
+
+    def on_after_backward(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        step = int(trainer.global_step)
+        if step == 0 or step % self.log_every_n_steps != 0:
+            return
+
+        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
+
+        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+
+
 class PeriodicSampleGenerationCallback(Callback):
     """Generate text samples during training for qualitative inspection."""
 
@@ -115,6 +169,101 @@ class PeriodicSampleGenerationCallback(Callback):
                 "pad_token": None,
             })()
         )
+
+    @staticmethod
+    def _extract_generations(decoded_sequences: list[str], prompts: list[str]) -> list[str]:
+        """Strip prompt prefixes from decoded full sequences when possible."""
+
+        generations: list[str] = []
+        for prompt, text in zip(prompts, decoded_sequences):
+            if text.startswith(prompt):
+                generations.append(text[len(prompt):].lstrip())
+            else:
+                generations.append(text)
+        return generations
+
+    @staticmethod
+    def _resolve_logger_collection(trainer: L.Trainer) -> list[Any]:
+        """Return all attached logger instances as a flat list."""
+
+        if trainer.loggers:
+            return list(trainer.loggers)
+        if trainer.logger is None:
+            return []
+        return [trainer.logger]
+
+    def _log_samples_to_loggers(
+            self,
+            trainer: L.Trainer,
+            rows: list[dict[str, Any]],
+            sample_path: Path,
+    ) -> None:
+        """Push sample generations to configured experiment loggers."""
+
+        loggers = self._resolve_logger_collection(trainer)
+        if not loggers:
+            return
+
+        preview_lines = [
+            f"[{index}] prompt: {row['prompt']}\n[{index}] generation: {row['generation']}"
+            for index, row in enumerate(rows)
+        ]
+        preview_text = "\n\n".join(preview_lines)
+        base_metrics = {
+            "samples/count": float(len(rows)),
+            "samples/path": str(sample_path),
+        }
+
+        for logger in loggers:
+            logger.log_metrics(base_metrics, step=trainer.global_step)
+
+            experiment = getattr(logger, "experiment", None)
+            if isinstance(logger, WandbLogger) and experiment is not None:
+                try:
+                    import wandb
+
+                    experiment.log(
+                        {
+                            "samples/table": wandb.Table(
+                                columns=["step", "prompt", "generation", "path"],
+                                data=[
+                                    [trainer.global_step, row["prompt"], row["generation"], str(sample_path)]
+                                    for row in rows
+                                ],
+                            ),
+                            "samples/text": preview_text,
+                        },
+                        step=trainer.global_step,
+                    )
+                except Exception as exc:  # pragma: no cover - logger-specific best effort path
+                    rank_zero_info(f"[PeriodicSampleGenerationCallback] Failed to log samples to Weights & Biases: {exc}")
+            elif isinstance(logger, CSVLogger):
+                self._append_samples_csv(logger.log_dir, trainer.global_step, rows, sample_path)
+            elif experiment is not None:
+                add_text = getattr(experiment, "add_text", None)
+                if callable(add_text):
+                    add_text("samples/text", preview_text, global_step=trainer.global_step)
+
+    @staticmethod
+    def _append_samples_csv(log_dir: str, step: int, rows: list[dict[str, Any]], sample_path: Path) -> None:
+        """Persist sample rows under the CSV logger directory for easy inspection."""
+
+        csv_path = Path(log_dir) / "sample_generations.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = csv_path.exists()
+        with csv_path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["step", "prompt", "generation", "path"])
+            if not file_exists:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        "step": step,
+                        "prompt": row["prompt"],
+                        "generation": row["generation"],
+                        "path": str(sample_path),
+                    }
+                )
 
     @rank_zero_only
     def on_train_batch_end(
@@ -137,27 +286,46 @@ class PeriodicSampleGenerationCallback(Callback):
         if model is None:
             return
 
+        was_training = model.training
         prompts = self.logging_config.sample_prompts
         tokenized = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
         tokenized = {key: value.to(pl_module.device) for key, value in tokenized.items()}
-        with torch.no_grad():
+        if hasattr(model, "eval"):
+            model.eval()
+        with torch.inference_mode():
             generated = model.generate(
                 **tokenized,
-                max_new_tokens=128,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.95,
+                max_new_tokens=self.logging_config.sample_max_new_tokens,
+                do_sample=self.logging_config.sample_do_sample,
+                temperature=self.logging_config.sample_temperature,
+                top_p=self.logging_config.sample_top_p,
+                top_k=self.logging_config.sample_top_k,
+                num_beams=self.logging_config.sample_num_beams,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
-        texts = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+        if was_training and hasattr(model, "train"):
+            model.train()
+
+        decoded_sequences = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+        texts = self._extract_generations(decoded_sequences, prompts)
         output_dir = Path(trainer.default_root_dir) / "samples"
         output_dir.mkdir(parents=True, exist_ok=True)
         sample_path = output_dir / f"step-{trainer.global_step:08d}.json"
-        save_json_config(
-            [{"prompt": prompt, "generation": generation} for prompt, generation in zip(prompts, texts)],
-            sample_path,
-        )
+        payload = {
+            "step": trainer.global_step,
+            "timestamp": time.time(),
+            "samples": [
+                {
+                    "prompt": prompt,
+                    "generation": generation,
+                    "full_text": full_text,
+                }
+                for prompt, generation, full_text in zip(prompts, texts, decoded_sequences)
+            ],
+        }
+        save_json_config(payload, sample_path)
+        self._log_samples_to_loggers(trainer, payload["samples"], sample_path)
 
 
 class NaNLossCallback(Callback):
@@ -248,6 +416,7 @@ def build_callbacks(config: ExperimentConfig) -> list[Callback]:
         LearningRateMonitor(logging_interval="step"),
         TrainingStateCallback(),
         EfficiencyMonitorCallback(log_every_n_steps=config.logging.log_every_n_steps),
+        GradParamNormCallback(log_every_n_steps=config.logging.log_every_n_steps),
         NaNLossCallback(),
         ConfigSnapshotCallback(config),
     ]
