@@ -77,7 +77,6 @@ class DataConfig:
     dataset_config: Optional[str] = None
     train_split: str = "train"
     val_split: Optional[str] = None
-    val_split_size: Optional[float] = None
     split_seed: int = 42
     prompt_column: str = "prompt"
     response_column: str = "response"

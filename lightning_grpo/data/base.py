@@ -129,31 +129,12 @@ def _load_local_json_datasets(files: list[str], cache_dir: str) -> Dataset:
     return concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
 
 
-def _with_optional_validation_split(dataset_dict: DatasetDict, data_config: DataConfig) -> DatasetDict:
-    """Add a derived validation split when requested and one is not already present."""
-
-    existing_val_split = resolve_validation_split_name(data_config, dataset_dict)
-    if existing_val_split is not None or data_config.val_split_size is None:
-        return dataset_dict
-
-    if data_config.train_split not in dataset_dict:
-        raise KeyError(f"Train split '{data_config.train_split}' not found in dataset.")
-
-    split_dataset = dataset_dict[data_config.train_split].train_test_split(
-        test_size=data_config.val_split_size,
-        seed=data_config.split_seed,
-    )
-    dataset_dict[data_config.train_split] = split_dataset["train"]
-    dataset_dict[DEFAULT_VAL_SPLIT_NAME] = split_dataset["test"]
-    return dataset_dict
-
-
 def resolve_validation_split_name(data_config: DataConfig, dataset_dict: DatasetDict) -> Optional[str]:
     """Resolve which validation split should be used for the current dataset config."""
 
     if data_config.val_split and data_config.val_split in dataset_dict:
         return data_config.val_split
-    if data_config.val_split_size is not None and DEFAULT_VAL_SPLIT_NAME in dataset_dict:
+    if DEFAULT_VAL_SPLIT_NAME in dataset_dict:
         return DEFAULT_VAL_SPLIT_NAME
     return None
 
@@ -184,7 +165,7 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
     else:
         raise ValueError("One of data.train_files, data.dataset_name, or data.dataset_mixture must be configured.")
 
-    return _with_optional_validation_split(dataset_dict, data_config)
+    return dataset_dict
 
 
 def apply_chat_template(

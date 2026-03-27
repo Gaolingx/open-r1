@@ -71,6 +71,7 @@ def build_trainer(config: ExperimentConfig) -> L.Trainer:
         config.distributed,
         config.precision,
     )
+    has_validation_data = bool(config.data.val_files or config.data.val_split)
 
     return L.Trainer(
         default_root_dir=config.output_dir,
@@ -82,5 +83,7 @@ def build_trainer(config: ExperimentConfig) -> L.Trainer:
         callbacks=build_callbacks(config),
         logger=build_loggers(config),
         val_check_interval=config.log_every_n_steps,
+        limit_val_batches=0 if not has_validation_data else None,
+        num_sanity_val_steps=0 if not has_validation_data else None,
         **strategy_kwargs,
     )

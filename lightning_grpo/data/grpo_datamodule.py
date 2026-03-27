@@ -87,17 +87,6 @@ class GRPODataModule(LightningDataModule):
         train_dataset = dataset_dict[self.data_config.train_split]
         val_split_name = resolve_validation_split_name(self.data_config, dataset_dict)
 
-        if val_split_name is None:
-            split_ratio = self.data_config.val_split_size or 0.01
-            split_dataset = train_dataset.train_test_split(
-                test_size=split_ratio,
-                seed=self.data_config.split_seed,
-            )
-            train_dataset = split_dataset["train"]
-            dataset_dict[self.data_config.train_split] = train_dataset
-            dataset_dict["validation"] = split_dataset["test"]
-            val_split_name = "validation"
-
         self.train_dataset = self._prepare_prompt_dataset(train_dataset, formatter)
         self.val_dataset = None
         if val_split_name is not None:
