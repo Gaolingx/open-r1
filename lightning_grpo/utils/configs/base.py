@@ -189,6 +189,7 @@ class ExperimentConfig:
     """Top-level configuration consumed by Lightning entrypoints."""
 
     seed: int = 42
+    log_every_n_steps: int = 500
     task: Literal["sft", "grpo", "pretrain"] = "sft"
     output_dir: str = "outputs/default"
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)

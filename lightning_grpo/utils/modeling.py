@@ -283,16 +283,16 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
 
     metrics: dict[str, torch.Tensor] = {}
 
+    def _get_output_value(outputs: Any, key: str) -> Any:
+        if isinstance(outputs, dict):
+            return outputs.get(key)
+        return getattr(outputs, key, None)
+
     if outputs is None:
         return metrics
 
-    router_logits = getattr(outputs, "router_logits", None)
-    if router_logits is None and isinstance(outputs, dict):
-        router_logits = outputs.get("router_logits")
-
-    aux_loss = getattr(outputs, "aux_loss", None)
-    if aux_loss is None and isinstance(outputs, dict):
-        aux_loss = outputs.get("aux_loss")
+    router_logits = _get_output_value(outputs, "router_logits")
+    aux_loss = _get_output_value(outputs, "aux_loss")
 
     if aux_loss is not None:
         metrics["aux_loss"] = aux_loss.detach().to(dtype=torch.float32)
@@ -315,8 +315,25 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
     layer_load_imbalance: list[torch.Tensor] = []
 
     for layer_logits in valid_router_logits:
-        probs = torch.softmax(layer_logits.detach().to(dtype=torch.float32), dim=-1)
-        mean_probs = probs.mean(dim=(0, 1))
+        probs = layer_logits.detach().to(dtype=torch.float32)
+        if probs.ndim == 0 or probs.shape[-1] == 0:
+            continue
+
+        probs = probs.reshape(-1, probs.shape[-1])
+        if probs.numel() == 0:
+            continue
+
+        row_sums = probs.sum(dim=-1)
+        is_probability_distribution = torch.allclose(
+            row_sums,
+            torch.ones_like(row_sums),
+            atol=1.0e-4,
+            rtol=1.0e-4,
+        ) and torch.all(probs >= 0)
+        if not is_probability_distribution:
+            probs = torch.softmax(probs, dim=-1)
+
+        mean_probs = probs.mean(dim=0)
         entropy = -(probs * torch.log(probs.clamp_min(1.0e-8))).sum(dim=-1).mean()
         max_prob = probs.max(dim=-1).values.mean()
         load_std = mean_probs.std(unbiased=False)

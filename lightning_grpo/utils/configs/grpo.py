@@ -59,7 +59,6 @@ class RolloutConfig:
 
     num_generations: int = 8
     num_generations_eval: int | None = None
-    eval_strategy: Literal["no", "epoch", "steps"] = "no"
     max_prompt_length: int = 2048
     max_completion_length: int = 1024
     temperature: float = 0.8
@@ -70,7 +69,7 @@ class RolloutConfig:
     loss_type: Literal["grpo", "cispo"] = "grpo"
     advantage_epsilon: float = 1.0e-6
     use_reference_model: bool = True
-    generation_batch_size: int = 1
+    generation_batch_size: int = 0
     engine: RolloutEngineConfig = field(default_factory=RolloutEngineConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
 

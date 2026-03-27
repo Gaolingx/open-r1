@@ -36,6 +36,7 @@ class GRPOLightningModule(L.LightningModule):
             policy_model=self.policy,
             tokenizer=self.tokenizer,
             temperature=config.rollout.temperature,
+            generation_batch_size=config.rollout.generation_batch_size,
             sglang_base_url=config.rollout.engine.sglang_base_url,
             sglang_model_path=config.rollout.engine.sglang_model_path,
             sglang_shared_path=config.rollout.engine.sglang_shared_path,
@@ -305,10 +306,7 @@ class GRPOLightningModule(L.LightningModule):
         ).nansum(dim=-1)
         num_generations = self._resolve_num_generations(training)
         global_advantages = self._compute_advantages(global_rewards, num_generations)
-
-        local_batch_size = rewards.shape[0]
-        rank = getattr(self, "global_rank", 0)
-        advantages = global_advantages[rank * local_batch_size: (rank + 1) * local_batch_size].unsqueeze(1)
+        advantages = self._compute_advantages(rewards, num_generations).unsqueeze(1)
 
         log_ratio = per_token_logps - old_per_token_logps
         importance_ratio = torch.exp(log_ratio)
@@ -385,103 +383,25 @@ class GRPOLightningModule(L.LightningModule):
         self.log(f"{prefix}/loss", loss, prog_bar=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/reward", metrics["reward"], prog_bar=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/reward_std", metrics["reward_std"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        self.log(
-            f"{prefix}/frac_reward_zero_std",
-            metrics["frac_reward_zero_std"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
+        self.log(f"{prefix}/frac_reward_zero_std", metrics["frac_reward_zero_std"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/advantage_mean", metrics["advantage_mean"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/advantage_std", metrics["advantage_std"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/kl", metrics["kl"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/entropy", metrics["entropy"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         log_moe_metrics(self, metrics, prefix, on_step=on_step, on_epoch=on_epoch)
-        self.log(
-            f"{prefix}/completions/mean_length",
-            metrics["completion_length"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
-        self.log(
-            f"{prefix}/completions/min_length",
-            metrics["completion_length_min"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
-        self.log(
-            f"{prefix}/completions/max_length",
-            metrics["completion_length_max"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
-        self.log(
-            f"{prefix}/completions/clipped_ratio",
-            metrics["completion_clipped_ratio"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
-        self.log(
-            f"{prefix}/completions/mean_terminated_length",
-            metrics["terminated_length_mean"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
-        self.log(
-            f"{prefix}/completions/min_terminated_length",
-            metrics["terminated_length_min"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
-        self.log(
-            f"{prefix}/completions/max_terminated_length",
-            metrics["terminated_length_max"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
-        self.log(
-            f"{prefix}/clip_ratio/low",
-            metrics["clip_ratio_low"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
-        self.log(
-            f"{prefix}/clip_ratio/high",
-            metrics["clip_ratio_high"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
-        self.log(
-            f"{prefix}/clip_ratio/region",
-            metrics["clip_ratio_region"],
-            on_step=on_step,
-            on_epoch=on_epoch,
-            sync_dist=True,
-        )
+        self.log(f"{prefix}/completions/mean_length", metrics["completion_length"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        self.log(f"{prefix}/completions/min_length", metrics["completion_length_min"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        self.log(f"{prefix}/completions/max_length", metrics["completion_length_max"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        self.log(f"{prefix}/completions/clipped_ratio", metrics["completion_clipped_ratio"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        self.log(f"{prefix}/completions/mean_terminated_length", metrics["terminated_length_mean"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        self.log(f"{prefix}/completions/min_terminated_length", metrics["terminated_length_min"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        self.log(f"{prefix}/completions/max_terminated_length", metrics["terminated_length_max"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        self.log(f"{prefix}/clip_ratio/low", metrics["clip_ratio_low"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        self.log(f"{prefix}/clip_ratio/high", metrics["clip_ratio_high"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        self.log(f"{prefix}/clip_ratio/region", metrics["clip_ratio_region"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         for reward_name in self.config.reward.reward_funcs:
-            self.log(
-                f"{prefix}/rewards/{reward_name}/mean",
-                metrics[f"reward/{reward_name}"],
-                on_step=on_step,
-                on_epoch=on_epoch,
-                sync_dist=True,
-            )
-            self.log(
-                f"{prefix}/rewards/{reward_name}/std",
-                metrics[f"reward_std/{reward_name}"],
-                on_step=on_step,
-                on_epoch=on_epoch,
-                sync_dist=True,
-            )
+            self.log(f"{prefix}/rewards/{reward_name}/mean", metrics[f"reward/{reward_name}"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+            self.log(f"{prefix}/rewards/{reward_name}/std", metrics[f"reward_std/{reward_name}"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         """Run one online rollout and optimization step."""

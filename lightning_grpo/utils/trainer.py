@@ -64,25 +64,6 @@ def build_loggers(config: ExperimentConfig) -> list[Any]:
     return loggers
 
 
-def build_eval_kwargs(config: ExperimentConfig) -> dict[str, Any]:
-    """Build Lightning validation scheduling kwargs from rollout configuration."""
-
-    rollout_config = getattr(config, "rollout", None)
-    eval_strategy = getattr(rollout_config, "eval_strategy", "no")
-
-    if eval_strategy == "no":
-        return {
-            "limit_val_batches": 0,
-            "num_sanity_val_steps": 0,
-        }
-    if eval_strategy == "steps":
-        return {
-            "check_val_every_n_epoch": None,
-            "val_check_interval": max(1, config.logging.log_every_n_steps),
-        }
-    return {"check_val_every_n_epoch": 1}
-
-
 def build_trainer(config: ExperimentConfig) -> L.Trainer:
     """Create a Lightning trainer with DDP or FSDP support."""
 
@@ -90,7 +71,6 @@ def build_trainer(config: ExperimentConfig) -> L.Trainer:
         config.distributed,
         config.precision,
     )
-    eval_strategy_kwargs = build_eval_kwargs(config)
 
     return L.Trainer(
         default_root_dir=config.output_dir,
@@ -101,8 +81,6 @@ def build_trainer(config: ExperimentConfig) -> L.Trainer:
         log_every_n_steps=config.logging.log_every_n_steps,
         callbacks=build_callbacks(config),
         logger=build_loggers(config),
-        benchmark=True,
-        deterministic=False,
+        val_check_interval=config.log_every_n_steps,
         **strategy_kwargs,
-        **eval_strategy_kwargs,
     )
