@@ -16,7 +16,7 @@ for path in (PROJECT_ROOT, SRC_ROOT):
 import lightning as L
 
 from lightning_grpo.utils.configs.grpo import GRPOConfig
-from lightning_grpo.data.grpo import GRPODataModule
+from lightning_grpo.data.grpo_datamodule import GRPODataModule
 from lightning_grpo.models.grpo_module import GRPOLightningModule
 from lightning_grpo.utils.config import load_experiment_config
 from lightning_grpo.utils.trainer import build_trainer, find_resume_checkpoint

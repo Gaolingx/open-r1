@@ -15,7 +15,7 @@ for path in (PROJECT_ROOT, SRC_ROOT):
 
 import lightning as L
 
-from lightning_grpo.data.pretrain_module import PretrainDataModule
+from lightning_grpo.data.pretrain_datamodule import PretrainDataModule
 from lightning_grpo.models.pretrain_module import PretrainLightningModule
 from lightning_grpo.utils.config import load_experiment_config
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
