@@ -1,7 +1,7 @@
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -474,14 +474,13 @@ class MiniMindModel(MiniMindPreTrainedModel, GenerationMixin):
             aux_loss = sum((layer.aux_loss for layer in moe_layers), hidden_states.new_zeros(1).squeeze())
             z_loss = sum((layer.router_z_loss for layer in moe_layers), hidden_states.new_zeros(1).squeeze())
             router_logits = tuple(layer.router_logits for layer in moe_layers)
-        model_output = MiniMindModelOutputWithPast(
+        return MiniMindModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             router_logits=router_logits,
             aux_loss=aux_loss,
             router_z_loss=z_loss,
         )
-        return model_output
 
 
 class MiniMindForCausalLM(MiniMindPreTrainedModel, GenerationMixin):
@@ -532,7 +531,7 @@ class MiniMindForCausalLM(MiniMindPreTrainedModel, GenerationMixin):
             loss = loss + aux_loss.to(loss.device)
         if labels is not None and router_z_loss is not None:
             loss = loss + router_z_loss.to(loss.device)
-        output = MiniMindCausalLMOutputWithPast(
+        return MiniMindCausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
             logits=logits,
@@ -541,10 +540,3 @@ class MiniMindForCausalLM(MiniMindPreTrainedModel, GenerationMixin):
             router_logits=outputs.router_logits if output_router_logits else None,
             router_z_loss=router_z_loss,
         )
-        return output
-
-
-def register_minimind_for_auto_class():
-    MiniMindConfig.register_for_auto_class()
-    MiniMindModel.register_for_auto_class("AutoModel")
-    MiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")
