@@ -211,10 +211,16 @@ def describe_model_source(model_config: ModelConfig) -> str:
     return f"{model_config.model_family}:{model_config.pretrained_weight or 'none'}"
 
 
-def save_pth_weights(cls, pl_module: L.LightningModule, filepath: str) -> Path | None:
+def resolve_export_model(pl_module: L.LightningModule) -> torch.nn.Module | None:
+    """Return the underlying trainable model that should be exported."""
+
+    return getattr(pl_module, "policy", None) or getattr(pl_module, "model", None)
+
+
+def save_pth_weights(pl_module: L.LightningModule, filepath: str) -> Path | None:
     """Persist a plain PyTorch state dict next to the Lightning checkpoint."""
 
-    model = cls._resolve_export_model(pl_module)
+    model = resolve_export_model(pl_module)
     if model is None:
         return None
 

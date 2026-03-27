@@ -10,7 +10,7 @@ from typing import Any
 
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 
@@ -24,12 +24,6 @@ class CheckpointCallback(ModelCheckpoint):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-
-    @staticmethod
-    def _resolve_export_model(pl_module: L.LightningModule) -> torch.nn.Module | None:
-        """Return the underlying trainable model that should be exported."""
-
-        return getattr(pl_module, "policy", None) or getattr(pl_module, "model", None)
 
     def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
         super()._save_checkpoint(trainer, filepath)
@@ -151,6 +145,19 @@ class GradParamNormCallback(Callback):
         grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
 
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+
+    def on_before_zero_grad(
+            self,
+            trainer: L.Trainer,
+            pl_module: L.LightningModule,
+            optimizer: torch.optim.Optimizer) -> None:
+        step = int(trainer.global_step)
+        if step == 0 or step % self.log_every_n_steps != 0:
+            return
+
+        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
+
+        pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
 
 class PeriodicSampleGenerationCallback(Callback):
@@ -419,6 +426,7 @@ def build_callbacks(config: ExperimentConfig) -> list[Callback]:
         GradParamNormCallback(log_every_n_steps=config.logging.log_every_n_steps),
         NaNLossCallback(),
         ConfigSnapshotCallback(config),
+        RichProgressBar(),
     ]
     early_stopping_callback = build_early_stopping_callback(config.early_stopping, config.checkpoint)
     if early_stopping_callback is not None:
