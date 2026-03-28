@@ -236,13 +236,13 @@ def unwrap_model(model: PreTrainedModel) -> PreTrainedModel:
 
 
 def export_hf_model(
-        model: PreTrainedModel,
-        model_config: ModelConfig,
-        export_dir: str | Path,
-        *,
-        tokenizer: PreTrainedTokenizerBase | None = None,
-        state_dict: dict[str, torch.Tensor] | None = None,
-        safe_serialization: bool = False,
+    model: PreTrainedModel,
+    model_config: ModelConfig,
+    export_dir: str | Path,
+    *,
+    tokenizer: PreTrainedTokenizerBase | None = None,
+    state_dict: dict[str, torch.Tensor] | None = None,
+    safe_serialization: bool = False,
 ) -> Path:
     export_path = Path(export_dir)
     export_path.mkdir(parents=True, exist_ok=True)
@@ -355,13 +355,13 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
 
 
 def log_moe_metrics(
-        module: L.LightningModule,
-        outputs_or_metrics: Any,
-        stage: str,
-        *,
-        on_step: bool,
-        on_epoch: bool = True,
-        sync_dist: bool = True,
+    module: L.LightningModule,
+    outputs_or_metrics: Any,
+    stage: str,
+    *,
+    on_step: bool,
+    on_epoch: bool = True,
+    sync_dist: bool = True,
 ) -> None:
     """Log shared MoE diagnostics from raw outputs or a precomputed metric dict."""
 

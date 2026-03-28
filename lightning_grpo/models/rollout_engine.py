@@ -16,12 +16,12 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 
 def compute_per_token_logps(
-        model: torch.nn.Module,
-        input_ids: Tensor,
-        n_keep: int,
-        *,
-        attention_mask: Optional[Tensor] = None,
-        temperature: float = 1.0,
+    model: torch.nn.Module,
+    input_ids: Tensor,
+    n_keep: int,
+    *,
+    attention_mask: Optional[Tensor] = None,
+    temperature: float = 1.0,
 ) -> Tensor:
     """Compute per-token log-probabilities for the sampled completion suffix."""
 
@@ -59,14 +59,14 @@ class RolloutEngine(ABC):
 
     @abstractmethod
     def rollout(
-            self,
-            *,
-            prompt_ids: Tensor,
-            attention_mask: Tensor,
-            num_generations: int,
-            max_new_tokens: int,
-            temperature: float,
-            top_p: float,
+        self,
+        *,
+        prompt_ids: Tensor,
+        attention_mask: Tensor,
+        num_generations: int,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
     ) -> RolloutResult:
         raise NotImplementedError
 
@@ -79,11 +79,11 @@ class PolicyRolloutEngine(RolloutEngine):
     """In-process rollout using the current policy model."""
 
     def __init__(
-            self,
-            policy_model: torch.nn.Module,
-            tokenizer: PreTrainedTokenizerBase,
-            temperature: float,
-            generation_batch_size: int = 0,
+        self,
+        policy_model: torch.nn.Module,
+        tokenizer: PreTrainedTokenizerBase,
+        temperature: float,
+        generation_batch_size: int = 0,
     ) -> None:
         self.policy_model = policy_model
         self.tokenizer = tokenizer
@@ -91,14 +91,14 @@ class PolicyRolloutEngine(RolloutEngine):
         self.generation_batch_size = max(0, int(generation_batch_size))
 
     def rollout(
-            self,
-            *,
-            prompt_ids: Tensor,
-            attention_mask: Tensor,
-            num_generations: int,
-            max_new_tokens: int,
-            temperature: float,
-            top_p: float,
+        self,
+        *,
+        prompt_ids: Tensor,
+        attention_mask: Tensor,
+        num_generations: int,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
     ) -> RolloutResult:
         model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
         original_padding_side = self.tokenizer.padding_side
@@ -154,15 +154,15 @@ class PolicyRolloutEngine(RolloutEngine):
         self.policy_model = model
 
     def _generate_in_chunks(
-            self,
-            *,
-            model: torch.nn.Module,
-            prompt_ids: Tensor,
-            attention_mask: Tensor,
-            num_generations: int,
-            max_new_tokens: int,
-            temperature: float,
-            top_p: float,
+        self,
+        *,
+        model: torch.nn.Module,
+        prompt_ids: Tensor,
+        attention_mask: Tensor,
+        num_generations: int,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
     ) -> Tensor:
         """Generate completions in prompt chunks to cap rollout memory usage."""
 
@@ -196,12 +196,12 @@ class SGLangRolloutEngine(RolloutEngine):
     """HTTP rollout backend backed by an SGLang server."""
 
     def __init__(
-            self,
-            *,
-            base_url: str,
-            model_path: str,
-            shared_ckpt_path: str,
-            timeout: int,
+        self,
+        *,
+        base_url: str,
+        model_path: str,
+        shared_ckpt_path: str,
+        timeout: int,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.shared_ckpt_path = shared_ckpt_path
@@ -210,14 +210,14 @@ class SGLangRolloutEngine(RolloutEngine):
         self.http = requests
 
     def rollout(
-            self,
-            *,
-            prompt_ids: Tensor,
-            attention_mask: Tensor,
-            num_generations: int,
-            max_new_tokens: int,
-            temperature: float,
-            top_p: float,
+        self,
+        *,
+        prompt_ids: Tensor,
+        attention_mask: Tensor,
+        num_generations: int,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
     ) -> RolloutResult:
         input_ids_list = [ids[mask.bool()].tolist() for ids, mask in zip(prompt_ids, attention_mask, strict=True)]
         repeated_prompt_ids_list = [ids for ids in input_ids_list for _ in range(num_generations)]
@@ -291,9 +291,9 @@ class SGLangRolloutEngine(RolloutEngine):
 
 
 def truncate_completions(
-        completion_ids: Tensor,
-        pad_token_id: int,
-        eos_token_id: Optional[int],
+    completion_ids: Tensor,
+    pad_token_id: int,
+    eos_token_id: Optional[int],
 ) -> tuple[Tensor, Tensor, Tensor, list[list[int]]]:
     """Mask tokens after EOS and extract valid completion token lists."""
 
@@ -338,16 +338,16 @@ def pad_float_sequences(sequences: list[list[float]], max_len: int, device: torc
 
 
 def create_rollout_engine(
-        *,
-        engine_type: str,
-        policy_model: torch.nn.Module,
-        tokenizer: PreTrainedTokenizerBase,
-        temperature: float,
-        generation_batch_size: int = 0,
-        sglang_base_url: Optional[str] = None,
-        sglang_model_path: Optional[str] = None,
-        sglang_shared_path: Optional[str] = None,
-        request_timeout: int = 120,
+    *,
+    engine_type: str,
+    policy_model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    temperature: float,
+    generation_batch_size: int = 0,
+    sglang_base_url: Optional[str] = None,
+    sglang_model_path: Optional[str] = None,
+    sglang_shared_path: Optional[str] = None,
+    request_timeout: int = 120,
 ) -> RolloutEngine:
     """Build the configured rollout engine."""
 

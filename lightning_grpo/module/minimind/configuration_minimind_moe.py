@@ -4,7 +4,6 @@ from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
 from transformers.utils import logging
 
-
 logger = logging.get_logger(__name__)
 
 

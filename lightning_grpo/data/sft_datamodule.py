@@ -62,11 +62,11 @@ class SFTDataModule(LightningDataModule):
     """Lightning data module for supervised fine-tuning."""
 
     def __init__(
-            self,
-            data_config: DataConfig,
-            model_config: ModelConfig,
-            optimization_config: OptimizationConfig,
-            system_prompt: Optional[str] = None,
+        self,
+        data_config: DataConfig,
+        model_config: ModelConfig,
+        optimization_config: OptimizationConfig,
+        system_prompt: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.data_config = data_config

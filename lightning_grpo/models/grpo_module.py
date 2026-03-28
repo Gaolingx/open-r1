@@ -219,11 +219,11 @@ class GRPOLightningModule(L.LightningModule):
             self.policy.train()
 
     def _compute_rewards(
-            self,
-            prompts: list[str],
-            completions: list[list[dict[str, str]]],
-            completion_id_lists: list[list[int]],
-            metadata: list[dict[str, Any]],
+        self,
+        prompts: list[str],
+        completions: list[list[dict[str, str]]],
+        completion_id_lists: list[list[int]],
+        metadata: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute per-reward and aggregated rewards using TRL-style reward kwargs propagation."""
 

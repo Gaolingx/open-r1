@@ -36,7 +36,6 @@ from .utils.competitive_programming import patch_code as cf_patch_code
 from .utils.competitive_programming import score_submission as cf_score_submission
 from .utils.competitive_programming import score_subtask
 
-
 FORMAT_MODE_STRICT = "strict"
 FORMAT_MODE_COMPATIBLE = "compatible"
 FORMAT_MODE_NO_ANSWER_TAG = "no_answer_tag"

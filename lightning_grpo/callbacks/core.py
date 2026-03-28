@@ -47,23 +47,23 @@ class EfficiencyMonitorCallback(Callback):
         self.step_start_time: float | None = None
 
     def on_train_batch_start(
-            self,
-            trainer: L.Trainer,
-            pl_module: L.LightningModule,
-            batch: dict[str, Any],
-            batch_idx: int,
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        batch: dict[str, Any],
+        batch_idx: int,
     ) -> None:
         """Capture batch start time for throughput estimation."""
 
         self.step_start_time = time.perf_counter()
 
     def on_train_batch_end(
-            self,
-            trainer: L.Trainer,
-            pl_module: L.LightningModule,
-            outputs: Any,
-            batch: dict[str, Any],
-            batch_idx: int,
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: dict[str, Any],
+        batch_idx: int,
     ) -> None:
         """Log tokens per second and sequence statistics periodically."""
 
@@ -128,10 +128,10 @@ class GradParamNormCallback(Callback):
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
     def on_before_zero_grad(
-            self,
-            trainer: L.Trainer,
-            pl_module: L.LightningModule,
-            optimizer: torch.optim.Optimizer) -> None:
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        optimizer: torch.optim.Optimizer) -> None:
         step = int(trainer.global_step)
         if step == 0 or step % self.log_every_n_steps != 0:
             return
@@ -243,10 +243,10 @@ class PeriodicSampleGenerationCallback(Callback):
         return [trainer.logger]
 
     def _log_samples_to_loggers(
-            self,
-            trainer: L.Trainer,
-            rows: list[dict[str, Any]],
-            sample_path: Path,
+        self,
+        trainer: L.Trainer,
+        rows: list[dict[str, Any]],
+        sample_path: Path,
     ) -> None:
         """Push sample generations to configured experiment loggers."""
 
@@ -317,12 +317,12 @@ class PeriodicSampleGenerationCallback(Callback):
 
     @rank_zero_only
     def on_train_batch_end(
-            self,
-            trainer: L.Trainer,
-            pl_module: L.LightningModule,
-            outputs: Any,
-            batch: dict[str, Any],
-            batch_idx: int,
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: dict[str, Any],
+        batch_idx: int,
     ) -> None:
         """Generate periodic sample completions and save them to disk."""
 
@@ -382,12 +382,12 @@ class NaNLossCallback(Callback):
     """Immediately stop training when a NaN or Inf loss is detected."""
 
     def on_train_batch_end(
-            self,
-            trainer: L.Trainer,
-            pl_module: L.LightningModule,
-            outputs: Any,
-            batch: Any,
-            batch_idx: int,
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
     ) -> None:
         """Stop training when the batch loss becomes non-finite."""
 
@@ -423,8 +423,8 @@ class ConfigSnapshotCallback(Callback):
 
 
 def build_early_stopping_callback(
-        early_stopping_config: EarlyStoppingConfig,
-        checkpoint_config: CheckpointConfig,
+    early_stopping_config: EarlyStoppingConfig,
+    checkpoint_config: CheckpointConfig,
 ) -> EarlyStopping | None:
     """Create an early stopping callback when the feature is enabled."""
 

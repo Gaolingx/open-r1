@@ -52,8 +52,8 @@ def _resolve_policy_classes(class_paths: list[str]) -> set[type[Module]] | None:
 
 
 def configure_cuda_precision(
-        precision_config: PrecisionConfig,
-        accelerator: str | None,
+    precision_config: PrecisionConfig,
+    accelerator: str | None,
 ) -> None:
     """Configure TF32 and float32 matmul precision when CUDA is available."""
 
@@ -94,8 +94,8 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | FSDPStrateg
 
 
 def trainer_strategy_kwargs(
-        distributed_config: DistributedConfig,
-        precision_config: PrecisionConfig | None = None,
+    distributed_config: DistributedConfig,
+    precision_config: PrecisionConfig | None = None,
 ) -> dict[str, Any]:
     """Build keyword arguments for [`lightning.pytorch.Trainer`](lightning_grpo/strategies/factory.py:126)."""
 
