@@ -293,9 +293,12 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
 
     router_logits = _get_output_value(outputs, "router_logits")
     aux_loss = _get_output_value(outputs, "aux_loss")
+    z_loss = _get_output_value(outputs, "z_loss")
 
     if aux_loss is not None:
         metrics["aux_loss"] = aux_loss.detach().to(dtype=torch.float32)
+    if z_loss is not None:
+        metrics["z_loss"] = z_loss.detach().to(dtype=torch.float32)
 
     if router_logits is None:
         return metrics
@@ -371,6 +374,7 @@ def log_moe_metrics(
         get_metric = outputs_or_metrics.get
         metrics.update({
             "aux_loss": get_metric("aux_loss", metrics.get("aux_loss")),
+            "z_loss": get_metric("z_loss", metrics.get("z_loss")),
             "router_entropy": get_metric("router_entropy", metrics.get("router_entropy")),
             "router_max_prob": get_metric("router_max_prob", metrics.get("router_max_prob")),
             "expert_load_std": get_metric("expert_load_std", metrics.get("expert_load_std")),

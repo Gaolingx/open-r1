@@ -23,7 +23,7 @@ from transformers.modeling_layers import (
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from transformers.modeling_outputs import MoECausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
@@ -239,33 +239,20 @@ class MiniMindMoeTopKRouter(nn.Module):
         super().__init__()
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
-        self.expert_dropout = config.expert_dropout
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)  # (num_tokens, num_experts)
-
-        routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)  # (num_tokens, top_k)
-
-        if self.training and self.expert_dropout > 0:
-            keep_mask = torch.rand_like(router_top_value).gt(self.expert_dropout)
-            has_active = keep_mask.any(dim=-1, keepdim=True)
-            if not torch.all(has_active):
-                fallback = router_top_value.argmax(dim=-1, keepdim=True)
-                keep_mask = keep_mask.scatter(-1, fallback, True)
-            router_top_value = router_top_value * keep_mask.to(router_top_value.dtype)
-            router_indices = router_indices.masked_fill(~keep_mask, self.num_experts)
-
+        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
+        router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
         if self.norm_topk_prob:
-            normalizer = router_top_value.sum(dim=-1, keepdim=True)
-            router_top_value = router_top_value / normalizer.clamp_min(torch.finfo(router_top_value.dtype).eps)
-
+            router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
         router_top_value = router_top_value.to(router_logits.dtype)
-        return router_logits, router_top_value, router_indices
+        router_scores = router_top_value
+        return router_logits, router_scores, router_indices
 
 
 class MiniMindMoeSparseMoeBlock(nn.Module):
@@ -528,6 +515,32 @@ class MiniMindMoeModel(MiniMindMoePreTrainedModel):
         )
 
 
+def z_loss_func(gate_logits: torch.Tensor | tuple[torch.Tensor] | None) -> torch.Tensor | int:
+    r"""
+    Compute the router z-loss implemented in PyTorch.
+
+    The router z-loss was introduced in [Designing Effective Sparse Expert Models](https://huggingface.co/papers/2202.08906).
+    It encourages router logits to remain small in an effort to improve stability.
+
+    Args:
+        router_logits (`float`):
+            Input logits of shape [batch_size, sequence_length, num_experts]
+
+    Returns:
+        Scalar router z-loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    if isinstance(gate_logits, tuple):
+        compute_device = gate_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+
+    log_z = torch.logsumexp(concatenated_gate_logits, dim=-1)
+    z_loss = torch.mean(log_z ** 2)
+    return z_loss
+
+
 def load_balancing_loss_func(
     gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
     num_experts: int | None = None,
@@ -622,6 +635,7 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.router_aux_loss_coef = config.router_aux_loss_coef
+        self.router_z_loss_coef = config.router_z_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
 
@@ -643,7 +657,7 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoeCausalLMOutputWithPast:
+    ) -> MoECausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -701,12 +715,15 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
                 self.num_experts_per_tok,
                 attention_mask,
             )
+            z_loss = z_loss_func(outputs.router_logits)
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
+                loss += self.router_z_loss_coef * z_loss.to(loss.device)
 
-        return MoeCausalLMOutputWithPast(
+        return MoECausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
+            z_loss=z_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,

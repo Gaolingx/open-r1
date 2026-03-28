@@ -69,8 +69,6 @@ class MiniMindMoeConfig(PreTrainedConfig):
             Number of selected experts.
         num_experts (`int`, *optional*, defaults to 128):
             Number of routed experts.
-        expert_dropout (`float`, *optional*, defaults to 0.0):
-            Dropout probability applied to selected expert routing weights during training only.
         norm_topk_prob (`bool`, *optional*, defaults to `False`):
             Whether to normalize the topk probabilities.
         output_router_logits (`bool`, *optional*, defaults to `False`):
@@ -78,6 +76,8 @@ class MiniMindMoeConfig(PreTrainedConfig):
             allow the model to output the auxiliary loss, including load balancing loss and router z-loss.
         router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
             The aux loss factor for the total loss.
+        router_z_loss_coef (`float`, *optional*, defaults to 0.001):
+            The z_loss factor for the total loss.
         mlp_only_layers (`list[int]`, *optional*, defaults to `[]`):
             Indicate which layers use MiniMindMoeMLP rather than MiniMindMoeSparseMoeBlock
             The list contains layer index, from 0 to num_layers-1 if we have num_layers layers
@@ -153,10 +153,10 @@ class MiniMindMoeConfig(PreTrainedConfig):
         moe_intermediate_size: int | None = 768,
         num_experts_per_tok: int | None = 8,
         num_experts: int | None = 128,
-        expert_dropout: float | None = 0.0,
         norm_topk_prob: bool | None = False,
         output_router_logits: bool | None = False,
         router_aux_loss_coef: float | None = 0.001,
+        router_z_loss_coef: float | None = 0.001,
         mlp_only_layers: bool | None = None,
         pad_token_id: int | None = None,
         bos_token_id: int | None = None,
@@ -186,10 +186,10 @@ class MiniMindMoeConfig(PreTrainedConfig):
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
         self.num_experts = num_experts
-        self.expert_dropout = expert_dropout
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
+        self.router_z_loss_coef = router_z_loss_coef
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
 
         self.pad_token_id = pad_token_id
