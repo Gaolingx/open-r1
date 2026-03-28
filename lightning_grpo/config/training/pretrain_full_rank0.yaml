@@ -27,22 +27,24 @@ data:
     - E:/training/t2t/pretrain/pretrain_t2t.jsonl
   text_column: text
   train_split: train
-  max_seq_length: 340
+  max_seq_length: 1024
   num_workers: 0
   preprocessing_batch_size: 128
   preprocessing_use_cache: true
   preprocessing_keep_in_memory: false
 
 optimization:
-  optimizer: adamw8bit
-  learning_rate: 1.0e-5
-  weight_decay: 0.01
-  warmup_steps: 100
-  scheduler: cosine
+  optimizer:
+    type: adamw8bit
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+  scheduler:
+    type: cosine
+    warmup_steps: 100
   max_epochs: 2
   gradient_accumulation_steps: 1
   gradient_clip_val: 1.0
-  train_micro_batch_size: 32
+  train_micro_batch_size: 16
   eval_micro_batch_size: 1
 
 logging:

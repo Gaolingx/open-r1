@@ -13,6 +13,7 @@ import torch
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
+from transformers.optimization import get_scheduler
 
 from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
 from lightning_grpo.utils.modeling import load_tokenizer, save_pth_weights
@@ -20,11 +21,10 @@ from lightning_grpo.utils.config import save_json_config
 
 
 class CheckpointCallback(ModelCheckpoint):
-    """ModelCheckpoint Callback."""
+    """ModelCheckpoint with optional torch export delegated to LightningModule."""
 
     def __init__(self, *args: Any, save_pt_format: bool = True, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-
         self.save_pt_format = save_pt_format
 
     def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
@@ -139,6 +139,68 @@ class GradParamNormCallback(Callback):
         grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
 
         pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+
+
+class LRandSchedulerOverrideCallback(Callback):
+    """Override optimizer LR and optionally reset scheduler state after ckpt resume."""
+
+    def __init__(self, config: ExperimentConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.applied = False
+
+    def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if self.applied:
+            return
+
+        optimization = self.config.optimization
+        resume_override = optimization.resume_override
+        reset_lr = resume_override.override_lr_on_resume
+        reset_scheduler = resume_override.reset_scheduler_on_resume
+
+        if not reset_lr and not reset_scheduler:
+            return
+
+        if not trainer.optimizers:
+            return
+
+        optimizer = trainer.optimizers[0]
+        target_lr = float(optimization.optimizer.learning_rate)
+
+        if reset_lr:
+            for group in optimizer.param_groups:
+                group["lr"] = target_lr
+                group["initial_lr"] = target_lr
+            rank_zero_info(f"[LRandSchedulerOverrideCallback] Reset optimizer LR to {target_lr}.")
+
+        if reset_scheduler:
+            scheduler_config = optimization.scheduler
+            scheduler_type = str(scheduler_config.type)
+
+            if optimization.max_steps and optimization.max_steps > 0:
+                total_steps = optimization.max_steps
+            else:
+                total_steps = max(1, trainer.estimated_stepping_batches)
+
+            num_warmup_steps = min(max(0, scheduler_config.warmup_steps), total_steps)
+            scheduler_specific_kwargs = dict(scheduler_config.scheduler_specific_kwargs)
+
+            new_scheduler = get_scheduler(
+                name=scheduler_type,
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=total_steps,
+                scheduler_specific_kwargs=scheduler_specific_kwargs or None,
+            )
+
+            if trainer.lr_scheduler_configs:
+                trainer.lr_scheduler_configs[0].scheduler = new_scheduler
+            rank_zero_info(
+                "[LRandSchedulerOverrideCallback] Reset scheduler state "
+                f"(type={scheduler_type}, warmup={num_warmup_steps}, total_steps={total_steps})."
+            )
+
+        self.applied = True
 
 
 class PeriodicSampleGenerationCallback(Callback):
@@ -360,21 +422,6 @@ class ConfigSnapshotCallback(Callback):
         save_json_config(self.config.to_dict(), config_path)
 
 
-def build_checkpoint_callback(checkpoint_config: CheckpointConfig) -> ModelCheckpoint:
-    """Create the default checkpoint callback."""
-
-    return CheckpointCallback(
-        dirpath=checkpoint_config.dirpath,
-        filename="model-{epoch:02d}-{step:06d}-{train/loss:.4f}",
-        monitor=checkpoint_config.monitor,
-        mode=checkpoint_config.mode,
-        save_top_k=checkpoint_config.save_top_k,
-        save_last=checkpoint_config.save_last,
-        every_n_train_steps=checkpoint_config.every_n_train_steps,
-        save_pt_format=True,
-    )
-
-
 def build_early_stopping_callback(
         early_stopping_config: EarlyStoppingConfig,
         checkpoint_config: CheckpointConfig,
@@ -399,9 +446,21 @@ def build_early_stopping_callback(
 def build_callbacks(config: ExperimentConfig) -> list[Callback]:
     """Build the callback stack for Lightning training."""
 
+    ckpt_callback = CheckpointCallback(
+        dirpath=config.checkpoint.dirpath,
+        filename="model-{epoch:02d}-{step:06d}-{train/loss:.4f}",
+        monitor=config.checkpoint.monitor,
+        mode=config.checkpoint.mode,
+        save_top_k=config.checkpoint.save_top_k,
+        save_last=config.checkpoint.save_last,
+        every_n_train_steps=config.checkpoint.every_n_train_steps,
+        save_pt_format=True,
+    )
+
     callbacks: list[Callback] = [
-        build_checkpoint_callback(config.checkpoint),
+        ckpt_callback,
         LearningRateMonitor(logging_interval="step"),
+        LRandSchedulerOverrideCallback(config),
         EfficiencyMonitorCallback(log_every_n_steps=config.logging.log_every_n_steps),
         GradParamNormCallback(log_every_n_steps=config.logging.log_every_n_steps),
         NaNLossCallback(),

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import torch
-from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
+from transformers.optimization import get_scheduler
 
 from lightning_grpo.utils.configs.base import OptimizationConfig
 
@@ -14,26 +13,85 @@ from lightning_grpo.utils.configs.base import OptimizationConfig
 def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.optim.Optimizer:
     """Create the optimizer from configuration."""
 
-    if optimization.optimizer == "adamw8bit":
+    optimizer_config = optimization.optimizer
+    optimizer_type = optimizer_config.type.lower()
+
+    if optimizer_type in {"adamw8bit", "adam8bit"}:
         try:
             import bitsandbytes as bnb
         except ImportError as error:
-            raise ImportError("bitsandbytes is required for adamw8bit optimizer.") from error
+            raise ImportError("bitsandbytes is required for 8-bit optimizers.") from error
 
-        return bnb.optim.AdamW8bit(
+        optimizer_class = bnb.optim.AdamW8bit if optimizer_type == "adamw8bit" else bnb.optim.Adam8bit
+        return optimizer_class(
             parameters,
-            lr=optimization.learning_rate,
-            betas=optimization.betas,
-            eps=optimization.eps,
-            weight_decay=optimization.weight_decay,
+            lr=optimizer_config.learning_rate,
+            betas=optimizer_config.betas,
+            eps=optimizer_config.eps,
+            weight_decay=optimizer_config.weight_decay,
         )
 
-    return torch.optim.AdamW(
-        parameters,
-        lr=optimization.learning_rate,
-        betas=optimization.betas,
-        eps=optimization.eps,
-        weight_decay=optimization.weight_decay,
+    if optimizer_type == "adamw":
+        return torch.optim.AdamW(
+            parameters,
+            lr=optimizer_config.learning_rate,
+            betas=optimizer_config.betas,
+            eps=optimizer_config.eps,
+            weight_decay=optimizer_config.weight_decay,
+            amsgrad=optimizer_config.amsgrad,
+            foreach=optimizer_config.foreach,
+            maximize=optimizer_config.maximize,
+        )
+
+    if optimizer_type == "adam":
+        return torch.optim.Adam(
+            parameters,
+            lr=optimizer_config.learning_rate,
+            betas=optimizer_config.betas,
+            eps=optimizer_config.eps,
+            weight_decay=optimizer_config.weight_decay,
+            amsgrad=optimizer_config.amsgrad,
+            foreach=optimizer_config.foreach,
+            maximize=optimizer_config.maximize,
+        )
+
+    if optimizer_type == "sgd":
+        return torch.optim.SGD(
+            parameters,
+            lr=optimizer_config.learning_rate,
+            momentum=optimizer_config.momentum,
+            weight_decay=optimizer_config.weight_decay,
+            dampening=optimizer_config.dampening,
+            nesterov=optimizer_config.nesterov,
+            foreach=optimizer_config.foreach,
+            maximize=optimizer_config.maximize,
+        )
+
+    if optimizer_type == "rmsprop":
+        return torch.optim.RMSprop(
+            parameters,
+            lr=optimizer_config.learning_rate,
+            alpha=optimizer_config.alpha,
+            eps=optimizer_config.eps,
+            weight_decay=optimizer_config.weight_decay,
+            momentum=optimizer_config.momentum,
+            centered=optimizer_config.centered,
+            foreach=optimizer_config.foreach,
+            maximize=optimizer_config.maximize,
+        )
+
+    if optimizer_type == "adagrad":
+        return torch.optim.Adagrad(
+            parameters,
+            lr=optimizer_config.learning_rate,
+            eps=optimizer_config.eps,
+            weight_decay=optimizer_config.weight_decay,
+            foreach=optimizer_config.foreach,
+            maximize=optimizer_config.maximize,
+        )
+
+    raise ValueError(
+        f"Unknown optimizer type: {optimizer_config.type}. Supported: adamw, adam, adamw8bit, adam8bit, sgd, rmsprop, adagrad."
     )
 
 
@@ -43,26 +101,23 @@ def build_scheduler(
         estimated_stepping_batches: int,
 ) -> dict[str, Any]:
     """Create a per-step learning rate scheduler."""
+    scheduler_config = optimization.scheduler
 
     if optimization.max_steps and optimization.max_steps > 0:
         total_steps = optimization.max_steps
     else:
         total_steps = max(1, estimated_stepping_batches)
 
-    if optimization.scheduler == "linear":
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=optimization.warmup_steps,
-            num_training_steps=total_steps,
-        )
-    elif optimization.scheduler == "cosine":
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=optimization.warmup_steps,
-            num_training_steps=total_steps,
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    num_warmup_steps = min(max(0, scheduler_config.warmup_steps), total_steps)
+    scheduler_specific_kwargs = dict(scheduler_config.scheduler_specific_kwargs)
+
+    scheduler = get_scheduler(
+        name=scheduler_config.type,
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=total_steps,
+        scheduler_specific_kwargs=scheduler_specific_kwargs or None,
+    )
 
     return {
         "scheduler": scheduler,

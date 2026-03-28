@@ -70,6 +70,8 @@ class MiniMindMoeConfig(PreTrainedConfig):
             Number of selected experts.
         num_experts (`int`, *optional*, defaults to 128):
             Number of routed experts.
+        expert_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout probability applied to selected expert routing weights during training only.
         norm_topk_prob (`bool`, *optional*, defaults to `False`):
             Whether to normalize the topk probabilities.
         output_router_logits (`bool`, *optional*, defaults to `False`):
@@ -152,6 +154,7 @@ class MiniMindMoeConfig(PreTrainedConfig):
         moe_intermediate_size: int | None = 768,
         num_experts_per_tok: int | None = 8,
         num_experts: int | None = 128,
+        expert_dropout: float | None = 0.0,
         norm_topk_prob: bool | None = False,
         output_router_logits: bool | None = False,
         router_aux_loss_coef: float | None = 0.001,
@@ -184,6 +187,7 @@ class MiniMindMoeConfig(PreTrainedConfig):
         self.moe_intermediate_size = moe_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
         self.num_experts = num_experts
+        self.expert_dropout = expert_dropout
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef

@@ -32,11 +32,13 @@ data:
   mask_prompt_labels: true
 
 optimization:
-  optimizer: adamw
-  learning_rate: 2.0e-5
-  weight_decay: 0.01
-  warmup_steps: 100
-  scheduler: cosine
+  optimizer:
+    type: adamw
+    learning_rate: 2.0e-5
+    weight_decay: 0.01
+  scheduler:
+    type: cosine
+    warmup_steps: 100
   max_epochs: 1
   gradient_accumulation_steps: 8
   gradient_clip_val: 1.0

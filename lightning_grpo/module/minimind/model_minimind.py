@@ -36,7 +36,7 @@ from .configuration_minimind_moe import MiniMindMoeConfig
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -113,7 +113,7 @@ class MiniMindMoeAttention(nn.Module):
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
@@ -239,20 +239,33 @@ class MiniMindMoeTopKRouter(nn.Module):
         super().__init__()
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
+        self.expert_dropout = config.expert_dropout
         self.norm_topk_prob = config.norm_topk_prob
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
+        router_logits = F.linear(hidden_states, self.weight)  # (num_tokens, num_experts)
+
         routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)  # (seq_len, top_k)
+        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)  # (num_tokens, top_k)
+
+        if self.training and self.expert_dropout > 0:
+            keep_mask = torch.rand_like(router_top_value).gt(self.expert_dropout)
+            has_active = keep_mask.any(dim=-1, keepdim=True)
+            if not torch.all(has_active):
+                fallback = router_top_value.argmax(dim=-1, keepdim=True)
+                keep_mask = keep_mask.scatter(-1, fallback, True)
+            router_top_value = router_top_value * keep_mask.to(router_top_value.dtype)
+            router_indices = router_indices.masked_fill(~keep_mask, self.num_experts)
+
         if self.norm_topk_prob:
-            router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
+            normalizer = router_top_value.sum(dim=-1, keepdim=True)
+            router_top_value = router_top_value / normalizer.clamp_min(torch.finfo(router_top_value.dtype).eps)
+
         router_top_value = router_top_value.to(router_logits.dtype)
-        router_scores = router_top_value
-        return router_logits, router_scores, router_indices
+        return router_logits, router_top_value, router_indices
 
 
 class MiniMindMoeSparseMoeBlock(nn.Module):
@@ -295,7 +308,7 @@ class MiniMindMoeDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.self_attn = MiniMindMoeAttention(config, layer_idx)
         if (layer_idx not in config.mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+                config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = MiniMindMoeSparseMoeBlock(config)
         else:
@@ -413,7 +426,7 @@ class MiniMindMoeRotaryEmbedding(nn.Module):
 
         # Compute the inverse frequencies
         inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+                base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
         )
         return inv_freq, attention_factor
 

@@ -99,16 +99,60 @@ class DataConfig:
 
 
 @dataclass
-class OptimizationConfig:
-    """Optimizer, scheduler, and gradient update configuration."""
+class OptimizerSettings:
+    """Nested optimizer settings."""
 
-    optimizer: Literal["adamw", "adamw8bit"] = "adamw"
+    type: Literal["adamw", "adam", "adamw8bit", "adam8bit", "sgd", "rmsprop", "adagrad"] = "adamw"
     learning_rate: float = 2.0e-5
     weight_decay: float = 0.01
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1.0e-8
+    momentum: float = 0.9
+    alpha: float = 0.99
+    centered: bool = False
+    dampening: float = 0.0
+    nesterov: bool = False
+    amsgrad: bool = False
+    foreach: Optional[bool] = None
+    maximize: bool = False
+
+
+@dataclass
+class SchedulerSettings:
+    """Nested scheduler settings."""
+
+    type: Literal[
+        "linear",
+        "cosine",
+        "cosine_with_restarts",
+        "polynomial",
+        "constant",
+        "constant_with_warmup",
+        "inverse_sqrt",
+        "reduce_lr_on_plateau",
+        "cosine_with_min_lr",
+        "cosine_warmup_with_min_lr",
+        "warmup_stable_decay",
+    ] = "cosine"
     warmup_steps: int = 100
-    scheduler: Literal["cosine", "linear", "constant"] = "cosine"
+    scheduler_specific_kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ResumeOverrideConfig:
+    """Resume-time overrides for optimizer and scheduler state."""
+
+    override_lr_on_resume: bool = False
+    reset_scheduler_on_resume: bool = False
+
+
+@dataclass
+class OptimizationConfig:
+    """Optimizer, scheduler, and gradient update configuration."""
+
+    optimizer: OptimizerSettings = field(default_factory=OptimizerSettings)
+    scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
+    resume_override: ResumeOverrideConfig = field(default_factory=ResumeOverrideConfig)
     min_learning_rate: float = 0.0
     max_epochs: int = 1
     max_steps: int = -1

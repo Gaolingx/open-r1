@@ -23,11 +23,13 @@ data:
   preprocessing_keep_in_memory: true
 
 optimization:
-  optimizer: adamw
-  learning_rate: 1.0e-6
-  weight_decay: 0.0
-  warmup_steps: 50
-  scheduler: cosine
+  optimizer:
+    type: adamw
+    learning_rate: 1.0e-6
+    weight_decay: 0.0
+  scheduler:
+    type: cosine
+    warmup_steps: 50
   max_epochs: 1
   gradient_accumulation_steps: 4
   gradient_clip_val: 1.0
