@@ -586,7 +586,10 @@ def load_balancing_loss_func(
     return overall_loss * num_experts
 
 
-def router_z_loss_func(router_logits: torch.Tensor) -> float:
+def router_z_loss_func(
+    router_logits: tuple[torch.Tensor] | None,
+    attention_mask: torch.Tensor | None = None,
+) -> int:
     r"""
     Compute the router z-loss implemented in PyTorch.
 
@@ -605,12 +608,27 @@ def router_z_loss_func(router_logits: torch.Tensor) -> float:
 
     if isinstance(router_logits, tuple):
         compute_device = router_logits[0].device
-        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in router_logits], dim=0)
+        concatenated_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in router_logits], dim=0)
 
-    num_groups, tokens_per_group, _ = router_logits.shape
-    log_z = torch.logsumexp(concatenated_gate_logits, dim=-1)
+    log_z = torch.logsumexp(concatenated_logits, dim=-1)
     z_loss = log_z**2
-    return torch.sum(z_loss) / (num_groups * tokens_per_group)
+
+    if attention_mask is None:
+        z_loss = z_loss.mean()
+    else:
+        batch_size, seq_len = attention_mask.shape
+        num_moe_layers = concatenated_logits.shape[0] // (batch_size * seq_len)
+
+        mask = (
+            attention_mask[None, :, :]
+            .expand(num_moe_layers, batch_size, seq_len)
+            .reshape(-1)
+            .to(compute_device)
+        )
+
+        z_loss = (z_loss * mask).sum() / mask.sum()
+
+    return z_loss
 
 
 @auto_docstring
@@ -704,7 +722,10 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
                 self.num_experts_per_tok,
                 attention_mask,
             )
-            z_loss = router_z_loss_func(outputs.router_logits)
+            z_loss = router_z_loss_func(
+                outputs.router_logits,
+                attention_mask,
+            )
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
                 loss += self.router_z_loss_coef * z_loss.to(loss.device)
