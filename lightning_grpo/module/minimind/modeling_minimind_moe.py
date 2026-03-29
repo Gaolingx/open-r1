@@ -1,3 +1,4 @@
+# modified from Qwen3MoE model
 from collections.abc import Callable
 from typing import Optional
 
@@ -36,7 +37,7 @@ from .configuration_minimind_moe import MiniMindMoeConfig
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
+    x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -113,7 +114,7 @@ class MiniMindMoeAttention(nn.Module):
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
@@ -139,7 +140,6 @@ class MiniMindMoeAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -153,9 +153,7 @@ class MiniMindMoeAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -246,12 +244,11 @@ class MiniMindMoeTopKRouter(nn.Module):
     def forward(self, hidden_states):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
-        router_logits = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+        routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)  # (seq_len, top_k)
         if self.norm_topk_prob:
             router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        router_top_value = router_top_value.to(router_logits.dtype)
-        router_scores = router_top_value
+        router_scores = router_top_value.to(routing_weights.dtype)
         return router_logits, router_scores, router_indices
 
 
@@ -295,7 +292,7 @@ class MiniMindMoeDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.self_attn = MiniMindMoeAttention(config, layer_idx)
         if (layer_idx not in config.mlp_only_layers) and (
-                config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             self.mlp = MiniMindMoeSparseMoeBlock(config)
         else:
@@ -311,7 +308,6 @@ class MiniMindMoeDecoderLayer(GradientCheckpointingLayer):
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
@@ -324,7 +320,6 @@ class MiniMindMoeDecoderLayer(GradientCheckpointingLayer):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -413,7 +408,7 @@ class MiniMindMoeRotaryEmbedding(nn.Module):
 
         # Compute the inverse frequencies
         inv_freq = 1.0 / (
-                base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
         )
         return inv_freq, attention_factor
 
@@ -462,7 +457,6 @@ class MiniMindMoeModel(MiniMindMoePreTrainedModel):
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -474,20 +468,16 @@ class MiniMindMoeModel(MiniMindMoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.unsqueeze(0)
 
         mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
         causal_mask = mask_function(
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -502,7 +492,6 @@ class MiniMindMoeModel(MiniMindMoePreTrainedModel):
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
-                cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
@@ -513,32 +502,6 @@ class MiniMindMoeModel(MiniMindMoePreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
-
-
-def z_loss_func(gate_logits: torch.Tensor | tuple[torch.Tensor] | None) -> torch.Tensor | int:
-    r"""
-    Compute the router z-loss implemented in PyTorch.
-
-    The router z-loss was introduced in [Designing Effective Sparse Expert Models](https://huggingface.co/papers/2202.08906).
-    It encourages router logits to remain small in an effort to improve stability.
-
-    Args:
-        router_logits (`float`):
-            Input logits of shape [batch_size, sequence_length, num_experts]
-
-    Returns:
-        Scalar router z-loss.
-    """
-    if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
-
-    if isinstance(gate_logits, tuple):
-        compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
-
-    log_z = torch.logsumexp(concatenated_gate_logits, dim=-1)
-    z_loss = torch.mean(log_z ** 2)
-    return z_loss
 
 
 def load_balancing_loss_func(
@@ -623,6 +586,33 @@ def load_balancing_loss_func(
     return overall_loss * num_experts
 
 
+def router_z_loss_func(router_logits: torch.Tensor) -> float:
+    r"""
+    Compute the router z-loss implemented in PyTorch.
+
+    The router z-loss was introduced in [Designing Effective Sparse Expert Models](https://huggingface.co/papers/2202.08906).
+    It encourages router logits to remain small in an effort to improve stability.
+
+    Args:
+        router_logits (`float`):
+            Input logits of shape [batch_size, sequence_length, num_experts]
+
+    Returns:
+        Scalar router z-loss.
+    """
+    if router_logits is None or not isinstance(router_logits, tuple):
+        return 0
+
+    if isinstance(router_logits, tuple):
+        compute_device = router_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in router_logits], dim=0)
+
+    num_groups, tokens_per_group, _ = router_logits.shape
+    log_z = torch.logsumexp(concatenated_gate_logits, dim=-1)
+    z_loss = log_z**2
+    return torch.sum(z_loss) / (num_groups * tokens_per_group)
+
+
 @auto_docstring
 class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -635,9 +625,9 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.router_aux_loss_coef = config.router_aux_loss_coef
-        self.router_z_loss_coef = config.router_z_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.router_z_loss_coef = config.router_z_loss_coef
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -654,7 +644,6 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         output_router_logits: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoECausalLMOutputWithPast:
@@ -667,9 +656,9 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, MiniMindMoeForCausalLM
+        >>> from transformers import AutoTokenizer, Qwen3MoeForCausalLM
 
-        >>> model = MiniMindMoeForCausalLM.from_pretrained("Qwen/Qwen3-MoE-15B-A2B")
+        >>> model = Qwen3MoeForCausalLM.from_pretrained("Qwen/Qwen3-MoE-15B-A2B")
         >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-MoE-15B-A2B")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
@@ -694,7 +683,6 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_router_logits=output_router_logits,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -708,6 +696,7 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
             loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
         aux_loss = None
+        z_loss = None
         if output_router_logits:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
@@ -715,7 +704,7 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
                 self.num_experts_per_tok,
                 attention_mask,
             )
-            z_loss = z_loss_func(outputs.router_logits)
+            z_loss = router_z_loss_func(outputs.router_logits)
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
                 loss += self.router_z_loss_coef * z_loss.to(loss.device)
@@ -723,12 +712,12 @@ class MiniMindMoeForCausalLM(MiniMindMoePreTrainedModel, GenerationMixin):
         return MoECausalLMOutputWithPast(
             loss=loss,
             aux_loss=aux_loss,
-            z_loss=z_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
+            z_loss=z_loss,
         )
 
 

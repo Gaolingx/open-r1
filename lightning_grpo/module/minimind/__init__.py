@@ -1,5 +1,5 @@
 from .configuration_minimind_moe import MiniMindMoeConfig
-from .model_minimind import (
+from .modeling_minimind_moe import (
     MiniMindMoeForCausalLM,
     MiniMindMoeForQuestionAnswering,
     MiniMindMoeForSequenceClassification,

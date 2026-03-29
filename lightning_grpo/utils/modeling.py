@@ -10,7 +10,7 @@ import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from lightning.pytorch.utilities import rank_zero_info
-from lightning_grpo.module.minimind.model_minimind import MiniMindMoeForCausalLM
+from lightning_grpo.module.minimind.modeling_minimind_moe import MiniMindMoeForCausalLM
 
 from lightning_grpo.utils.config import load_json_config
 from lightning_grpo.utils.configs.base import ModelConfig, PrecisionConfig

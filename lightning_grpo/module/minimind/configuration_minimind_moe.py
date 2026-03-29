@@ -9,8 +9,9 @@ logger = logging.get_logger(__name__)
 
 class MiniMindMoeConfig(PreTrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`MiniMindMoeModel`]. It is used to instantiate a
-    MiniMindMoe model according to the specified arguments, defining the model architecture. Instantiating a configuration.
+    This is the configuration class to store the configuration of a [`Qwen3MoeModel`]. It is used to instantiate a
+    Qwen3MoE model according to the specified arguments, defining the model architecture. Instantiating a configuration
+    with the defaults will yield a similar configuration to that of [Qwen/Qwen3-15B-A2B](https://huggingface.co/Qwen/Qwen3-15B-A2B).
 
     Configuration objects inherit from [`PreTrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PreTrainedConfig`] for more information.
@@ -18,8 +19,8 @@ class MiniMindMoeConfig(PreTrainedConfig):
 
     Args:
         vocab_size (`int`, *optional*, defaults to 151936):
-            Vocabulary size of the MiniMindMoe model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`MiniMindMoeModel`]
+            Vocabulary size of the Qwen3MoE model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`Qwen3MoeModel`]
         hidden_size (`int`, *optional*, defaults to 2048):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 6144):
@@ -79,7 +80,7 @@ class MiniMindMoeConfig(PreTrainedConfig):
         router_z_loss_coef (`float`, *optional*, defaults to 0.001):
             The z_loss factor for the total loss.
         mlp_only_layers (`list[int]`, *optional*, defaults to `[]`):
-            Indicate which layers use MiniMindMoeMLP rather than MiniMindMoeSparseMoeBlock
+            Indicate which layers use Qwen3MoeMLP rather than Qwen3MoeSparseMoeBlock
             The list contains layer index, from 0 to num_layers-1 if we have num_layers layers
             If `mlp_only_layers` is empty, `decoder_sparse_step` is used to determine the sparsity.
         pad_token_id (`int`, *optional*):
@@ -90,13 +91,13 @@ class MiniMindMoeConfig(PreTrainedConfig):
             End of stream token id.
 
     ```python
-    >>> from transformers import MiniMindMoeModel, MiniMindMoeConfig
+    >>> from transformers import Qwen3MoeModel, Qwen3MoeConfig
 
-    >>> # Initializing a MiniMindMoe style configuration
-    >>> configuration = MiniMindMoeConfig()
+    >>> # Initializing a Qwen3MoE style configuration
+    >>> configuration = Qwen3MoeConfig()
 
     >>> # Initializing a model from the Qwen3-15B-A2B" style configuration
-    >>> model = MiniMindMoeModel(configuration)
+    >>> model = Qwen3MoeModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
@@ -109,7 +110,7 @@ class MiniMindMoeConfig(PreTrainedConfig):
         "num_experts": "num_local_experts",
     }
 
-    # Default tensor parallel plan for base model `MiniMindMoe`
+    # Default tensor parallel plan for base model `Qwen3Moe`
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
         "layers.*.self_attn.k_proj": "colwise",
