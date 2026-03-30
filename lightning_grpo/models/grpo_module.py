@@ -311,14 +311,22 @@ class GRPOLightningModule(L.LightningModule):
         log_ratio = per_token_logps - old_per_token_logps
         importance_ratio = torch.exp(log_ratio)
         clip_eps = getattr(self.config.rollout, "epsilon", 0.2)
+        is_low_clipped = torch.zeros_like(per_token_logps, dtype=torch.bool)
+        is_high_clipped = torch.zeros_like(per_token_logps, dtype=torch.bool)
+        is_region_clipped = torch.zeros_like(per_token_logps, dtype=torch.bool)
+        is_cispo_clipped = torch.zeros_like(per_token_logps, dtype=torch.bool)
         if self.config.rollout.loss_type == "cispo":
             clipped_ratio = torch.clamp(importance_ratio, max=self.config.rollout.epsilon_high).detach()
             surrogate = clipped_ratio * advantages * per_token_logps
+            is_cispo_clipped = (importance_ratio > self.config.rollout.epsilon_high) & (advantages > 0)
         else:
             clipped_ratio = torch.clamp(importance_ratio, 1.0 - clip_eps, 1.0 + clip_eps)
             surrogate_unclipped = importance_ratio * advantages
             surrogate_clipped = clipped_ratio * advantages
             surrogate = torch.minimum(surrogate_unclipped, surrogate_clipped)
+            is_low_clipped = (importance_ratio < 1.0 - clip_eps) & (advantages < 0)
+            is_high_clipped = (importance_ratio > 1.0 + clip_eps) & (advantages > 0)
+            is_region_clipped = is_low_clipped | is_high_clipped
 
         if ref_per_token_logps is not None:
             per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1.0
@@ -344,12 +352,10 @@ class GRPOLightningModule(L.LightningModule):
             if terminated_lengths.numel() == 0:
                 terminated_lengths = global_completion_lengths.new_zeros(1)
 
-            is_low_clipped = (importance_ratio < 1.0 - clip_eps) & (advantages < 0)
-            is_high_clipped = (importance_ratio > 1.0 + clip_eps) & (advantages > 0)
-            is_region_clipped = is_low_clipped | is_high_clipped
             global_is_low_clipped = self._gather_tensor_for_metrics(is_low_clipped.to(per_token_logps.dtype))
             global_is_high_clipped = self._gather_tensor_for_metrics(is_high_clipped.to(per_token_logps.dtype))
             global_is_region_clipped = self._gather_tensor_for_metrics(is_region_clipped.to(per_token_logps.dtype))
+            global_is_cispo_clipped = self._gather_tensor_for_metrics(is_cispo_clipped.to(per_token_logps.dtype))
 
         metrics = {
             "reward": global_rewards.mean(),
@@ -369,6 +375,7 @@ class GRPOLightningModule(L.LightningModule):
             "clip_ratio_low": masked_mean(global_is_low_clipped, global_loss_mask),
             "clip_ratio_high": masked_mean(global_is_high_clipped, global_loss_mask),
             "clip_ratio_region": masked_mean(global_is_region_clipped, global_loss_mask),
+            "cispo_clip_ratio": masked_mean(global_is_cispo_clipped, global_loss_mask),
         }
         metrics.update(moe_metrics)
         for index, reward_name in enumerate(self.config.reward.reward_funcs):
@@ -396,9 +403,12 @@ class GRPOLightningModule(L.LightningModule):
         self.log(f"{prefix}/completions/mean_terminated_length", metrics["terminated_length_mean"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/completions/min_terminated_length", metrics["terminated_length_min"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         self.log(f"{prefix}/completions/max_terminated_length", metrics["terminated_length_max"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        self.log(f"{prefix}/clip_ratio/low", metrics["clip_ratio_low"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        self.log(f"{prefix}/clip_ratio/high", metrics["clip_ratio_high"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        self.log(f"{prefix}/clip_ratio/region", metrics["clip_ratio_region"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        if self.config.rollout.loss_type == "cispo":
+            self.log(f"{prefix}/cispo_clip_ratio", metrics["cispo_clip_ratio"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        else:
+            self.log(f"{prefix}/clip_ratio/low", metrics["clip_ratio_low"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+            self.log(f"{prefix}/clip_ratio/high", metrics["clip_ratio_high"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+            self.log(f"{prefix}/clip_ratio/region", metrics["clip_ratio_region"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         for reward_name in self.config.reward.reward_funcs:
             self.log(f"{prefix}/rewards/{reward_name}/mean", metrics[f"reward/{reward_name}"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
             self.log(f"{prefix}/rewards/{reward_name}/std", metrics[f"reward_std/{reward_name}"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)

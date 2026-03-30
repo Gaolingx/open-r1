@@ -14,7 +14,7 @@
   "max_window_layers": 16,
   "mlp_only_layers": [0,1],
   "model_type": "minimind_moe",
-  "moe_intermediate_size": 1280,
+  "moe_intermediate_size": 1536,
   "norm_topk_prob": true,
   "num_attention_heads": 8,
   "num_experts": 8,
