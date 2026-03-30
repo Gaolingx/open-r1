@@ -14,7 +14,7 @@ from open_r1.rewards import get_reward_funcs
 from lightning_grpo.models.rollout_engine import create_rollout_engine, compute_per_token_logps
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.models.common import build_optimizer, build_scheduler, entropy_from_logits, masked_mean
-from lightning_grpo.utils.modeling import collect_moe_metrics, count_trainable_parameters, describe_model_source, export_hf_model, load_causal_lm, load_tokenizer, log_moe_metrics
+from lightning_grpo.utils.modeling import collect_moe_metrics, count_trainable_parameters, describe_model_source, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
 class GRPOLightningModule(L.LightningModule):
@@ -443,5 +443,6 @@ class GRPOLightningModule(L.LightningModule):
             return
 
         export_dir = self.config.output_dir + "/hf_final"
-        export_hf_model(self.policy, self.config.model, export_dir, tokenizer=self.tokenizer)
-        rank_zero_info(f"Exported HF model to {export_dir}")
+        exported_paths = export_configured_model(self.policy, self.config.model, export_dir, tokenizer=self.tokenizer)
+        if exported_paths:
+            rank_zero_info(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")

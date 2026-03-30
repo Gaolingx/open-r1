@@ -37,7 +37,8 @@ class LoRAConfig:
 class ModelConfig:
     """Model loading and architecture adaptation settings."""
 
-    model_family: Literal["auto", "minimind"] = "auto"
+    model_family: str = "auto"
+    model_class_path: Optional[str] = None
     model_name_or_path: str = "Qwen/Qwen2.5-1.5B-Instruct"
     model_revision: str = "main"
     tokenizer_name_or_path: Optional[str] = None
@@ -54,6 +55,8 @@ class ModelConfig:
     gradient_checkpointing: bool = True
     use_cache: bool = False
     compile_model: bool = False
+    save_pth_format: bool = True
+    save_safetensors_format: bool = False
     lora: LoRAConfig = field(default_factory=LoRAConfig)
 
 
@@ -192,6 +195,8 @@ class CheckpointConfig:
     save_top_k: int = 3
     save_last: bool = True
     every_n_train_steps: Optional[int] = 500
+    save_pth_format: bool = True
+    save_safetensors_format: bool = False
 
 
 @dataclass

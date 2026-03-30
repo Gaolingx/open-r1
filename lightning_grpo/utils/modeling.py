@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import inspect
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -10,10 +12,11 @@ import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from lightning.pytorch.utilities import rank_zero_info
-from lightning_grpo.module.minimind.modeling_minimind_moe import MiniMindMoeForCausalLM
+from transformers.configuration_utils import PreTrainedConfig
 
 from lightning_grpo.utils.config import load_json_config
 from lightning_grpo.utils.configs.base import ModelConfig, PrecisionConfig
+from lightning_grpo.utils.reflection import PreTrainedModelReflectionRegistry, import_causal_lm_class
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -22,6 +25,7 @@ DTYPE_MAP = {
 }
 
 CustomModelBuilder = Callable[[ModelConfig, PrecisionConfig], PreTrainedModel]
+LOCAL_MODEL_REGISTRY = PreTrainedModelReflectionRegistry(("lightning_grpo.module",))
 
 
 def resolve_torch_dtype(precision_config: PrecisionConfig) -> torch.dtype:
@@ -119,35 +123,76 @@ def _resolve_model_init_kwargs(model_config: ModelConfig) -> dict:
     return init_kwargs
 
 
-def _build_minimind_model(model_config: ModelConfig, precision_config: PrecisionConfig) -> PreTrainedModel:
-    """Build a MiniMind model from local modules with optional checkpoint loading."""
+def _resolve_checkpoint_state_dict(checkpoint: Any) -> Mapping[str, torch.Tensor]:
+    """Normalize checkpoint containers to a plain state dict."""
 
-    init_kwargs = _resolve_model_init_kwargs(model_config)
-    init_kwargs.setdefault("hidden_size", 768)
-    init_kwargs.setdefault("num_hidden_layers", 8)
-    init_kwargs.setdefault("use_moe", False)
+    if isinstance(checkpoint, dict):
+        state_dict = checkpoint.get("state_dict") or checkpoint.get("model_state_dict") or checkpoint
+    else:
+        state_dict = checkpoint
 
-    config_cls = getattr(MiniMindMoeForCausalLM, "config_class", None)
-    if config_cls is None:
-        raise ValueError("MiniMindMoeForCausalLM.config_class is required for MiniMind initialization.")
+    if not isinstance(state_dict, Mapping):
+        raise TypeError("Expected checkpoint to resolve to a mapping-based state dict.")
 
-    minimind_config = config_cls(**init_kwargs)
-    model = MiniMindMoeForCausalLM(minimind_config)
-    model = model.to(dtype=resolve_torch_dtype(precision_config))
+    return state_dict
 
-    if model_config.pretrained_weight and model_config.pretrained_weight.lower() != "none":
-        moe_suffix = "_moe" if getattr(minimind_config, "use_moe", False) else ""
-        hidden_size = getattr(minimind_config, "hidden_size", init_kwargs["hidden_size"])
-        weight_path = Path(model_config.custom_weight_dir) / f"{model_config.pretrained_weight}_{hidden_size}{moe_suffix}.pth"
-        weights = torch.load(weight_path, map_location="cpu")
-        model.load_state_dict(weights, strict=False)
 
+def _maybe_load_custom_weights(model: PreTrainedModel, model_config: ModelConfig) -> PreTrainedModel:
+    """Load an optional local PyTorch checkpoint into a freshly built model."""
+
+    if not model_config.pretrained_weight or model_config.pretrained_weight.lower() == "none":
+        return model
+
+    weight_path = Path(model_config.custom_weight_dir).expanduser()
+    if weight_path.suffix == "":
+        pth_candidate = weight_path.with_suffix(".pth")
+        if pth_candidate.exists():
+            weight_path = pth_candidate
+
+    if not weight_path.exists():
+        raise FileNotFoundError(f"Custom checkpoint not found: {weight_path}")
+
+    checkpoint = torch.load(weight_path, map_location="cpu")
+    state_dict = _resolve_checkpoint_state_dict(checkpoint)
+    model.load_state_dict(state_dict, strict=False)
     return model
 
 
-CUSTOM_MODEL_BUILDERS: dict[str, CustomModelBuilder] = {
-    "minimind": _build_minimind_model,
-}
+def _build_reflected_model(model_config: ModelConfig, precision_config: PrecisionConfig) -> PreTrainedModel:
+    """Build a local `PreTrainedModel` by matching config `model_type` via reflection."""
+
+    init_kwargs = _resolve_model_init_kwargs(model_config)
+    model_type = init_kwargs.get("model_type")
+    if not isinstance(model_type, str) or not model_type:
+        raise ValueError(
+            "Custom reflected model loading requires `model_type` in `model_config_path` or `model_init_kwargs`."
+        )
+
+    reflected_spec = LOCAL_MODEL_REGISTRY.resolve(model_type)
+    model_hf_config = reflected_spec.config_class(**init_kwargs)
+    model = reflected_spec.model_class(model_hf_config)
+    model = model.to(dtype=resolve_torch_dtype(precision_config))
+
+    return _maybe_load_custom_weights(model, model_config)
+
+
+def _build_configured_model_class(model_config: ModelConfig, precision_config: PrecisionConfig) -> PreTrainedModel:
+    """Build a local model from an explicit YAML-configured class path."""
+
+    init_kwargs = _resolve_model_init_kwargs(model_config)
+    model_class = import_causal_lm_class(model_config.model_class_path or "")
+
+    config_class = getattr(model_class, "config_class", None)
+    if not inspect.isclass(config_class) or not issubclass(config_class, PreTrainedConfig):
+        raise TypeError(
+            f"Configured model class must expose a PreTrainedConfig `config_class`: {model_config.model_class_path}"
+        )
+
+    model_hf_config = config_class(**init_kwargs)
+    model = model_class(model_hf_config)
+    model = model.to(dtype=resolve_torch_dtype(precision_config))
+
+    return _maybe_load_custom_weights(model, model_config)
 
 
 def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig) -> PreTrainedModel:
@@ -161,13 +206,10 @@ def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig)
             attn_implementation=model_config.attn_implementation,
             dtype=resolve_torch_dtype(precision_config),
         )
+    elif model_config.model_class_path:
+        model = _build_configured_model_class(model_config, precision_config)
     else:
-        builder = CUSTOM_MODEL_BUILDERS.get(model_config.model_family)
-        if builder is None:
-            raise ValueError(
-                f"Unsupported model_family '{model_config.model_family}'. Expected one of {sorted(CUSTOM_MODEL_BUILDERS)} or 'auto'."
-            )
-        model = builder(model_config, precision_config)
+        model = _build_reflected_model(model_config, precision_config)
 
     if hasattr(model, "config"):
         model.config.use_cache = model_config.use_cache
@@ -197,12 +239,6 @@ def count_trainable_parameters(model: PreTrainedModel) -> tuple[int, int]:
     return trainable, total
 
 
-def register_custom_model_builder(name: str, builder: CustomModelBuilder) -> None:
-    """Register a custom model loader for future extensions."""
-
-    CUSTOM_MODEL_BUILDERS[name] = builder
-
-
 def describe_model_source(model_config: ModelConfig) -> str:
     """Describe the selected model source for logging."""
 
@@ -217,18 +253,49 @@ def resolve_export_model(pl_module: L.LightningModule) -> torch.nn.Module | None
     return getattr(pl_module, "policy", None) or getattr(pl_module, "model", None)
 
 
-def save_pth_weights(pl_module: L.LightningModule, filepath: str) -> Path | None:
+def save_pth_weights(model: PreTrainedModel, filepath: str) -> Path | None:
     """Persist a plain PyTorch state dict next to the Lightning checkpoint."""
 
-    model = resolve_export_model(pl_module)
-    if model is None:
-        return None
-
-    checkpoint_path = Path(filepath)
-    pth_path = checkpoint_path.with_suffix(".pth")
+    path = Path(filepath)
+    pth_path = path.with_suffix(".pth")
     state_dict = {key: value.detach().cpu() for key, value in model.state_dict().items()}
     torch.save(state_dict, pth_path)
     return pth_path
+
+
+def export_configured_model(
+    model: PreTrainedModel,
+    model_config: ModelConfig,
+    base_dir: str | Path,
+    *,
+    tokenizer: PreTrainedTokenizerBase | None = None,
+) -> dict[str, Path]:
+    """Export model artifacts according to config flags using standard directory names."""
+
+    export_root = Path(base_dir)
+    export_root.mkdir(parents=True, exist_ok=True)
+    exported_paths: dict[str, Path] = {}
+
+    if model_config.save_pth_format:
+        pth_dir = export_root / "pt_checkpoint"
+        pth_dir.mkdir(parents=True, exist_ok=True)
+        pth_stem = pth_dir / "pretrain_model.ckpt"
+        pth_path = save_pth_weights(model, pth_stem)
+        if pth_path is not None:
+            exported_paths["pth"] = pth_path
+
+    if model_config.save_safetensors_format:
+        hf_dir = export_root / "hf_checkpoint"
+        export_hf_model(
+            model,
+            model_config,
+            hf_dir,
+            tokenizer=tokenizer,
+            safe_serialization=True,
+        )
+        exported_paths["safetensors"] = hf_dir
+
+    return exported_paths
 
 
 def unwrap_model(model: PreTrainedModel) -> PreTrainedModel:

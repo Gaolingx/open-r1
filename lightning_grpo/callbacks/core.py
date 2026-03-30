@@ -16,27 +16,53 @@ from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 from transformers.optimization import get_scheduler
 
 from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
-from lightning_grpo.utils.modeling import load_tokenizer, save_pth_weights
+from lightning_grpo.utils.modeling import export_configured_model, load_tokenizer, resolve_export_model
 from lightning_grpo.utils.config import save_json_config
 
 
 class CheckpointCallback(ModelCheckpoint):
     """ModelCheckpoint with optional torch export delegated to LightningModule."""
 
-    def __init__(self, *args: Any, save_pt_format: bool = True, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        save_pth_format: bool = True,
+        save_safetensors_format: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
-        self.save_pt_format = save_pt_format
+        self.save_pth_format = save_pth_format
+        self.save_safetensors_format = save_safetensors_format
 
     def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
         super()._save_checkpoint(trainer, filepath)
 
-        if not self.save_pt_format or not trainer.is_global_zero:
+        if not trainer.is_global_zero:
             return
 
-        save_path = Path(filepath).parent / "pt_checkpoint"
-        save_path.mkdir(parents=True, exist_ok=True)
-        save_file = save_path / "pretrain_model"
-        save_pth_weights(trainer.lightning_module, save_file)
+        model = resolve_export_model(trainer.lightning_module)
+        if model is None:
+            return
+
+        tokenizer = getattr(trainer.lightning_module, "tokenizer", None)
+
+        model_config = trainer.lightning_module.config.model
+        original_save_pth_format = model_config.save_pth_format
+        original_save_safetensors_format = model_config.save_safetensors_format
+
+        model_config.save_pth_format = self.save_pth_format
+        model_config.save_safetensors_format = self.save_safetensors_format
+
+        try:
+            export_configured_model(
+                model,
+                model_config,
+                Path(filepath).parent,
+                tokenizer=tokenizer,
+            )
+        finally:
+            model_config.save_pth_format = original_save_pth_format
+            model_config.save_safetensors_format = original_save_safetensors_format
 
 
 class EfficiencyMonitorCallback(Callback):
@@ -454,7 +480,8 @@ def build_callbacks(config: ExperimentConfig) -> list[Callback]:
         save_top_k=config.checkpoint.save_top_k,
         save_last=config.checkpoint.save_last,
         every_n_train_steps=config.checkpoint.every_n_train_steps,
-        save_pt_format=True,
+        save_pth_format=config.checkpoint.save_pth_format,
+        save_safetensors_format=config.checkpoint.save_safetensors_format,
     )
 
     callbacks: list[Callback] = [

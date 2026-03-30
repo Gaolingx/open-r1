@@ -11,7 +11,7 @@ from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.sft import SFTConfig
 from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats
-from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, export_hf_model, load_causal_lm, load_tokenizer, log_moe_metrics
+from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
 class SFTLightningModule(L.LightningModule):
@@ -108,5 +108,6 @@ class SFTLightningModule(L.LightningModule):
             return
 
         export_dir = self.config.output_dir + "/hf_final"
-        export_hf_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
-        rank_zero_info(f"Exported HF model to {export_dir}")
+        exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
+        if exported_paths:
+            rank_zero_info(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")
