@@ -12,8 +12,8 @@ from lightning_grpo.utils.configs.base import (
     PrecisionConfig,
 )
 from lightning_grpo.utils.configs.grpo import GRPOConfig, RewardConfig, RolloutConfig
-from lightning_grpo.utils.configs.pretrain import PretrainConfig
-from lightning_grpo.utils.configs.sft import SFTConfig
+from lightning_grpo.utils.configs.pretrain import LMExperimentConfig, PretrainConfig, PretrainDataConfig
+from lightning_grpo.utils.configs.sft import ChatDataConfig, SFTConfig, SFTDataConfig
 
 __all__ = [
     "CheckpointConfig",
@@ -22,12 +22,16 @@ __all__ = [
     "EarlyStoppingConfig",
     "ExperimentConfig",
     "GRPOConfig",
+    "ChatDataConfig",
+    "LMExperimentConfig",
     "LoggingConfig",
     "ModelConfig",
     "OptimizationConfig",
     "PretrainConfig",
+    "PretrainDataConfig",
     "PrecisionConfig",
     "RewardConfig",
     "RolloutConfig",
     "SFTConfig",
+    "SFTDataConfig",
 ]

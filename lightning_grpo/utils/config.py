@@ -24,13 +24,12 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     """Load a typed experiment configuration from YAML."""
 
     payload = load_yaml_config(path)
-
     task = payload.get("task", "sft")
     config_cls = CONFIG_REGISTRY.get(task)
     if config_cls is None:
         raise ValueError(f"Unsupported task '{task}'. Expected one of {sorted(CONFIG_REGISTRY)}.")
 
-    return config_cls._from_mapping(payload)
+    return config_cls.from_yaml(path)
 
 
 def load_yaml_config(path: str | Path) -> dict[str, Any]:

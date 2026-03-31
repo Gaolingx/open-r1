@@ -157,7 +157,7 @@ class SFTDataModule(LightningDataModule):
                     full_text = apply_chat_template(
                         tokenizer=self.tokenizer,
                         messages=messages,
-                        add_generation_prompt=False,
+                        add_generation_prompt=self.data_config.add_generation_prompt,
                         tools=tools,
                     )
                     full_text = postprocess_chat_text(full_text)
@@ -176,7 +176,7 @@ class SFTDataModule(LightningDataModule):
                         prompt_text = apply_chat_template(
                             tokenizer=self.tokenizer,
                             messages=prompt_messages,
-                            add_generation_prompt=True,
+                            add_generation_prompt=self.data_config.add_generation_prompt,
                             tools=tools,
                         )
                         prompt_text = postprocess_chat_text(prompt_text)

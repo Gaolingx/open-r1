@@ -142,6 +142,12 @@ def resolve_validation_split_name(data_config: DataConfig, dataset_dict: Dataset
 def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
     """Load a dataset or dataset mixture from configuration."""
 
+    def _shuffle_dataset(dataset: Dataset) -> Dataset:
+        shuffle_kwargs = {"seed": data_config.split_seed}
+        if data_config.streaming:
+            shuffle_kwargs["buffer_size"] = data_config.shuffle_buffer_size
+        return dataset.shuffle(**shuffle_kwargs)
+
     if data_config.train_files:
         dataset_dict = DatasetDict({
             data_config.train_split: _load_local_json_datasets(data_config.train_files, data_config.cache_dir)
@@ -154,7 +160,7 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
             _load_single_dataset(source, seed=data_config.split_seed, cache_dir=data_config.cache_dir)
             for source in data_config.dataset_mixture
         ]
-        combined_dataset = concatenate_datasets(datasets).shuffle(seed=data_config.split_seed)
+        combined_dataset = _shuffle_dataset(concatenate_datasets(datasets))
         dataset_dict = DatasetDict({data_config.train_split: combined_dataset})
     elif data_config.dataset_name:
         dataset_dict = load_dataset(
@@ -162,6 +168,8 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
             data_config.dataset_config,
             cache_dir=data_config.cache_dir,
         )
+        if data_config.streaming and data_config.train_split in dataset_dict:
+            dataset_dict[data_config.train_split] = _shuffle_dataset(dataset_dict[data_config.train_split])
     else:
         raise ValueError("One of data.train_files, data.dataset_name, or data.dataset_mixture must be configured.")
 

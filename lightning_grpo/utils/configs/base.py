@@ -6,8 +6,6 @@ from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, get_args, get_origin, get_type_hints
 
-import yaml
-
 
 @dataclass
 class PrecisionConfig:
@@ -16,7 +14,6 @@ class PrecisionConfig:
     parameter_dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
     trainer_precision: Literal["bf16-mixed", "16-mixed", "16-true", "bf16-true", "32-true"] = "bf16-mixed"
     tf32: bool = True
-    grad_scaler_enabled: bool = False
 
 
 @dataclass
@@ -73,7 +70,7 @@ class DatasetSource:
 
 @dataclass
 class DataConfig:
-    """Dataset, formatting, and tokenization configuration."""
+    """Dataset loading and preprocessing configuration shared by all tasks."""
 
     cache_dir: str = "./.cache/huggingface"
     dataset_name: Optional[str] = None
@@ -81,24 +78,16 @@ class DataConfig:
     train_split: str = "train"
     val_split: Optional[str] = None
     split_seed: int = 42
-    prompt_column: str = "prompt"
-    response_column: str = "response"
-    messages_column: str = "messages"
     max_seq_length: int = 4096
     num_workers: int = 4
     preprocessing_batch_size: int = 256
     shuffle_buffer_size: int = 10000
     streaming: bool = False
-    add_generation_prompt: bool = False
-    mask_prompt_labels: bool = True
-    assistant_only_loss: bool = False
-    pack_sequences: bool = False
     preprocessing_use_cache: bool = True
     preprocessing_keep_in_memory: bool = False
     train_files: list[str] = field(default_factory=list)
     val_files: list[str] = field(default_factory=list)
     dataset_mixture: list[DatasetSource] = field(default_factory=list)
-    text_column: str = "text"
 
 
 @dataclass
@@ -156,7 +145,6 @@ class OptimizationConfig:
     optimizer: OptimizerSettings = field(default_factory=OptimizerSettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     resume_override: ResumeOverrideConfig = field(default_factory=ResumeOverrideConfig)
-    min_learning_rate: float = 0.0
     max_epochs: int = 1
     max_steps: int = -1
     gradient_accumulation_steps: int = 1
@@ -172,7 +160,6 @@ class LoggingConfig:
     project: str = "open-r1-lightning"
     run_name: str = "experiment"
     log_every_n_steps: int = 10
-    flush_logs_every_n_steps: int = 50
     enable_wandb: bool = False
     enable_csv: bool = True
     sample_prompts: list[str] = field(default_factory=list)
@@ -258,8 +245,9 @@ class ExperimentConfig:
     def from_yaml(cls, path: str | Path) -> "ExperimentConfig":
         """Load configuration from a YAML file."""
 
-        with Path(path).open("r", encoding="utf-8") as handle:
-            raw_config = yaml.safe_load(handle) or {}
+        from lightning_grpo.utils.config import load_yaml_config
+
+        raw_config = load_yaml_config(path)
         return cls._from_mapping(raw_config)
 
     @classmethod
@@ -267,44 +255,49 @@ class ExperimentConfig:
         """Recursively convert mappings into typed dataclasses."""
 
         origin = get_origin(annotation)
-        if origin in {list, tuple}:
-            item_type = get_args(annotation)[0] if get_args(annotation) else Any
-            if isinstance(value, list):
-                return [cls._coerce_value(item_type, item) for item in value]
-            return value
-
-        if origin is not None:
-            for candidate in get_args(annotation):
-                if candidate is type(None):
-                    continue
-                coerced = cls._coerce_value(candidate, value)
-                if coerced is not value or isinstance(value, candidate if isinstance(candidate, type) else tuple()):
-                    return coerced
-            return value
+        args = get_args(annotation)
 
         if isinstance(annotation, type) and is_dataclass(annotation) and isinstance(value, dict):
             nested_type_hints = get_type_hints(annotation)
-            coerced_values = {}
-            for sub_field in fields(annotation):
-                if sub_field.name not in value:
+            return annotation(
+                **{
+                    sub_field.name: cls._coerce_value(
+                        nested_type_hints.get(sub_field.name, sub_field.type),
+                        value[sub_field.name],
+                    )
+                    for sub_field in fields(annotation)
+                    if sub_field.name in value
+                }
+            )
+
+        if origin is list and isinstance(value, list):
+            item_type = args[0] if args else Any
+            return [cls._coerce_value(item_type, item) for item in value]
+
+        if origin is tuple and isinstance(value, (list, tuple)):
+            item_type = args[0] if args else Any
+            return tuple(cls._coerce_value(item_type, item) for item in value)
+
+        if origin is not None:
+            for candidate in args:
+                if candidate is type(None):
                     continue
-                sub_annotation = nested_type_hints.get(sub_field.name, sub_field.type)
-                coerced_values[sub_field.name] = cls._coerce_value(sub_annotation, value[sub_field.name])
-            return annotation(**coerced_values)
+                coerced = cls._coerce_value(candidate, value)
+                if coerced is not value:
+                    return coerced
 
         return value
 
     @classmethod
     def _from_mapping(cls, mapping: dict[str, Any]) -> "ExperimentConfig":
-        kwargs: dict[str, Any] = {}
         type_hints = get_type_hints(cls)
-        for field_info in fields(cls):
-            if field_info.name not in mapping:
-                continue
-            value = mapping[field_info.name]
-            if value is None:
-                kwargs[field_info.name] = None
-                continue
-            annotation = type_hints.get(field_info.name, field_info.type)
-            kwargs[field_info.name] = cls._coerce_value(annotation, value)
-        return cls(**kwargs)
+        return cls(
+            **{
+                field_info.name: cls._coerce_value(
+                    type_hints.get(field_info.name, field_info.type),
+                    mapping[field_info.name],
+                )
+                for field_info in fields(cls)
+                if field_info.name in mapping
+            }
+        )

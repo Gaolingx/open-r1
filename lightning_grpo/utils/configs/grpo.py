@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from lightning_grpo.utils.configs.base import ExperimentConfig
+from lightning_grpo.utils.configs.pretrain import LMExperimentConfig
+from lightning_grpo.utils.configs.sft import ChatDataConfig
 
 
 @dataclass
@@ -75,10 +76,10 @@ class RolloutConfig:
 
 
 @dataclass
-class GRPOConfig(ExperimentConfig):
+class GRPOConfig(LMExperimentConfig):
     """Configuration for online GRPO optimization."""
 
     task: Literal["grpo"] = "grpo"
-    system_prompt: Optional[str] = None
+    data: ChatDataConfig = field(default_factory=ChatDataConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)

@@ -2,14 +2,29 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Literal, Optional
 
-from lightning_grpo.utils.configs.base import ExperimentConfig
+from lightning_grpo.utils.configs.base import DataConfig, ExperimentConfig
 
 
 @dataclass
-class PretrainConfig(ExperimentConfig):
+class LMExperimentConfig(ExperimentConfig):
+    """Shared configuration for language-model training tasks."""
+
+    system_prompt: Optional[str] = None
+
+
+@dataclass
+class PretrainDataConfig(DataConfig):
+    """Dataset configuration used by plain text pretraining."""
+
+    text_column: str = "text"
+
+
+@dataclass
+class PretrainConfig(LMExperimentConfig):
     """Configuration for causal language model pretraining."""
 
     task: Literal["pretrain"] = "pretrain"
+    data: PretrainDataConfig = field(default_factory=PretrainDataConfig)

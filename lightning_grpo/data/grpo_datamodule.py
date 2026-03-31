@@ -105,7 +105,7 @@ class GRPODataModule(LightningDataModule):
                     apply_chat_template(
                         tokenizer=self.tokenizer,
                         messages=formatted["messages"],
-                        add_generation_prompt=True,
+                        add_generation_prompt=self.data_config.add_generation_prompt,
                     )
                 )
                 metadata.append({
