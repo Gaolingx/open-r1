@@ -1,17 +1,14 @@
-task: pretrain
+task: sft
 seed: 42
-output_dir: outputs/lightning_pretrain_demo
+output_dir: outputs/lightning_sft_demo
 
 precision:
   parameter_dtype: bf16
   trainer_precision: bf16-mixed
 
 model:
-  custom_model: true
-  model_name_or_path: MiniMind
-  model_config_path: lightning_grpo/config/model/model_config.json
-  pretrained_weight: none
-  custom_weight_dir: outputs
+  model_name_or_path: Qwen/Qwen3.5-0.8B
+  attn_implementation: sdpa
   gradient_checkpointing: true
   use_cache: false
   lora:
@@ -22,50 +19,55 @@ model:
     target_modules: [q_proj, k_proj, v_proj, o_proj]
 
 data:
-  train_files:
-    - lightning_grpo/dataset/pretrain_t2t_mini.jsonl
-  text_column: text
+  dataset_name: open-r1/Mixture-of-Thoughts
+  dataset_config: all
   train_split: train
-  max_seq_length: 340
+  val_split: test
+  prompt_column: prompt
+  response_column: response
+  max_seq_length: 2048
   num_workers: 4
   preprocessing_batch_size: 128
   preprocessing_use_cache: false
   preprocessing_keep_in_memory: true
+  mask_prompt_labels: true
 
 optimization:
   optimizer:
     type: adamw
-    learning_rate: 5.0e-4
+    learning_rate: 2.0e-5
     weight_decay: 0.01
   scheduler:
     type: cosine
     warmup_steps: 100
-  max_epochs: 2
+  max_epochs: 1
   gradient_accumulation_steps: 8
   gradient_clip_val: 1.0
-  train_micro_batch_size: 32
+  train_micro_batch_size: 1
   eval_micro_batch_size: 1
 
 logging:
   project: open-r1-lightning
-  run_name: pretrain-demo
+  run_name: sft-demo
   enable_csv: true
   enable_wandb: false
-  log_every_n_steps: 100
-  sample_every_n_steps: 0
-  sample_prompts: []
+  log_every_n_steps: 10
+  sample_every_n_steps: 200
+  sample_prompts:
+    - Solve: What is 12 * 13?
+    - Explain why the derivative of x^2 is 2x.
 
 checkpoint:
-  dirpath: outputs/lightning_pretrain_demo/checkpoints
-  monitor: train/loss
+  dirpath: outputs/lightning_sft_demo/checkpoints
+  monitor: val/loss
   mode: min
   save_top_k: 2
   save_last: true
-  every_n_train_steps: 1000
+  every_n_train_steps: 200
 
 distributed:
-  strategy: ddp
+  strategy: fsdp
   accelerator: gpu
-  devices: 1
+  devices: 8
   num_nodes: 1
   sync_batchnorm: false

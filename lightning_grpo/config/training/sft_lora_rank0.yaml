@@ -13,8 +13,8 @@ model:
   use_cache: false
   lora:
     enabled: true
-    r: 8
-    alpha: 16
+    r: 16
+    alpha: 32
     dropout: 0.05
     target_modules: [q_proj, k_proj, v_proj, o_proj]
 
@@ -25,7 +25,7 @@ data:
   val_split: test
   prompt_column: prompt
   response_column: response
-  max_seq_length: 4096
+  max_seq_length: 2048
   num_workers: 4
   preprocessing_batch_size: 128
   preprocessing_use_cache: false
@@ -35,7 +35,7 @@ data:
 optimization:
   optimizer:
     type: adamw
-    learning_rate: 2.0e-6
+    learning_rate: 2.0e-5
     weight_decay: 0.01
   scheduler:
     type: cosine
@@ -68,6 +68,6 @@ checkpoint:
 distributed:
   strategy: auto
   accelerator: gpu
-  devices: auto
+  devices: 1
   num_nodes: 1
   sync_batchnorm: false

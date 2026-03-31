@@ -7,7 +7,8 @@ precision:
   trainer_precision: bf16-mixed
 
 model:
-  model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+  model_name_or_path: Qwen/Qwen3.5-0.8B
+  attn_implementation: sdpa
   gradient_checkpointing: true
   use_cache: false
 
@@ -18,7 +19,7 @@ data:
   response_column: solution
   max_seq_length: 2048
   num_workers: 4
-  preprocessing_batch_size: 64
+  preprocessing_batch_size: 128
   preprocessing_use_cache: false
   preprocessing_keep_in_memory: true
 
