@@ -9,7 +9,7 @@ import transformers
 import warnings
 from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig, Qwen3MoeForCausalLM
 from module.minimind.modeling_minimind_moe import MiniMindConfig, MiniMindMoeForCausalLM
-from module.minimind.model_lora import apply_lora, merge_lora
+from .model_lora import apply_lora, merge_lora
 
 warnings.filterwarnings('ignore', category=UserWarning)
 

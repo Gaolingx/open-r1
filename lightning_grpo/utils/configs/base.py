@@ -37,9 +37,9 @@ class LoRAConfig:
 class ModelConfig:
     """Model loading and architecture adaptation settings."""
 
-    model_family: str = "auto"
+    custom_model: bool = False
     model_class_path: Optional[str] = None
-    model_name_or_path: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    model_name_or_path: str = None
     model_revision: str = "main"
     tokenizer_name_or_path: Optional[str] = None
     model_config_path: Optional[str] = None

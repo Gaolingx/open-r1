@@ -7,9 +7,8 @@ precision:
   trainer_precision: bf16-mixed
 
 model:
-  model_family: minimind
-  model_name_or_path: MiniMind
-  tokenizer_name_or_path: lightning_grpo/module/minimind/tokenizer
+  custom_model: true
+  tokenizer_name_or_path: lightning_grpo/module/nekomind/tokenizer
   model_config_path: lightning_grpo/config/model/model_config.json
   pretrained_weight: none
   custom_weight_dir: outputs

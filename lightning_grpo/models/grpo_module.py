@@ -14,7 +14,7 @@ from open_r1.rewards import get_reward_funcs
 from lightning_grpo.models.rollout_engine import create_rollout_engine, compute_per_token_logps
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.models.common import build_optimizer, build_scheduler, entropy_from_logits, masked_mean
-from lightning_grpo.utils.modeling import collect_moe_metrics, count_trainable_parameters, describe_model_source, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
+from lightning_grpo.utils.modeling import collect_moe_metrics, count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
 class GRPOLightningModule(L.LightningModule):
@@ -25,7 +25,6 @@ class GRPOLightningModule(L.LightningModule):
         self.config = config
         self.policy = load_causal_lm(config.model, config.precision)
         self.reference_model = load_causal_lm(config.model, config.precision) if config.rollout.use_reference_model else None
-        rank_zero_info(f"Loaded GRPO model from {describe_model_source(config.model)}")
         if self.reference_model is not None:
             self.reference_model.requires_grad_(False)
             self.reference_model.eval()

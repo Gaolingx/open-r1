@@ -1,4 +1,4 @@
-"""MiniMindMoe model configuration"""
+"""NekoMindMoe model configuration"""
 
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
@@ -7,7 +7,7 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 
-class MiniMindMoeConfig(PreTrainedConfig):
+class NekoMindMoeConfig(PreTrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3MoeModel`]. It is used to instantiate a
     Qwen3MoE model according to the specified arguments, defining the model architecture. Instantiating a configuration
@@ -103,7 +103,7 @@ class MiniMindMoeConfig(PreTrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "minimind_moe"
+    model_type = "nekomind_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     attribute_map = {
@@ -200,4 +200,4 @@ class MiniMindMoeConfig(PreTrainedConfig):
         super().__init__(**kwargs)
 
 
-__all__ = ["MiniMindMoeConfig"]
+__all__ = ["NekoMindMoeConfig"]

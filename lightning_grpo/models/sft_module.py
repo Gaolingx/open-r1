@@ -11,7 +11,7 @@ from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.sft import SFTConfig
 from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats
-from lightning_grpo.utils.modeling import count_trainable_parameters, describe_model_source, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
+from lightning_grpo.utils.modeling import count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
 class SFTLightningModule(L.LightningModule):
@@ -22,7 +22,6 @@ class SFTLightningModule(L.LightningModule):
         self.config = config
         self.model = load_causal_lm(config.model, config.precision)
         self.save_hyperparameters(config.to_dict())
-        rank_zero_info(f"Loaded SFT model from {describe_model_source(config.model)}")
 
         trainable, total = count_trainable_parameters(self.model)
         self.trainable_parameter_count = trainable

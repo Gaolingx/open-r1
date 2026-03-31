@@ -37,8 +37,8 @@ def resolve_torch_dtype(precision_config: PrecisionConfig) -> torch.dtype:
 def load_tokenizer(model_config: ModelConfig) -> PreTrainedTokenizerBase:
     """Load and normalize the tokenizer."""
 
-    if not model_config.model_family and not model_config.tokenizer_name_or_path:
-        raise ValueError(f"{model_config.model_family} requires `tokenizer_name_or_path` for tokenizer loading.")
+    if model_config.custom_model and not model_config.tokenizer_name_or_path:
+        raise ValueError(f"custom_model requires `tokenizer_name_or_path` for tokenizer loading.")
 
     tokenizer_name = model_config.tokenizer_name_or_path or model_config.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(
@@ -198,7 +198,7 @@ def _build_configured_model_class(model_config: ModelConfig, precision_config: P
 def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig) -> PreTrainedModel:
     """Load a decoder-only language model with optional LoRA support."""
 
-    if model_config.model_family == "auto":
+    if model_config.model_name_or_path:
         model = AutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
             revision=model_config.model_revision,
@@ -237,14 +237,6 @@ def count_trainable_parameters(model: PreTrainedModel) -> tuple[int, int]:
         if parameter.requires_grad:
             trainable += count
     return trainable, total
-
-
-def describe_model_source(model_config: ModelConfig) -> str:
-    """Describe the selected model source for logging."""
-
-    if model_config.model_family == "auto":
-        return model_config.model_name_or_path
-    return f"{model_config.model_family}:{model_config.pretrained_weight or 'none'}"
 
 
 def resolve_export_model(pl_module: L.LightningModule) -> torch.nn.Module | None:
