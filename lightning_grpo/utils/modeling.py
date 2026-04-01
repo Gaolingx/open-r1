@@ -140,7 +140,7 @@ def _resolve_checkpoint_state_dict(checkpoint: Any) -> Mapping[str, torch.Tensor
 def _maybe_load_custom_weights(model: PreTrainedModel, model_config: ModelConfig) -> PreTrainedModel:
     """Load an optional local PyTorch checkpoint into a freshly built model."""
 
-    if not model_config.pretrained_weight or model_config.pretrained_weight.lower() == "none":
+    if model_config.custom_weight_dir is None:
         return model
 
     weight_path = Path(model_config.custom_weight_dir).expanduser()

@@ -88,7 +88,7 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | FSDPStrateg
             activation_checkpointing_policy=activation_checkpointing_policy,
             sharding_strategy=_resolve_sharding_strategy(config.fsdp_sharding_strategy),
             backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            state_dict_type="full",
+            state_dict_type=config.fsdp_state_dict_type,
         )
     raise ValueError(f"Unknown distributed strategy: {config.strategy}")
 

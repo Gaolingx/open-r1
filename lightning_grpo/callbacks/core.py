@@ -13,11 +13,12 @@ import torch
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
+from transformers import GenerationConfig
 from transformers.optimization import get_scheduler
 
-from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig
+from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig, ModelConfig
 from lightning_grpo.utils.modeling import export_configured_model, load_tokenizer, resolve_export_model
-from lightning_grpo.utils.config import save_json_config
+from lightning_grpo.utils.config import load_json_config, save_json_config
 
 
 class CheckpointCallback(ModelCheckpoint):
@@ -232,19 +233,19 @@ class LRandSchedulerOverrideCallback(Callback):
 class PeriodicSampleGenerationCallback(Callback):
     """Generate text samples during training for qualitative inspection."""
 
-    def __init__(self, logging_config: LoggingConfig, model_name_or_path: str) -> None:
+    def __init__(self, logging_config: LoggingConfig, model_config: ModelConfig) -> None:
         self.logging_config = logging_config
-        self.tokenizer = load_tokenizer(
-            type("ModelConfigProxy", (), {
-                "model_name_or_path": model_name_or_path,
-                "tokenizer_name_or_path": None,
-                "model_revision": "main",
-                "trust_remote_code": False,
-                "chat_template": None,
-                "eos_token": None,
-                "pad_token": None,
-            })()
-        )
+        self.generation_config = self._load_generation_config(logging_config.sample_generation_config_path)
+        self.tokenizer = load_tokenizer(model_config)
+
+    @staticmethod
+    def _load_generation_config(config_path: str | None) -> GenerationConfig:
+        """Load text generation settings from a JSON config file."""
+
+        if not config_path:
+            return GenerationConfig(max_new_tokens=128)
+
+        return GenerationConfig(load_json_config(config_path))
 
     @staticmethod
     def _extract_generations(decoded_sequences: list[str], prompts: list[str]) -> list[str]:
@@ -371,14 +372,7 @@ class PeriodicSampleGenerationCallback(Callback):
         with torch.inference_mode():
             generated = model.generate(
                 **tokenized,
-                max_new_tokens=self.logging_config.sample_max_new_tokens,
-                do_sample=self.logging_config.sample_do_sample,
-                temperature=self.logging_config.sample_temperature,
-                top_p=self.logging_config.sample_top_p,
-                top_k=self.logging_config.sample_top_k,
-                num_beams=self.logging_config.sample_num_beams,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
+                generation_config=self.generation_config,
             )
         if was_training and hasattr(model, "train"):
             model.train()
@@ -501,7 +495,7 @@ def build_callbacks(config: ExperimentConfig) -> list[Callback]:
         callbacks.append(
             PeriodicSampleGenerationCallback(
                 logging_config=config.logging,
-                model_name_or_path=config.model.model_name_or_path,
+                model_config=config.model,
             )
         )
     return callbacks
