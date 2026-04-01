@@ -41,7 +41,7 @@ class ModelConfig:
     tokenizer_name_or_path: Optional[str] = None
     model_config_path: Optional[str] = None
     model_init_kwargs: dict[str, Any] = field(default_factory=dict)
-    custom_weight_dir: str = "outputs"
+    custom_weight_dir: str = None
     trust_remote_code: bool = False
     attn_implementation: Optional[str] = "flash_attention_2"
     chat_template: Optional[str] = None
