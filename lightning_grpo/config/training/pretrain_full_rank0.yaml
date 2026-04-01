@@ -22,7 +22,7 @@ model:
 
 data:
   train_files:
-    - E:/training/t2t/pretrain/pretrain_t2t.jsonl
+    - E:/training/datasets/minimind_dataset/pretrain_t2t.jsonl
   text_column: text
   train_split: train
   max_seq_length: 2048
