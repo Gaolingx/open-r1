@@ -13,12 +13,12 @@ import torch
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
-from transformers import GenerationConfig
 from transformers.optimization import get_scheduler
 
+from lightning_grpo.models.rollout_engine import PolicyRolloutEngine
 from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig, ModelConfig
 from lightning_grpo.utils.modeling import export_configured_model, load_tokenizer, resolve_export_model
-from lightning_grpo.utils.config import load_json_config, save_json_config
+from lightning_grpo.utils.config import save_json_config
 
 
 class CheckpointCallback(ModelCheckpoint):
@@ -235,17 +235,8 @@ class PeriodicSampleGenerationCallback(Callback):
 
     def __init__(self, logging_config: LoggingConfig, model_config: ModelConfig) -> None:
         self.logging_config = logging_config
-        self.generation_config = self._load_generation_config(logging_config.sample_generation_config_path)
         self.tokenizer = load_tokenizer(model_config)
-
-    @staticmethod
-    def _load_generation_config(config_path: str | None) -> GenerationConfig:
-        """Load text generation settings from a JSON config file."""
-
-        if not config_path:
-            return GenerationConfig(max_new_tokens=128)
-
-        return GenerationConfig(load_json_config(config_path))
+        self.rollout_engine: PolicyRolloutEngine | None = None
 
     @staticmethod
     def _extract_generations(decoded_sequences: list[str], prompts: list[str]) -> list[str]:
@@ -359,26 +350,32 @@ class PeriodicSampleGenerationCallback(Callback):
         if trainer.global_step == 0 or trainer.global_step % every_n_steps != 0:
             return
 
-        model = getattr(pl_module, "policy", None) or getattr(pl_module, "model", None)
+        model = resolve_export_model(pl_module)
         if model is None:
             return
 
-        was_training = model.training
         prompts = self.logging_config.sample_prompts
         tokenized = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-        tokenized = {key: value.to(pl_module.device) for key, value in tokenized.items()}
+        prompt_ids = tokenized["input_ids"].to(pl_module.device)
+        attention_mask = tokenized["attention_mask"].to(pl_module.device)
+
+        rollout_engine = self._get_rollout_engine(model)
+        was_training = model.training
         if hasattr(model, "eval"):
             model.eval()
-        with torch.inference_mode():
-            generated = model.generate(
-                **tokenized,
-                generation_config=self.generation_config,
-            )
-        if was_training and hasattr(model, "train"):
-            model.train()
+        try:
+            with torch.inference_mode():
+                rollout = rollout_engine.rollout(
+                    prompt_ids=prompt_ids,
+                    attention_mask=attention_mask,
+                    num_generations=1,
+                )
+        finally:
+            if was_training and hasattr(model, "train"):
+                model.train()
 
-        decoded_sequences = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
-        texts = self._extract_generations(decoded_sequences, prompts)
+        texts = rollout.completions_text
+        decoded_sequences = self.tokenizer.batch_decode(rollout.output_ids, skip_special_tokens=True)
         output_dir = Path(trainer.default_root_dir) / "samples"
         output_dir.mkdir(parents=True, exist_ok=True)
         sample_path = output_dir / f"step-{trainer.global_step:08d}.json"
@@ -396,6 +393,19 @@ class PeriodicSampleGenerationCallback(Callback):
         }
         save_json_config(payload, sample_path)
         self._log_samples_to_loggers(trainer, payload["samples"], sample_path)
+
+    def _get_rollout_engine(self, model: torch.nn.Module) -> PolicyRolloutEngine:
+        """Lazily build and refresh the local rollout engine for sample logging."""
+
+        if self.rollout_engine is None:
+            self.rollout_engine = PolicyRolloutEngine(
+                policy_model=model,
+                tokenizer=self.tokenizer,
+                generation_config_path=self.logging_config.sample_generation_config_path,
+            )
+        else:
+            self.rollout_engine.update_policy(model)
+        return self.rollout_engine
 
 
 class NaNLossCallback(Callback):

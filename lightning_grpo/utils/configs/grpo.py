@@ -51,7 +51,7 @@ class DebugConfig:
     enabled: bool = False
     every_n_steps: int = 0
     questions: list[str] = field(default_factory=list)
-    max_new_tokens: int = 256
+    generation_config_path: Optional[str] = None
 
 
 @dataclass
@@ -61,9 +61,7 @@ class RolloutConfig:
     num_generations: int = 8
     num_generations_eval: int | None = None
     max_prompt_length: int = 2048
-    max_completion_length: int = 1024
-    temperature: float = 0.8
-    top_p: float = 0.95
+    generation_config_path: Optional[str] = None
     kl_beta: float = 0.04
     epsilon: float = 0.2
     epsilon_high: float = 5.0

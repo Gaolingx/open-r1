@@ -34,7 +34,7 @@ class GRPOLightningModule(L.LightningModule):
             engine_type=config.rollout.engine.engine_type,
             policy_model=self.policy,
             tokenizer=self.tokenizer,
-            temperature=config.rollout.temperature,
+            generation_config_path=config.rollout.generation_config_path,
             generation_batch_size=config.rollout.generation_batch_size,
             sglang_base_url=config.rollout.engine.sglang_base_url,
             sglang_model_path=config.rollout.engine.sglang_model_path,
@@ -80,7 +80,7 @@ class GRPOLightningModule(L.LightningModule):
             code_eval_test_batch_size=getattr(reward, "code_eval_test_batch_size", 1),
             code_eval_scoring_mode=getattr(reward, "code_eval_scoring_mode", "weighted_sum"),
             ioi_provider=getattr(reward, "ioi_provider", "piston"),
-            max_completion_len=rollout.max_completion_length,
+            max_completion_len=getattr(self.rollout_engine.generation_config, "max_new_tokens", None),
             soft_punish_cache=getattr(reward, "soft_punish_cache", 0),
         )
 
@@ -122,7 +122,7 @@ class GRPOLightningModule(L.LightningModule):
             input_ids,
             logits_to_keep,
             attention_mask=attention_mask,
-            temperature=self.config.rollout.temperature,
+            temperature=float(getattr(self.rollout_engine.generation_config, "temperature", 1.0) or 1.0),
         )
 
     def _decode_completion_ids(self, completion_texts: list[str]) -> tuple[list[str], list[list[dict[str, str]]]]:
@@ -158,9 +158,6 @@ class GRPOLightningModule(L.LightningModule):
             prompt_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             num_generations=num_generations,
-            max_new_tokens=self.config.rollout.max_completion_length,
-            temperature=self.config.rollout.temperature,
-            top_p=self.config.rollout.top_p,
         )
         completion_texts, structured_completions = self._decode_completion_ids(rollout.completions_text)
 
@@ -195,19 +192,18 @@ class GRPOLightningModule(L.LightningModule):
         original_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
         try:
+            generation_config = self.rollout_engine.generation_config
+            if debug_config.generation_config_path is not None:
+                generation_config = self.rollout_engine._load_generation_config(debug_config.generation_config_path)
+
             for index, question in enumerate(debug_config.questions):
                 tokenized = self.tokenizer([question], return_tensors="pt", padding=True, truncation=True).to(self.device)
                 generated = self.policy.generate(
                     input_ids=tokenized["input_ids"],
                     attention_mask=tokenized["attention_mask"],
-                    do_sample=True,
-                    temperature=self.config.rollout.temperature,
-                    top_p=self.config.rollout.top_p,
-                    max_new_tokens=debug_config.max_new_tokens,
                     num_return_sequences=1,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
                     use_cache=True,
+                    generation_config=generation_config,
                 )
                 completion = generated[:, tokenized["input_ids"].shape[1]:]
                 text = self.tokenizer.batch_decode(completion, skip_special_tokens=True)[0]
