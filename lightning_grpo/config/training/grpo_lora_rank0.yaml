@@ -44,12 +44,33 @@ optimization:
   eval_micro_batch_size: 1
 
 reward:
-  reward_funcs: [accuracy, format, tag_count]
-  cosine_min_value_wrong: 0.0
-  cosine_max_value_wrong: -0.5
-  cosine_min_value_correct: 0.5
-  cosine_max_value_correct: 1.0
-  cosine_max_len: 1000
+  training_paradigm: rlvr
+  rlvr:
+    reward_funcs: [accuracy, format, tag_count]
+    cosine_min_value_wrong: 0.0
+    cosine_max_value_wrong: -0.5
+    cosine_min_value_correct: 0.5
+    cosine_max_value_correct: 1.0
+    cosine_max_len: 1000
+  rlhf:
+    reward_funcs: [reward_model_score]
+    reward_model:
+      enabled: false
+      model_name_or_path: null
+      tokenizer_name_or_path: null
+      max_length: 4096
+      batch_size: 4
+      dtype: bf16
+      score_field: score
+      normalize: false
+      bias: 0.0
+      scale: 1.0
+      template:
+        enabled: false
+        chat_template: null
+        add_generation_prompt: false
+        include_system_prompt: false
+        system_prompt: null
 
 rollout:
   num_generations: 4

@@ -5,14 +5,16 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 import torch
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
 
 from lightning_grpo.utils.config import load_json_config
+from lightning_grpo.utils.configs.grpo import RewardModelConfig
+from lightning_grpo.utils.modeling import DTYPE_MAP
 
 
 def load_generation_config(config_path: str | None) -> GenerationConfig:
@@ -81,6 +83,9 @@ class RolloutEngine(ABC):
     @abstractmethod
     def update_policy(self, model: torch.nn.Module) -> None:
         raise NotImplementedError
+
+    def score(self, samples: list[dict[str, Any]]) -> list[float]:
+        raise NotImplementedError(f"{self.__class__.__name__} does not support reward-model scoring.")
 
 
 class PolicyRolloutEngine(RolloutEngine):
@@ -156,6 +161,95 @@ class PolicyRolloutEngine(RolloutEngine):
 
     def update_policy(self, model: torch.nn.Module) -> None:
         self.policy_model = model
+
+
+class RewardModelRolloutEngine(RolloutEngine):
+    """Local reward-model inference backend for GRPO reward scoring."""
+
+    def __init__(self, reward_model_config: RewardModelConfig) -> None:
+        if not reward_model_config.model_name_or_path:
+            raise ValueError("reward_model.model_name_or_path must be set when reward_model is enabled.")
+
+        self.config = reward_model_config
+        tokenizer_name = reward_model_config.tokenizer_name_or_path or reward_model_config.model_name_or_path
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            revision=reward_model_config.model_revision,
+            trust_remote_code=reward_model_config.trust_remote_code,
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        model_kwargs: dict[str, Any] = {
+            "revision": reward_model_config.model_revision,
+            "trust_remote_code": reward_model_config.trust_remote_code,
+            "torch_dtype": DTYPE_MAP[reward_model_config.dtype],
+        }
+        if reward_model_config.attn_implementation:
+            model_kwargs["attn_implementation"] = reward_model_config.attn_implementation
+
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            reward_model_config.model_name_or_path,
+            **model_kwargs,
+        )
+        self.model.eval()
+
+    def rollout(
+        self,
+        *,
+        prompt_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_generations: int,
+    ) -> RolloutResult:
+        raise NotImplementedError("RewardModelRolloutEngine is only used for reward scoring, not text generation.")
+
+    def update_policy(self, model: torch.nn.Module) -> None:
+        return None
+
+    @torch.no_grad()
+    def score(self, samples: list[dict[str, Any]]) -> list[float]:
+        if not samples:
+            return []
+
+        device = next(self.model.parameters()).device
+        outputs: list[float] = []
+        batch_size = max(1, int(self.config.batch_size))
+        score_field = self.config.score_field
+
+        for start in range(0, len(samples), batch_size):
+            chunk = samples[start:start + batch_size]
+            texts = [sample["text"] for sample in chunk]
+            tokenized = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.config.max_length,
+                return_tensors="pt",
+            )
+            tokenized = {key: value.to(device) for key, value in tokenized.items()}
+            model_outputs = self.model(**tokenized)
+
+            if hasattr(model_outputs, score_field):
+                scores = getattr(model_outputs, score_field)
+            elif hasattr(model_outputs, "logits"):
+                scores = model_outputs.logits
+            else:
+                raise AttributeError(
+                    f"Reward model output has neither '{score_field}' nor 'logits'."
+                )
+
+            if scores.ndim > 1:
+                if scores.shape[-1] == 1:
+                    scores = scores.squeeze(-1)
+                else:
+                    scores = scores[..., 0]
+
+            if self.config.normalize:
+                scores = torch.tanh(scores)
+            scores = scores * self.config.scale + self.config.bias
+            outputs.extend(float(score) for score in scores.detach().cpu())
+
+        return outputs
 
     def _build_generation_config(self, num_generations: int) -> GenerationConfig:
         """Build the per-call generation config for local policy rollouts."""
@@ -367,6 +461,7 @@ def create_rollout_engine(
     sglang_model_path: Optional[str] = None,
     sglang_shared_path: Optional[str] = None,
     request_timeout: int = 120,
+    reward_model_config: Optional[RewardModelConfig] = None,
 ) -> RolloutEngine:
     """Build the configured rollout engine."""
 
@@ -387,4 +482,8 @@ def create_rollout_engine(
             timeout=request_timeout,
             generation_config_path=generation_config_path,
         )
+    if engine_type == "reward_model":
+        if reward_model_config is None:
+            raise ValueError("reward_model rollout requires `reward_model_config`.")
+        return RewardModelRolloutEngine(reward_model_config)
     raise ValueError(f"Unsupported rollout engine type: {engine_type}")

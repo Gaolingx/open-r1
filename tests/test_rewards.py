@@ -26,6 +26,7 @@ from open_r1.rewards import (
     get_reward_funcs,
     get_soft_overlong_punishment,
     len_reward,
+    reward_model_score_reward,
     reasoning_steps_reward,
     tag_count_reward,
 )
@@ -49,6 +50,7 @@ class TestGetRewardFuncs(unittest.TestCase):
             "ioi_code",
             "code_format",
             "binary_code",
+            "reward_model_score",
         ]
         reward_func_names = [
             "accuracy_reward",
@@ -62,6 +64,7 @@ class TestGetRewardFuncs(unittest.TestCase):
             "ioi_code_reward",
             "code_format_reward",
             "binary_code_reward",
+            "reward_model_score_reward",
         ]
 
         args = GRPOScriptArguments(
@@ -70,9 +73,25 @@ class TestGetRewardFuncs(unittest.TestCase):
         )
 
         reward_funcs = get_reward_funcs(args)
-        self.assertEqual(len(reward_funcs), 11)
+        self.assertEqual(len(reward_funcs), 12)
         for func_name, func in zip(reward_func_names, reward_funcs):
             self.assertEqual(func_name, func.__name__)
+
+    def test_reward_model_score_reward(self):
+        class DummyRewardModelEngine:
+            def score(self, samples):
+                return [0.25 * (index + 1) for index, _ in enumerate(samples)]
+
+        completions = [
+            [{"content": "answer a"}],
+            [{"content": "answer b"}],
+        ]
+        rewards = reward_model_score_reward(
+            completions,
+            reward_model_engine=DummyRewardModelEngine(),
+            reward_model_texts=["prompt a\nanswer a", "prompt b\nanswer b"],
+        )
+        self.assertEqual(rewards, [0.25, 0.5])
 
 
 class TestRewards(unittest.TestCase):

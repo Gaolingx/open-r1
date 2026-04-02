@@ -82,7 +82,7 @@ def build_trainer(config: TrainingBaseConfig) -> L.Trainer:
         log_every_n_steps=config.logging.log_every_n_steps,
         callbacks=build_callbacks(config),
         logger=build_loggers(config),
-        val_check_interval=config.log_every_n_steps,
+        val_check_interval=config.val_check_interval,
         limit_val_batches=0 if not has_validation_data else None,
         num_sanity_val_steps=0 if not has_validation_data else None,
         **strategy_kwargs,

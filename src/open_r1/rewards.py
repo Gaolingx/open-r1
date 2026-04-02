@@ -678,6 +678,22 @@ def get_soft_overlong_punishment(max_completion_len, soft_punish_cache):
     return soft_overlong_punishment_reward
 
 
+def reward_model_score_reward(
+    completions,
+    reward_model_engine=None,
+    reward_model_texts: Optional[list[str]] = None,
+    **kwargs,
+) -> list[Optional[float]]:
+    """Reward function that scores completions with a reward model."""
+
+    if reward_model_engine is None:
+        raise ValueError("reward_model_score requires a configured reward_model_engine.")
+
+    texts = reward_model_texts or [completion[0]["content"] for completion in completions]
+    samples = [{"text": text} for text in texts]
+    return [float(score) for score in reward_model_engine.score(samples)]
+
+
 def get_reward_funcs(script_args) -> list[Callable]:
     format_mode = getattr(script_args, "format_mode", "strict")
     REWARD_FUNCS_REGISTRY = {
@@ -735,6 +751,13 @@ def get_reward_funcs(script_args) -> list[Callable]:
         "soft_overlong_punishment": get_soft_overlong_punishment(
             max_completion_len=script_args.max_completion_len,
             soft_punish_cache=script_args.soft_punish_cache,
+        ),
+        "reward_model_score": update_wrapper(
+            partial(
+                reward_model_score_reward,
+                reward_model_engine=getattr(script_args, "reward_model_engine", None),
+            ),
+            reward_model_score_reward,
         ),
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]

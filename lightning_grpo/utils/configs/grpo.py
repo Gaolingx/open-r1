@@ -10,8 +10,39 @@ from lightning_grpo.utils.configs.sft import ChatDataConfig
 
 
 @dataclass
-class RewardConfig:
-    """Reward function configuration for GRPO."""
+class RewardModelTemplateConfig:
+    """Formatting controls for reward-model scoring prompts."""
+
+    enabled: bool = False
+    chat_template: Optional[str] = None
+    add_generation_prompt: bool = False
+    include_system_prompt: bool = False
+    system_prompt: Optional[str] = None
+
+
+@dataclass
+class RewardModelConfig:
+    """Reward model inference configuration for non-programmatic GRPO rewards."""
+
+    enabled: bool = False
+    model_name_or_path: Optional[str] = None
+    tokenizer_name_or_path: Optional[str] = None
+    model_revision: str = "main"
+    trust_remote_code: bool = False
+    attn_implementation: Optional[str] = None
+    max_length: int = 4096
+    batch_size: int = 4
+    dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
+    score_field: str = "score"
+    normalize: bool = False
+    bias: float = 0.0
+    scale: float = 1.0
+    template: RewardModelTemplateConfig = field(default_factory=RewardModelTemplateConfig)
+
+
+@dataclass
+class BaseRewardConfig:
+    """Shared reward configuration for GRPO training paradigms."""
 
     reward_funcs: list[str] = field(default_factory=lambda: ["accuracy", "format", "tag_count"])
     reward_weights: list[float] | None = None
@@ -34,10 +65,35 @@ class RewardConfig:
 
 
 @dataclass
+class RLVRRewardConfig(BaseRewardConfig):
+    """Reward configuration for rule-based / verifiable GRPO training."""
+
+
+@dataclass
+class RLHFRewardConfig(BaseRewardConfig):
+    """Reward configuration for reward-model-based GRPO training."""
+
+    reward_model: RewardModelConfig = field(default_factory=RewardModelConfig)
+
+
+@dataclass
+class RewardConfig:
+    """Top-level reward config with explicit RLVR and RLHF sub-configs."""
+
+    training_paradigm: Literal["rlvr", "rlhf"] = "rlvr"
+    rlvr: RLVRRewardConfig = field(default_factory=RLVRRewardConfig)
+    rlhf: RLHFRewardConfig = field(default_factory=RLHFRewardConfig)
+
+    @property
+    def active(self) -> BaseRewardConfig:
+        return self.rlhf if self.training_paradigm == "rlhf" else self.rlvr
+
+
+@dataclass
 class RolloutEngineConfig:
     """Pluggable rollout backend configuration."""
 
-    engine_type: Literal["policy", "sglang"] = "policy"
+    engine_type: Literal["policy", "sglang", "reward_model"] = "policy"
     sglang_base_url: str = "http://localhost:8996"
     sglang_model_path: Optional[str] = None
     sglang_shared_path: str = "./sglang_ckpt_grpo"
@@ -62,6 +118,7 @@ class RolloutConfig:
     num_generations_eval: int | None = None
     max_prompt_length: int = 2048
     generation_config_path: Optional[str] = None
+    temperature: float = 1.0
     kl_beta: float = 0.04
     epsilon: float = 0.2
     epsilon_high: float = 5.0
