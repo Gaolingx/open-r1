@@ -1,13 +1,15 @@
-"""Shared dataset and formatting helpers for the Lightning GRPO pipeline."""
+"""Shared dataset and formatting helpers for Lightning training pipelines."""
 
 from __future__ import annotations
 
 from dataclasses import asdict
 import json
 import random
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
+from lightning import LightningDataModule
+from torch.utils.data import DataLoader
 
 from lightning_grpo.utils.configs.base import DataConfig, DatasetSource, ModelConfig
 
@@ -176,6 +178,26 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
     return dataset_dict
 
 
+def map_dataset_with_config(
+    dataset: Dataset,
+    preprocess_fn: Callable[[dict[str, list[Any]]], dict[str, list[Any]]],
+    data_config: DataConfig,
+    desc: str,
+) -> Dataset:
+    """Apply a batched dataset transform using shared preprocessing settings."""
+
+    return dataset.map(
+        preprocess_fn,
+        batched=True,
+        batch_size=data_config.preprocessing_batch_size,
+        num_proc=None if data_config.streaming else data_config.num_workers,
+        remove_columns=list(dataset.column_names),
+        load_from_cache_file=data_config.preprocessing_use_cache,
+        keep_in_memory=data_config.preprocessing_keep_in_memory,
+        desc=desc,
+    )
+
+
 def apply_chat_template(
     tokenizer: Any,
     messages: list[dict[str, str]],
@@ -208,3 +230,98 @@ def dump_data_config(data_config: DataConfig) -> dict[str, Any]:
     """Serialize the data configuration for logging and checkpoint metadata."""
 
     return asdict(data_config)
+
+
+class BaseDataModule(LightningDataModule):
+    """Reusable base class for dataset-driven Lightning data modules."""
+
+    def __init__(self, data_config: DataConfig) -> None:
+        super().__init__()
+        self.data_config = data_config
+        self.train_dataset: Optional[Dataset] = None
+        self.val_dataset: Optional[Dataset] = None
+
+    def load_dataset_dict(self) -> DatasetDict:
+        """Load the configured dataset dictionary."""
+
+        return load_dataset_from_config(self.data_config)
+
+    def resolve_val_split_name(self, dataset_dict: DatasetDict) -> Optional[str]:
+        """Resolve the validation split name for the current dataset dictionary."""
+
+        return resolve_validation_split_name(self.data_config, dataset_dict)
+
+    def map_dataset(
+        self,
+        dataset: Dataset,
+        preprocess_fn: Callable[[dict[str, list[Any]]], dict[str, list[Any]]],
+        desc: str,
+    ) -> Dataset:
+        """Apply a shared batched dataset preprocessing transform."""
+
+        return map_dataset_with_config(dataset, preprocess_fn, self.data_config, desc)
+
+    def _build_dataloader(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        collate_fn: Callable[[list[dict[str, Any]]], Any],
+        *,
+        shuffle: bool,
+        drop_last: bool,
+    ) -> DataLoader:
+        """Build a dataloader with shared worker and memory settings."""
+
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=self.data_config.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+            drop_last=drop_last,
+        )
+
+
+class BaseLMDataModule(BaseDataModule):
+    """Common utilities for language-model training pipelines."""
+
+    def __init__(self, data_config: DataConfig, model_config: ModelConfig) -> None:
+        super().__init__(data_config)
+        self.model_config = model_config
+
+
+class ChatTemplateDataModule(BaseLMDataModule):
+    """Base class for chat-style pipelines backed by `ConversationTemplate`."""
+
+    def __init__(
+        self,
+        data_config: DataConfig,
+        model_config: ModelConfig,
+        system_prompt: Optional[str] = None,
+    ) -> None:
+        super().__init__(data_config, model_config)
+        self.system_prompt = system_prompt
+
+    def build_conversation_template(self) -> ConversationTemplate:
+        """Construct the row-to-messages formatter from chat data settings."""
+
+        prompt_column = getattr(self.data_config, "prompt_column")
+        response_column = getattr(self.data_config, "response_column")
+        messages_column = getattr(self.data_config, "messages_column", "messages")
+        return ConversationTemplate(
+            prompt_column=prompt_column,
+            response_column=response_column,
+            messages_column=messages_column,
+            system_prompt=self.system_prompt,
+        )
+
+    @staticmethod
+    def iter_batch_samples(batch: dict[str, list[Any]]) -> list[dict[str, Any]]:
+        """Convert a dict-of-lists batch into a list of row dictionaries."""
+
+        batch_size = len(next(iter(batch.values())))
+        return [
+            {key: value[index] for key, value in batch.items()}
+            for index in range(batch_size)
+        ]

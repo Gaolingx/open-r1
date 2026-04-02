@@ -5,17 +5,13 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from datasets import Dataset
-from lightning import LightningDataModule
-from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 
 from lightning_grpo.utils.configs.base import DataConfig, ModelConfig, OptimizationConfig
 from lightning_grpo.utils.configs.grpo import RolloutConfig
 from lightning_grpo.data.base import (
-    ConversationTemplate,
+    ChatTemplateDataModule,
     apply_chat_template,
-    load_dataset_from_config,
-    resolve_validation_split_name,
 )
 from lightning_grpo.utils.modeling import load_tokenizer
 
@@ -51,7 +47,7 @@ class GRPORolloutCollator:
         }
 
 
-class GRPODataModule(LightningDataModule):
+class GRPODataModule(ChatTemplateDataModule):
     """Lightning data module for GRPO prompt and reward flows."""
 
     def __init__(
@@ -62,44 +58,33 @@ class GRPODataModule(LightningDataModule):
         rollout_config: RolloutConfig,
         system_prompt: Optional[str] = None,
     ) -> None:
-        super().__init__()
-        self.data_config = data_config
-        self.model_config = model_config
+        super().__init__(data_config=data_config, model_config=model_config, system_prompt=system_prompt)
         self.optimization_config = optimization_config
         self.rollout_config = rollout_config
-        self.system_prompt = system_prompt
         self.tokenizer = load_tokenizer(model_config)
         self.collator = GRPORolloutCollator(self.tokenizer, rollout_config)
-        self.train_dataset: Optional[Dataset] = None
-        self.val_dataset: Optional[Dataset] = None
 
     def setup(self, stage: Optional[str] = None) -> None:
         """Load and preprocess prompt-only datasets for GRPO."""
 
-        dataset_dict = load_dataset_from_config(self.data_config)
-        formatter = ConversationTemplate(
-            prompt_column=self.data_config.prompt_column,
-            response_column=self.data_config.response_column,
-            messages_column=self.data_config.messages_column,
-            system_prompt=self.system_prompt,
-        )
+        dataset_dict = self.load_dataset_dict()
+        formatter = self.build_conversation_template()
 
         train_dataset = dataset_dict[self.data_config.train_split]
-        val_split_name = resolve_validation_split_name(self.data_config, dataset_dict)
+        val_split_name = self.resolve_val_split_name(dataset_dict)
 
         self.train_dataset = self._prepare_prompt_dataset(train_dataset, formatter)
         self.val_dataset = None
         if val_split_name is not None:
             self.val_dataset = self._prepare_prompt_dataset(dataset_dict[val_split_name], formatter)
 
-    def _prepare_prompt_dataset(self, dataset: Dataset, formatter: ConversationTemplate) -> Dataset:
+    def _prepare_prompt_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
         """Build prompt text plus reward metadata for online optimization."""
 
         def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
             prompt_texts: list[str] = []
             metadata: list[dict[str, Any]] = []
-            for index in range(len(next(iter(batch.values())))):
-                sample = {key: value[index] for key, value in batch.items()}
+            for sample in self.iter_batch_samples(batch):
                 formatted = formatter(sample)
                 prompt_texts.append(
                     apply_chat_template(
@@ -115,44 +100,30 @@ class GRPODataModule(LightningDataModule):
                 })
             return {"prompt_text": prompt_texts, "metadata": metadata}
 
-        columns_to_remove = list(dataset.column_names)
-        return dataset.map(
-            preprocess_batch,
-            batched=True,
-            batch_size=self.data_config.preprocessing_batch_size,
-            num_proc=None if self.data_config.streaming else self.data_config.num_workers,
-            remove_columns=columns_to_remove,
-            load_from_cache_file=self.data_config.preprocessing_use_cache,
-            keep_in_memory=self.data_config.preprocessing_keep_in_memory,
-            desc="Formatting GRPO prompts",
-        )
+        return self.map_dataset(dataset, preprocess_batch, desc="Formatting GRPO prompts")
 
-    def train_dataloader(self) -> DataLoader:
+    def train_dataloader(self):
         """Build the training prompt dataloader."""
 
         if self.train_dataset is None:
             raise RuntimeError("GRPO train dataset is not initialized. Call setup() first.")
-        return DataLoader(
+        return self._build_dataloader(
             self.train_dataset,
             batch_size=self.optimization_config.train_micro_batch_size,
-            shuffle=not self.data_config.streaming,
-            num_workers=self.data_config.num_workers,
             collate_fn=self.collator,
-            pin_memory=True,
+            shuffle=not self.data_config.streaming,
             drop_last=True,
         )
 
-    def val_dataloader(self) -> Optional[DataLoader]:
+    def val_dataloader(self):
         """Build the validation prompt dataloader when a validation split is configured."""
 
         if self.val_dataset is None:
             return None
-        return DataLoader(
+        return self._build_dataloader(
             self.val_dataset,
             batch_size=self.optimization_config.eval_micro_batch_size,
-            shuffle=False,
-            num_workers=self.data_config.num_workers,
             collate_fn=self.collator,
-            pin_memory=True,
+            shuffle=False,
             drop_last=False,
         )
