@@ -27,7 +27,7 @@ class CheckpointCallback(ModelCheckpoint):
     def __init__(
         self,
         *args: Any,
-        save_pth_format: bool = True,
+        save_pth_format: bool = False,
         save_safetensors_format: bool = False,
         **kwargs: Any,
     ) -> None:

@@ -372,9 +372,9 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
         return metrics
 
     layer_entropies: list[torch.Tensor] = []
-    layer_max_probs: list[torch.Tensor] = []
     layer_load_std: list[torch.Tensor] = []
-    layer_load_imbalance: list[torch.Tensor] = []
+    layer_top1_occupancies: list[torch.Tensor] = []
+    layer_dead_expert_fractions: list[torch.Tensor] = []
 
     for layer_logits in valid_router_logits:
         probs = layer_logits.detach().to(dtype=torch.float32)
@@ -397,21 +397,23 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
 
         mean_probs = probs.mean(dim=0)
         entropy = -(probs * torch.log(probs.clamp_min(1.0e-8))).sum(dim=-1).mean()
-        max_prob = probs.max(dim=-1).values.mean()
         load_std = mean_probs.std(unbiased=False)
-        uniform_prob = 1.0 / max(mean_probs.numel(), 1)
-        load_imbalance = torch.mean(torch.abs(mean_probs - uniform_prob))
+        top1_experts = probs.argmax(dim=-1)
+        num_experts = probs.shape[-1]
+        top1_counts = torch.bincount(top1_experts, minlength=num_experts).to(dtype=torch.float32)
+        top1_occupancy = (top1_counts / max(top1_experts.numel(), 1)).max()
+        dead_expert_fraction = (top1_counts == 0).to(dtype=torch.float32).mean()
 
         layer_entropies.append(entropy)
-        layer_max_probs.append(max_prob)
         layer_load_std.append(load_std)
-        layer_load_imbalance.append(load_imbalance)
+        layer_top1_occupancies.append(top1_occupancy)
+        layer_dead_expert_fractions.append(dead_expert_fraction)
 
     if layer_entropies:
         metrics["router_entropy"] = torch.stack(layer_entropies).mean()
-        metrics["router_max_prob"] = torch.stack(layer_max_probs).mean()
         metrics["expert_load_std"] = torch.stack(layer_load_std).mean()
-        metrics["expert_load_imbalance"] = torch.stack(layer_load_imbalance).mean()
+        metrics["top1_expert_occupancy"] = torch.stack(layer_top1_occupancies).mean()
+        metrics["dead_expert_fraction"] = torch.stack(layer_dead_expert_fractions).mean()
 
     return metrics
 
@@ -435,9 +437,9 @@ def log_moe_metrics(
             "aux_loss": get_metric("aux_loss", metrics.get("aux_loss")),
             "z_loss": get_metric("z_loss", metrics.get("z_loss")),
             "router_entropy": get_metric("router_entropy", metrics.get("router_entropy")),
-            "router_max_prob": get_metric("router_max_prob", metrics.get("router_max_prob")),
             "expert_load_std": get_metric("expert_load_std", metrics.get("expert_load_std")),
-            "expert_load_imbalance": get_metric("expert_load_imbalance", metrics.get("expert_load_imbalance")),
+            "top1_expert_occupancy": get_metric("top1_expert_occupancy", metrics.get("top1_expert_occupancy")),
+            "dead_expert_fraction": get_metric("dead_expert_fraction", metrics.get("dead_expert_fraction")),
         })
         metrics = {key: value for key, value in metrics.items() if value is not None}
 
