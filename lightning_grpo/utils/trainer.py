@@ -9,7 +9,7 @@ import lightning as L
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 from lightning_grpo.callbacks import build_callbacks
-from lightning_grpo.utils.configs.base import ExperimentConfig
+from lightning_grpo.utils.configs.base import TrainingBaseConfig
 from lightning_grpo.strategies import trainer_strategy_kwargs
 
 
@@ -47,7 +47,7 @@ def find_resume_checkpoint(resume_arg: str, default_ckpt_dir: str) -> Optional[s
     return None
 
 
-def build_loggers(config: ExperimentConfig) -> list[Any]:
+def build_loggers(config: TrainingBaseConfig) -> list[Any]:
     """Build logger instances from experiment configuration."""
 
     loggers: list[Any] = []
@@ -64,7 +64,7 @@ def build_loggers(config: ExperimentConfig) -> list[Any]:
     return loggers
 
 
-def build_trainer(config: ExperimentConfig) -> L.Trainer:
+def build_trainer(config: TrainingBaseConfig) -> L.Trainer:
     """Create a Lightning trainer with DDP or FSDP support."""
 
     strategy_kwargs = trainer_strategy_kwargs(

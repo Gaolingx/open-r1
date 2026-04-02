@@ -5,14 +5,14 @@ from lightning_grpo.utils.configs.base import (
     DataConfig,
     DistributedConfig,
     EarlyStoppingConfig,
-    ExperimentConfig,
+    TrainingBaseConfig,
     LoggingConfig,
     ModelConfig,
     OptimizationConfig,
     PrecisionConfig,
 )
 from lightning_grpo.utils.configs.grpo import GRPOConfig, RewardConfig, RolloutConfig
-from lightning_grpo.utils.configs.pretrain import LMExperimentConfig, PretrainConfig, PretrainDataConfig
+from lightning_grpo.utils.configs.pretrain import PretrainConfig, PretrainDataConfig
 from lightning_grpo.utils.configs.sft import ChatDataConfig, SFTConfig, SFTDataConfig
 
 __all__ = [
@@ -20,10 +20,9 @@ __all__ = [
     "DataConfig",
     "DistributedConfig",
     "EarlyStoppingConfig",
-    "ExperimentConfig",
+    "TrainingBaseConfig",
     "GRPOConfig",
     "ChatDataConfig",
-    "LMExperimentConfig",
     "LoggingConfig",
     "ModelConfig",
     "OptimizationConfig",

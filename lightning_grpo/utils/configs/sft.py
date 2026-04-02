@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional
 
 from lightning_grpo.utils.configs.base import DataConfig
-from lightning_grpo.utils.configs.pretrain import LMExperimentConfig
+from lightning_grpo.utils.configs.base import TrainingBaseConfig
 
 
 @dataclass
@@ -28,10 +28,11 @@ class SFTDataConfig(ChatDataConfig):
 
 
 @dataclass
-class SFTConfig(LMExperimentConfig):
+class SFTConfig(TrainingBaseConfig):
     """Configuration for supervised fine-tuning."""
 
     task: Literal["sft"] = "sft"
+    system_prompt: Optional[str] = None
     data: SFTDataConfig = field(default_factory=SFTDataConfig)
     label_smoothing: float = 0.0
     eval_generation_max_new_tokens: int = 256

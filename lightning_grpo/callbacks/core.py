@@ -16,7 +16,7 @@ from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 from transformers.optimization import get_scheduler
 
 from lightning_grpo.models.rollout_engine import PolicyRolloutEngine
-from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, ExperimentConfig, LoggingConfig, ModelConfig
+from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, LoggingConfig, ModelConfig, TrainingBaseConfig
 from lightning_grpo.utils.modeling import export_configured_model, load_tokenizer, resolve_export_model
 from lightning_grpo.utils.config import save_json_config
 
@@ -24,16 +24,8 @@ from lightning_grpo.utils.config import save_json_config
 class CheckpointCallback(ModelCheckpoint):
     """ModelCheckpoint with optional torch export delegated to LightningModule."""
 
-    def __init__(
-        self,
-        *args: Any,
-        save_pth_format: bool = False,
-        save_safetensors_format: bool = False,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.save_pth_format = save_pth_format
-        self.save_safetensors_format = save_safetensors_format
 
     def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
         super()._save_checkpoint(trainer, filepath)
@@ -46,24 +38,9 @@ class CheckpointCallback(ModelCheckpoint):
             return
 
         tokenizer = getattr(trainer.lightning_module, "tokenizer", None)
-
         model_config = trainer.lightning_module.config.model
-        original_save_pth_format = model_config.save_pth_format
-        original_save_safetensors_format = model_config.save_safetensors_format
 
-        model_config.save_pth_format = self.save_pth_format
-        model_config.save_safetensors_format = self.save_safetensors_format
-
-        try:
-            export_configured_model(
-                model,
-                model_config,
-                Path(filepath).parent,
-                tokenizer=tokenizer,
-            )
-        finally:
-            model_config.save_pth_format = original_save_pth_format
-            model_config.save_safetensors_format = original_save_safetensors_format
+        export_configured_model(model, model_config, Path(filepath).parent, tokenizer=tokenizer)
 
 
 class EfficiencyMonitorCallback(Callback):
@@ -171,7 +148,7 @@ class GradParamNormCallback(Callback):
 class LRandSchedulerOverrideCallback(Callback):
     """Override optimizer LR and optionally reset scheduler state after ckpt resume."""
 
-    def __init__(self, config: ExperimentConfig) -> None:
+    def __init__(self, config: TrainingBaseConfig) -> None:
         super().__init__()
         self.config = config
         self.applied = False
@@ -439,7 +416,7 @@ class NaNLossCallback(Callback):
 class ConfigSnapshotCallback(Callback):
     """Persist the resolved experiment config next to checkpoints."""
 
-    def __init__(self, config: ExperimentConfig) -> None:
+    def __init__(self, config: TrainingBaseConfig) -> None:
         self.config = config
 
     @rank_zero_only
@@ -473,7 +450,7 @@ def build_early_stopping_callback(
     )
 
 
-def build_callbacks(config: ExperimentConfig) -> list[Callback]:
+def build_callbacks(config: TrainingBaseConfig) -> list[Callback]:
     """Build the callback stack for Lightning training."""
 
     ckpt_callback = CheckpointCallback(
@@ -484,8 +461,6 @@ def build_callbacks(config: ExperimentConfig) -> list[Callback]:
         save_top_k=config.checkpoint.save_top_k,
         save_last=config.checkpoint.save_last,
         every_n_train_steps=config.checkpoint.every_n_train_steps,
-        save_pth_format=config.checkpoint.save_pth_format,
-        save_safetensors_format=config.checkpoint.save_safetensors_format,
     )
 
     callbacks: list[Callback] = [

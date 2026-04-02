@@ -8,7 +8,7 @@ from typing import Any, Dict
 import yaml
 import json
 
-from lightning_grpo.utils.configs.base import ExperimentConfig
+from lightning_grpo.utils.configs.base import TrainingBaseConfig
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
 from lightning_grpo.utils.configs.sft import SFTConfig
@@ -20,7 +20,7 @@ CONFIG_REGISTRY = {
 }
 
 
-def load_experiment_config(path: str | Path) -> ExperimentConfig:
+def load_experiment_config(path: str | Path) -> TrainingBaseConfig:
     """Load a typed experiment configuration from YAML."""
 
     payload = load_yaml_config(path)

@@ -215,7 +215,7 @@ class DistributedConfig:
 
 
 @dataclass
-class ExperimentConfig:
+class TrainingBaseConfig:
     """Top-level configuration consumed by Lightning entrypoints."""
 
     seed: int = 42
@@ -237,7 +237,7 @@ class ExperimentConfig:
         return asdict(self)
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "ExperimentConfig":
+    def from_yaml(cls, path: str | Path) -> "TrainingBaseConfig":
         """Load configuration from a YAML file."""
 
         from lightning_grpo.utils.config import load_yaml_config
@@ -284,7 +284,7 @@ class ExperimentConfig:
         return value
 
     @classmethod
-    def _from_mapping(cls, mapping: dict[str, Any]) -> "ExperimentConfig":
+    def _from_mapping(cls, mapping: dict[str, Any]) -> "TrainingBaseConfig":
         type_hints = get_type_hints(cls)
         return cls(
             **{
