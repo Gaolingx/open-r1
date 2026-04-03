@@ -17,30 +17,30 @@ from transformers.optimization import get_scheduler
 
 from lightning_grpo.models.rollout_engine import PolicyRolloutEngine
 from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, LoggingConfig, ModelConfig, TrainingBaseConfig
-from lightning_grpo.utils.modeling import export_configured_model, load_tokenizer, resolve_export_model
+from lightning_grpo.utils.modeling import save_pth_weights, load_tokenizer, resolve_export_model
 from lightning_grpo.utils.config import save_json_config
 
 
 class CheckpointCallback(ModelCheckpoint):
     """ModelCheckpoint with optional torch export delegated to LightningModule."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, save_pt_format: bool = True, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.save_pt_format = save_pt_format
 
     def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
         super()._save_checkpoint(trainer, filepath)
 
-        if not trainer.is_global_zero:
+        if not self.save_pt_format or not trainer.is_global_zero:
             return
 
         model = resolve_export_model(trainer.lightning_module)
         if model is None:
             return
 
-        tokenizer = getattr(trainer.lightning_module, "tokenizer", None)
-        model_config = trainer.lightning_module.config.model
-
-        export_configured_model(model, model_config, Path(filepath).parent, tokenizer=tokenizer)
+        save_path = Path(filepath).parent / "pt_checkpoint"
+        save_file = save_path / "pretrain_model"
+        save_pth_weights(model, save_file)
 
 
 class EfficiencyMonitorCallback(Callback):
@@ -461,6 +461,7 @@ def build_callbacks(config: TrainingBaseConfig) -> list[Callback]:
         save_top_k=config.checkpoint.save_top_k,
         save_last=config.checkpoint.save_last,
         every_n_train_steps=config.checkpoint.every_n_train_steps,
+        save_pt_format=config.checkpoint.save_pt_format,
     )
 
     callbacks: list[Callback] = [

@@ -176,8 +176,7 @@ class CheckpointConfig:
     save_top_k: int = 3
     save_last: bool = True
     every_n_train_steps: Optional[int] = 500
-    save_pth_format: bool = False
-    save_safetensors_format: bool = False
+    save_pt_format: bool = True
 
 
 @dataclass

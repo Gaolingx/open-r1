@@ -250,6 +250,7 @@ def save_pth_weights(model: PreTrainedModel, filepath: str) -> Path | None:
 
     path = Path(filepath)
     pth_path = path.with_suffix(".pth")
+    pth_path.parent.mkdir(parents=True, exist_ok=True)
     state_dict = {key: value.detach().cpu() for key, value in model.state_dict().items()}
     torch.save(state_dict, pth_path)
     return pth_path
@@ -270,7 +271,6 @@ def export_configured_model(
 
     if model_config.save_pth_format:
         pth_dir = export_root / "pt_checkpoint"
-        pth_dir.mkdir(parents=True, exist_ok=True)
         pth_stem = pth_dir / "pretrain_model.ckpt"
         pth_path = save_pth_weights(model, pth_stem)
         if pth_path is not None:
