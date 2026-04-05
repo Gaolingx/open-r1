@@ -17,7 +17,7 @@ import lightning as L
 
 from lightning_grpo.data.pretrain_datamodule import PretrainDataModule
 from lightning_grpo.models.pretrain_module import PretrainLightningModule
-from lightning_grpo.utils.config import load_experiment_config
+from lightning_grpo.utils.configs.loader import load_experiment_config
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
 from lightning_grpo.utils.trainer import build_trainer, find_resume_checkpoint
 

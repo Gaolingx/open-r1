@@ -1,8 +1,8 @@
-"""Shared dataclass configuration for the Lightning GRPO pipeline."""
+"""Shared dataclass configuration for the Lightning pipeline."""
 
 from __future__ import annotations
 
-from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, get_args, get_origin, get_type_hints
 
@@ -249,49 +249,44 @@ class TrainingBaseConfig:
         """Recursively convert mappings into typed dataclasses."""
 
         origin = get_origin(annotation)
-        args = get_args(annotation)
-
-        if isinstance(annotation, type) and is_dataclass(annotation) and isinstance(value, dict):
-            nested_type_hints = get_type_hints(annotation)
-            return annotation(
-                **{
-                    sub_field.name: cls._coerce_value(
-                        nested_type_hints.get(sub_field.name, sub_field.type),
-                        value[sub_field.name],
-                    )
-                    for sub_field in fields(annotation)
-                    if sub_field.name in value
-                }
-            )
-
-        if origin is list and isinstance(value, list):
-            item_type = args[0] if args else Any
-            return [cls._coerce_value(item_type, item) for item in value]
-
-        if origin is tuple and isinstance(value, (list, tuple)):
-            item_type = args[0] if args else Any
-            return tuple(cls._coerce_value(item_type, item) for item in value)
+        if origin in {list, tuple}:
+            item_type = get_args(annotation)[0] if get_args(annotation) else Any
+            if isinstance(value, list):
+                return [cls._coerce_value(item_type, item) for item in value]
+            return value
 
         if origin is not None:
-            for candidate in args:
+            for candidate in get_args(annotation):
                 if candidate is type(None):
                     continue
                 coerced = cls._coerce_value(candidate, value)
-                if coerced is not value:
+                if coerced is not value or isinstance(value, candidate if isinstance(candidate, type) else tuple()):
                     return coerced
+            return value
+
+        if isinstance(annotation, type) and is_dataclass(annotation) and isinstance(value, dict):
+            nested_type_hints = get_type_hints(annotation)
+            coerced_values = {}
+            for sub_field in fields(annotation):
+                if sub_field.name not in value:
+                    continue
+                sub_annotation = nested_type_hints.get(sub_field.name, sub_field.type)
+                coerced_values[sub_field.name] = cls._coerce_value(sub_annotation, value[sub_field.name])
+            return annotation(**coerced_values)
 
         return value
 
     @classmethod
     def _from_mapping(cls, mapping: dict[str, Any]) -> "TrainingBaseConfig":
+        kwargs: dict[str, Any] = {}
         type_hints = get_type_hints(cls)
-        return cls(
-            **{
-                field_info.name: cls._coerce_value(
-                    type_hints.get(field_info.name, field_info.type),
-                    mapping[field_info.name],
-                )
-                for field_info in fields(cls)
-                if field_info.name in mapping
-            }
-        )
+        for field_info in fields(cls):
+            if field_info.name not in mapping:
+                continue
+            value = mapping[field_info.name]
+            if value is None:
+                kwargs[field_info.name] = None
+                continue
+            annotation = type_hints.get(field_info.name, field_info.type)
+            kwargs[field_info.name] = cls._coerce_value(annotation, value)
+        return cls(**kwargs)
