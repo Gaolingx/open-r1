@@ -30,7 +30,7 @@ data:
   preprocessing_batch_size: 128
   preprocessing_use_cache: false
   preprocessing_keep_in_memory: true
-  mask_prompt_labels: true
+  label_mode: last_assistant
 
 optimization:
   optimizer:

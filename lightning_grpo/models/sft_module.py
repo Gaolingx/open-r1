@@ -51,11 +51,11 @@ class SFTLightningModule(L.LightningModule):
         """Run one SFT optimization/evaluation step and log metrics."""
 
         labels = batch["labels"]
-        model_inputs = {**batch, "use_cache": False}
-        outputs = self(**model_inputs)
-        loss = self._compute_loss(outputs.logits, labels)
-        if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None:
-            loss = loss + outputs.aux_loss
+        outputs = self(**{**batch, "use_cache": False})
+        if hasattr(outputs, "loss") and outputs.loss is not None:
+            loss = outputs.loss
+        else:
+            loss = self._compute_loss(outputs.logits, labels)
         stats = masked_token_stats(outputs.logits, labels)
 
         on_step = stage == "train"

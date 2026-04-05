@@ -23,8 +23,7 @@ class ChatDataConfig(DataConfig):
 class SFTDataConfig(ChatDataConfig):
     """Dataset configuration specific to supervised fine-tuning."""
 
-    mask_prompt_labels: bool = True
-    assistant_only_loss: bool = False
+    label_mode: Literal["all_tokens", "last_assistant", "all_assistant"] = "last_assistant"
 
 
 @dataclass
