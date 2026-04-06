@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import logging
 from pathlib import Path
+import time
 from typing import Any, Optional
 
 import requests
@@ -15,6 +17,9 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer, Gene
 from lightning_grpo.utils.config import load_json_config
 from lightning_grpo.utils.configs.grpo import RewardModelConfig
 from lightning_grpo.utils.modeling import DTYPE_MAP
+
+
+logger = logging.getLogger(__name__)
 
 
 def load_generation_config(config_path: str | None) -> GenerationConfig:
@@ -162,6 +167,48 @@ class PolicyRolloutEngine(RolloutEngine):
     def update_policy(self, model: torch.nn.Module) -> None:
         self.policy_model = model
 
+    def _build_generation_config(self, num_generations: int) -> GenerationConfig:
+        """Build the per-call generation config for local policy rollouts."""
+
+        generation_config = {
+            key: value
+            for key, value in self.generation_config.to_dict().items()
+            if key not in self._GENERATION_CONFIG_OVERRIDE_KEYS and value is not None
+        }
+        generation_config["num_return_sequences"] = num_generations
+        generation_config.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+        generation_config.setdefault("eos_token_id", self.tokenizer.eos_token_id)
+        return GenerationConfig(**generation_config)
+
+    def _generate_in_chunks(
+        self,
+        *,
+        model: torch.nn.Module,
+        prompt_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_generations: int,
+    ) -> torch.Tensor:
+        """Generate completions in prompt chunks to cap rollout memory usage."""
+
+        chunk_size = self.generation_batch_size or prompt_ids.size(0)
+        if chunk_size <= 0:
+            chunk_size = prompt_ids.size(0)
+
+        generated_chunks: list[torch.Tensor] = []
+        for start in range(0, prompt_ids.size(0), chunk_size):
+            end = min(start + chunk_size, prompt_ids.size(0))
+            generated_chunk = model.generate(
+                input_ids=prompt_ids[start:end],
+                attention_mask=attention_mask[start:end],
+                use_cache=True,
+                generation_config=self._build_generation_config(num_generations),
+            )
+            generated_chunks.append(generated_chunk)
+
+        if not generated_chunks:
+            return prompt_ids.new_empty((0, prompt_ids.size(1)), dtype=prompt_ids.dtype)
+        return torch.cat(generated_chunks, dim=0)
+
 
 class RewardModelRolloutEngine(RolloutEngine):
     """Local reward-model inference backend for GRPO reward scoring."""
@@ -251,48 +298,6 @@ class RewardModelRolloutEngine(RolloutEngine):
 
         return outputs
 
-    def _build_generation_config(self, num_generations: int) -> GenerationConfig:
-        """Build the per-call generation config for local policy rollouts."""
-
-        generation_config = {
-            key: value
-            for key, value in self.generation_config.to_dict().items()
-            if key not in self._GENERATION_CONFIG_OVERRIDE_KEYS and value is not None
-        }
-        generation_config["num_return_sequences"] = num_generations
-        generation_config.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-        generation_config.setdefault("eos_token_id", self.tokenizer.eos_token_id)
-        return GenerationConfig(**generation_config)
-
-    def _generate_in_chunks(
-        self,
-        *,
-        model: torch.nn.Module,
-        prompt_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        num_generations: int,
-    ) -> torch.Tensor:
-        """Generate completions in prompt chunks to cap rollout memory usage."""
-
-        chunk_size = self.generation_batch_size or prompt_ids.size(0)
-        if chunk_size <= 0:
-            chunk_size = prompt_ids.size(0)
-
-        generated_chunks: list[torch.Tensor] = []
-        for start in range(0, prompt_ids.size(0), chunk_size):
-            end = min(start + chunk_size, prompt_ids.size(0))
-            generated_chunk = model.generate(
-                input_ids=prompt_ids[start:end],
-                attention_mask=attention_mask[start:end],
-                use_cache=True,
-                generation_config=self._build_generation_config(num_generations),
-            )
-            generated_chunks.append(generated_chunk)
-
-        if not generated_chunks:
-            return prompt_ids.new_empty((0, prompt_ids.size(1)), dtype=prompt_ids.dtype)
-        return torch.cat(generated_chunks, dim=0)
-
 
 class SGLangRolloutEngine(RolloutEngine):
     """HTTP rollout backend backed by an SGLang server."""
@@ -307,13 +312,45 @@ class SGLangRolloutEngine(RolloutEngine):
         shared_ckpt_path: str,
         timeout: int,
         generation_config_path: Optional[str],
+        max_retries: int,
+        retry_backoff_seconds: float,
+        retry_max_backoff_seconds: float,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.shared_ckpt_path = shared_ckpt_path
         self.timeout = timeout
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
+        self.retry_max_backoff_seconds = max(self.retry_backoff_seconds, float(retry_max_backoff_seconds))
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.http = requests
         self.generation_config = load_generation_config(generation_config_path)
+
+    def _request_with_retry(self, endpoint: str, payload: dict[str, Any]) -> Any:
+        """Execute an HTTP request with bounded retries and backoff."""
+
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.http.post(f"{self.base_url}/{endpoint.lstrip('/')}", json=payload, timeout=self.timeout)
+                response.raise_for_status()
+                return response.json()
+            except Exception as exc:  # pragma: no cover - network failure branch
+                last_error = exc
+                if attempt >= self.max_retries:
+                    break
+                delay = min(self.retry_backoff_seconds * (2 ** attempt), self.retry_max_backoff_seconds)
+                logger.warning(
+                    "SGLang request to %s failed on attempt %s/%s: %s; retrying in %.2fs",
+                    endpoint,
+                    attempt + 1,
+                    self.max_retries + 1,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+
+        raise RuntimeError(f"SGLang request to {endpoint} failed after {self.max_retries + 1} attempts") from last_error
 
     def _build_sampling_params(self) -> dict[str, object]:
         """Translate Transformers generation settings to SGLang sampling params."""
@@ -344,11 +381,11 @@ class SGLangRolloutEngine(RolloutEngine):
             "sampling_params": self._build_sampling_params(),
             "return_logprob": True,
         }
-        response = self.http.post(f"{self.base_url}/generate", json=payload, timeout=self.timeout)
-        response.raise_for_status()
-        results = response.json()
+        results = self._request_with_retry("generate", payload)
         if not isinstance(results, list):
             results = [results]
+        if len(results) != len(repeated_prompt_ids_list):
+            raise RuntimeError(f"SGLang returned {len(results)} generations, expected {len(repeated_prompt_ids_list)}.")
 
         completions, logprobs = [], []
         for result in results:
@@ -395,12 +432,7 @@ class SGLangRolloutEngine(RolloutEngine):
         if hasattr(unwrapped, "save_pretrained"):
             unwrapped.save_pretrained(str(target_path), state_dict=state_dict, safe_serialization=False)
         self.tokenizer.save_pretrained(str(target_path))
-        response = self.http.post(
-            f"{self.base_url}/update_weights_from_disk",
-            json={"model_path": str(target_path)},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
+        self._request_with_retry("update_weights_from_disk", {"model_path": str(target_path)})
 
 
 def truncate_completions(
@@ -461,6 +493,9 @@ def create_rollout_engine(
     sglang_model_path: Optional[str] = None,
     sglang_shared_path: Optional[str] = None,
     request_timeout: int = 120,
+    max_retries: int = 3,
+    retry_backoff_seconds: float = 2.0,
+    retry_max_backoff_seconds: float = 30.0,
     reward_model_config: Optional[RewardModelConfig] = None,
 ) -> RolloutEngine:
     """Build the configured rollout engine."""
@@ -481,6 +516,9 @@ def create_rollout_engine(
             shared_ckpt_path=sglang_shared_path or "./sglang_ckpt_grpo",
             timeout=request_timeout,
             generation_config_path=generation_config_path,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+            retry_max_backoff_seconds=retry_max_backoff_seconds,
         )
     if engine_type == "reward_model":
         if reward_model_config is None:

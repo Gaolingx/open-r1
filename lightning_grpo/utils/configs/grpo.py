@@ -98,6 +98,9 @@ class RolloutEngineConfig:
     sglang_model_path: Optional[str] = None
     sglang_shared_path: str = "./sglang_ckpt_grpo"
     request_timeout: int = 120
+    max_retries: int = 3
+    retry_backoff_seconds: float = 2.0
+    retry_max_backoff_seconds: float = 30.0
 
 
 @dataclass

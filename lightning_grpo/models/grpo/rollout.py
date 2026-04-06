@@ -27,6 +27,9 @@ class GRPORolloutCoordinator:
             sglang_model_path=config.rollout.engine.sglang_model_path,
             sglang_shared_path=config.rollout.engine.sglang_shared_path,
             request_timeout=config.rollout.engine.request_timeout,
+            max_retries=config.rollout.engine.max_retries,
+            retry_backoff_seconds=config.rollout.engine.retry_backoff_seconds,
+            retry_max_backoff_seconds=config.rollout.engine.retry_max_backoff_seconds,
             reward_model_config=config.reward.rlhf.reward_model,
         )
         self.reward_model_engine = None
