@@ -14,24 +14,12 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
 
-from lightning_grpo.utils.config import load_json_config
 from lightning_grpo.utils.configs.grpo import RewardModelConfig
+from lightning_grpo.utils.generation_config import load_generation_config
 from lightning_grpo.utils.modeling import DTYPE_MAP
 
 
 logger = logging.getLogger(__name__)
-
-
-def load_generation_config(config_path: str | None) -> GenerationConfig:
-    """Load rollout generation settings from a JSON config file."""
-
-    if not config_path:
-        return GenerationConfig(max_new_tokens=1024, do_sample=True, temperature=0.8, top_p=0.95)
-
-    config_data = dict(load_json_config(config_path))
-    config_data.pop("transformers_version", None)
-    return GenerationConfig(**config_data)
-
 
 def compute_per_token_logps(
     model: torch.nn.Module,
@@ -150,7 +138,7 @@ class PolicyRolloutEngine(RolloutEngine):
             model_input_ids,
             completion_ids.shape[1],
             attention_mask=model_attention_mask,
-            temperature=float(getattr(self.generation_config, "temperature", 1.0) or 1.0),
+            temperature=self.generation_config.temperature,
         )
         return RolloutResult(
             output_ids=model_input_ids,
@@ -170,11 +158,7 @@ class PolicyRolloutEngine(RolloutEngine):
     def _build_generation_config(self, num_generations: int) -> GenerationConfig:
         """Build the per-call generation config for local policy rollouts."""
 
-        generation_config = {
-            key: value
-            for key, value in self.generation_config.to_dict().items()
-            if key not in self._GENERATION_CONFIG_OVERRIDE_KEYS and value is not None
-        }
+        generation_config = self.generation_config.to_sampling_params(exclude_keys=self._GENERATION_CONFIG_OVERRIDE_KEYS)
         generation_config["num_return_sequences"] = num_generations
         generation_config.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         generation_config.setdefault("eos_token_id", self.tokenizer.eos_token_id)
@@ -355,11 +339,7 @@ class SGLangRolloutEngine(RolloutEngine):
     def _build_sampling_params(self) -> dict[str, object]:
         """Translate Transformers generation settings to SGLang sampling params."""
 
-        sampling_params = {
-            key: value
-            for key, value in self.generation_config.to_dict().items()
-            if key not in self._SAMPLING_CONFIG_EXCLUDE_KEYS and value is not None
-        }
+        sampling_params = self.generation_config.to_sampling_params(exclude_keys=self._SAMPLING_CONFIG_EXCLUDE_KEYS)
 
         eos_token_id = self.tokenizer.eos_token_id
         if eos_token_id is not None:

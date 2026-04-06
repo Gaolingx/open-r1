@@ -7,7 +7,8 @@ from typing import Any
 import torch
 from lightning.pytorch.utilities import rank_zero_info
 
-from lightning_grpo.models.rollout_engine import create_rollout_engine, load_generation_config
+from lightning_grpo.models.rollout_engine import create_rollout_engine
+from lightning_grpo.utils.generation_config import load_generation_config
 
 
 class GRPORolloutCoordinator:
@@ -101,7 +102,7 @@ class GRPORolloutCoordinator:
                     attention_mask=tokenized["attention_mask"],
                     num_return_sequences=1,
                     use_cache=True,
-                    generation_config=generation_config,
+                    generation_config=generation_config.to_generation_config(num_return_sequences=1),
                 )
                 completion = generated[:, tokenized["input_ids"].shape[1]:]
                 text = self.tokenizer.batch_decode(completion, skip_special_tokens=True)[0]

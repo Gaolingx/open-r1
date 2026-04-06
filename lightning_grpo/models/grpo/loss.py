@@ -15,10 +15,18 @@ from lightning_grpo.utils.modeling import collect_moe_metrics
 class GRPOLossComputer:
     """Compute GRPO loss and derived metrics."""
 
-    def __init__(self, module: Any, reward_manager: Any, metrics_aggregator: Any) -> None:
+    def __init__(
+        self,
+        module: Any,
+        reward_manager: Any,
+        metrics_aggregator: Any,
+        *,
+        rollout_temperature: float,
+    ) -> None:
         self.module = module
         self.reward_manager = reward_manager
         self.metrics_aggregator = metrics_aggregator
+        self.rollout_temperature = rollout_temperature
 
     def selective_log_softmax(self, logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
         log_probs = F.log_softmax(logits, dim=-1)
@@ -30,7 +38,7 @@ class GRPOLossComputer:
             input_ids,
             logits_to_keep,
             attention_mask=attention_mask,
-            temperature=float(getattr(self.module.rollout_coordinator.rollout_engine.generation_config, "temperature", 1.0) or 1.0),
+            temperature=self.rollout_temperature,
         )
 
     def compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
@@ -54,7 +62,7 @@ class GRPOLossComputer:
 
         outputs = self.module.policy(input_ids=model_input_ids, attention_mask=model_attention_mask, use_cache=False)
         logits = outputs.logits[:, :-1, :]
-        logits = logits[:, -logits_to_keep:, :] / self.module.config.rollout.temperature
+        logits = logits[:, -logits_to_keep:, :] / self.rollout_temperature
         per_token_logps = self.selective_log_softmax(logits, completion_ids)
         moe_metrics = collect_moe_metrics(outputs)
 

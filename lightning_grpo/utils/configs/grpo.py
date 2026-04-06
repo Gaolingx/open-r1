@@ -121,7 +121,6 @@ class RolloutConfig:
     num_generations_eval: int | None = None
     max_prompt_length: int = 2048
     generation_config_path: Optional[str] = None
-    temperature: float = 1.0
     kl_beta: float = 0.04
     epsilon: float = 0.2
     epsilon_high: float = 5.0

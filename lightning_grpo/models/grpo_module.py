@@ -15,6 +15,7 @@ from lightning_grpo.models.grpo import (
     GRPORewardManager,
     GRPORolloutCoordinator,
 )
+from lightning_grpo.utils.generation_config import load_generation_config
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.utils.modeling import count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer
 
@@ -35,10 +36,16 @@ class GRPOLightningModule(L.LightningModule):
         self.rollout_coordinator = GRPORolloutCoordinator(config, self.policy, self.tokenizer)
         self.rollout_engine = self.rollout_coordinator.rollout_engine
         self.reward_model_engine = self.rollout_coordinator.reward_model_engine
+        self.rollout_generation_config = load_generation_config(config.rollout.generation_config_path)
         self.reward_manager = GRPORewardManager(config, self.tokenizer, self.rollout_engine, self.reward_model_engine, self.device)
         self.register_buffer("reward_weights", self.reward_manager.reward_weight_tensor.clone(), persistent=False)
         self.metrics_aggregator = GRPOMetricsAggregator(self)
-        self.loss_computer = GRPOLossComputer(self, self.reward_manager, self.metrics_aggregator)
+        self.loss_computer = GRPOLossComputer(
+            self,
+            self.reward_manager,
+            self.metrics_aggregator,
+            rollout_temperature=self.rollout_generation_config.temperature,
+        )
         self.save_hyperparameters(config.to_dict())
 
         trainable, total = count_trainable_parameters(self.policy)
