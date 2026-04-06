@@ -7,8 +7,8 @@ from typing import Any
 import torch
 from lightning.pytorch.utilities import rank_zero_info
 
+from lightning_grpo.models.common import resolve_generation_config
 from lightning_grpo.models.rollout_engine import create_rollout_engine
-from lightning_grpo.utils.generation_config import load_generation_config
 
 
 class GRPORolloutCoordinator:
@@ -23,6 +23,7 @@ class GRPORolloutCoordinator:
             policy_model=policy,
             tokenizer=tokenizer,
             generation_config_path=config.rollout.generation_config_path,
+            model_config=policy.config,
             generation_batch_size=config.rollout.generation_batch_size,
             sglang_base_url=config.rollout.engine.sglang_base_url,
             sglang_model_path=config.rollout.engine.sglang_model_path,
@@ -93,7 +94,7 @@ class GRPORolloutCoordinator:
         try:
             generation_config = self.rollout_engine.generation_config
             if debug_config.generation_config_path is not None:
-                generation_config = load_generation_config(debug_config.generation_config_path)
+                generation_config = resolve_generation_config(debug_config.generation_config_path)
 
             for index, question in enumerate(debug_config.questions):
                 tokenized = self.tokenizer([question], return_tensors="pt", padding=True, truncation=True).to(device)
@@ -102,7 +103,7 @@ class GRPORolloutCoordinator:
                     attention_mask=tokenized["attention_mask"],
                     num_return_sequences=1,
                     use_cache=True,
-                    generation_config=generation_config.to_generation_config(num_return_sequences=1),
+                    generation_config=generation_config,
                 )
                 completion = generated[:, tokenized["input_ids"].shape[1]:]
                 text = self.tokenizer.batch_decode(completion, skip_special_tokens=True)[0]

@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional
 import lightning as L
 import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, PreTrainedModel, PreTrainedTokenizerBase
 from lightning.pytorch.utilities import rank_zero_info
 from transformers.configuration_utils import PreTrainedConfig
 
@@ -262,6 +262,7 @@ def export_configured_model(
     base_dir: str | Path,
     *,
     tokenizer: PreTrainedTokenizerBase | None = None,
+    generation_config: GenerationConfig | None = None,
 ) -> dict[str, Path]:
     """Export model artifacts according to config flags using standard directory names."""
 
@@ -283,6 +284,7 @@ def export_configured_model(
             model_config,
             hf_dir,
             tokenizer=tokenizer,
+            generation_config=generation_config,
             safe_serialization=True,
         )
         exported_paths["safetensors"] = hf_dir
@@ -300,6 +302,7 @@ def export_hf_model(
     export_dir: str | Path,
     *,
     tokenizer: PreTrainedTokenizerBase | None = None,
+    generation_config: GenerationConfig | None = None,
     state_dict: dict[str, torch.Tensor] | None = None,
     safe_serialization: bool = False,
 ) -> Path:
@@ -322,6 +325,8 @@ def export_hf_model(
         resolved_tokenizer = load_tokenizer(model_config)
     if resolved_tokenizer is not None:
         resolved_tokenizer.save_pretrained(str(export_path))
+    if generation_config is not None:
+        generation_config.save_pretrained(str(export_path))
 
     return export_path
 

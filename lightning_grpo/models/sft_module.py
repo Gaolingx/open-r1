@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.sft import SFTConfig
-from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats
+from lightning_grpo.models.common import build_optimizer, build_scheduler, resolve_generation_config, masked_token_stats
 from lightning_grpo.utils.modeling import count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
@@ -27,6 +27,7 @@ class SFTLightningModule(L.LightningModule):
         self.trainable_parameter_count = trainable
         self.total_parameter_count = total
         self.tokenizer = load_tokenizer(config.model) if config.model.tokenizer_name_or_path else None
+        self.export_generation_config = resolve_generation_config(config.generation_config_path, self.model.config)
 
     def forward(self, **batch: torch.Tensor) -> Any:
         """Forward tokens through the wrapped language model."""
@@ -107,6 +108,12 @@ class SFTLightningModule(L.LightningModule):
             return
 
         export_dir = self.config.output_dir + "/hf_final"
-        exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
+        exported_paths = export_configured_model(
+            self.model,
+            self.config.model,
+            export_dir,
+            tokenizer=self.tokenizer,
+            generation_config=self.export_generation_config,
+        )
         if exported_paths:
             rank_zero_info(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")

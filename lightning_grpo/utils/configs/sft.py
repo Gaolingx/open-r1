@@ -32,6 +32,7 @@ class SFTConfig(TrainingBaseConfig):
 
     task: Literal["sft"] = "sft"
     system_prompt: Optional[str] = None
+    generation_config_path: Optional[str] = None
     data: SFTDataConfig = field(default_factory=SFTDataConfig)
     label_smoothing: float = 0.0
     eval_generation_max_new_tokens: int = 256

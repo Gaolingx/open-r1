@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from transformers import GenerationConfig, PreTrainedConfig
 from transformers.optimization import get_scheduler
 
 from lightning_grpo.utils.configs.base import OptimizationConfig
@@ -183,3 +184,14 @@ def masked_token_stats(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, 
         "mean_logprob": mean_logprob,
         "perplexity": perplexity,
     }
+
+
+def resolve_generation_config(generation_config_path: str, model_config: PreTrainedConfig) -> GenerationConfig:
+    """Resolve the generation config that should be saved with final exports."""
+
+    if generation_config_path:
+        return GenerationConfig.from_pretrained(generation_config_path)
+    elif model_config:
+        return GenerationConfig.from_model_config(model_config)
+    else:
+        raise ValueError("generation_config must be provided when generation_config_path is empty")

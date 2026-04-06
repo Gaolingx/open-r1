@@ -8,14 +8,13 @@ import lightning as L
 import torch
 from lightning.pytorch.utilities import rank_zero_info
 
-from lightning_grpo.models.common import build_optimizer, build_scheduler
+from lightning_grpo.models.common import build_optimizer, build_scheduler, resolve_generation_config
 from lightning_grpo.models.grpo import (
     GRPOLossComputer,
     GRPOMetricsAggregator,
     GRPORewardManager,
     GRPORolloutCoordinator,
 )
-from lightning_grpo.utils.generation_config import load_generation_config
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.utils.modeling import count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer
 
@@ -36,7 +35,7 @@ class GRPOLightningModule(L.LightningModule):
         self.rollout_coordinator = GRPORolloutCoordinator(config, self.policy, self.tokenizer)
         self.rollout_engine = self.rollout_coordinator.rollout_engine
         self.reward_model_engine = self.rollout_coordinator.reward_model_engine
-        self.rollout_generation_config = load_generation_config(config.rollout.generation_config_path)
+        self.rollout_generation_config = resolve_generation_config(config.rollout.generation_config_path, self.model.config)
         self.reward_manager = GRPORewardManager(config, self.tokenizer, self.rollout_engine, self.reward_model_engine, self.device)
         self.register_buffer("reward_weights", self.reward_manager.reward_weight_tensor.clone(), persistent=False)
         self.metrics_aggregator = GRPOMetricsAggregator(self)
@@ -110,6 +109,12 @@ class GRPOLightningModule(L.LightningModule):
             return
 
         export_dir = self.config.output_dir + "/hf_final"
-        exported_paths = export_configured_model(self.policy, self.config.model, export_dir, tokenizer=self.tokenizer)
+        exported_paths = export_configured_model(
+            self.policy,
+            self.config.model,
+            export_dir,
+            tokenizer=self.tokenizer,
+            generation_config=self.rollout_generation_config.to_generation_config(),
+        )
         if exported_paths:
             rank_zero_info(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")
