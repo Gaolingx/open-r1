@@ -91,6 +91,49 @@ class EfficiencyMonitorCallback(Callback):
         pl_module.log("perf/batch_time_seconds", elapsed, on_step=True, sync_dist=True)
 
 
+class GlobalSampleCountCallback(Callback):
+    """Log the total number of global samples seen during training."""
+
+    def __init__(self, log_every_n_steps: int = 10, log_on_step: bool = True) -> None:
+        super().__init__()
+        self.log_every_n_steps = max(1, int(log_every_n_steps))
+        self.log_on_step = log_on_step
+        self.global_samples_seen: int = 0
+
+    @staticmethod
+    def _extract_batch_size(batch: Any) -> int:
+        if isinstance(batch, torch.Tensor):
+            return batch.size(0)
+        if isinstance(batch, dict):
+            if "attention_mask" in batch:
+                return batch["attention_mask"].size(0)
+            if "input_ids" in batch:
+                return batch["input_ids"].size(0)
+            for val in batch.values():
+                if isinstance(val, torch.Tensor):
+                    return val.size(0)
+        if isinstance(batch, (list, tuple)) and len(batch) > 0:
+            if isinstance(batch[0], torch.Tensor):
+                return batch[0].size(0)
+        return 1
+
+    def on_train_batch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        local_batch_size = self._extract_batch_size(batch)
+
+        self.global_samples_seen += local_batch_size * trainer.world_size
+
+        step = int(trainer.global_step)
+        if self.log_on_step and step > 0 and step % self.log_every_n_steps == 0:
+            pl_module.log("train/global_samples", float(self.global_samples_seen), on_step=True, sync_dist=False)
+
+
 class GradParamNormCallback(Callback):
     """Log global parameter/gradient L2 norms as training metrics."""
 
@@ -469,6 +512,7 @@ def build_callbacks(config: TrainingBaseConfig) -> list[Callback]:
         LearningRateMonitor(logging_interval="step"),
         LRandSchedulerOverrideCallback(config),
         EfficiencyMonitorCallback(log_every_n_steps=config.logging.log_every_n_steps),
+        GlobalSampleCountCallback(log_every_n_steps=config.logging.log_every_n_steps),
         GradParamNormCallback(log_every_n_steps=config.logging.log_every_n_steps),
         NaNLossCallback(),
         ConfigSnapshotCallback(config),

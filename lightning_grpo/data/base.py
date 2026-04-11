@@ -278,7 +278,7 @@ class BaseDataModule(LightningDataModule):
             shuffle=shuffle,
             num_workers=self.data_config.num_workers,
             collate_fn=collate_fn,
-            pin_memory=self.data_config.pin_memory,
+            pin_memory=True,
             drop_last=drop_last,
         )
 
