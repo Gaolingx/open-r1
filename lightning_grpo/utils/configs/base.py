@@ -82,6 +82,7 @@ class DataConfig:
     split_seed: int = 42
     max_seq_length: int = 4096
     num_workers: int = 4
+    pin_memory: bool = True
     preprocessing_batch_size: int = 256
     shuffle_buffer_size: int = 10000
     streaming: bool = False
