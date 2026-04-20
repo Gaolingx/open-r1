@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 import random
+import glob
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
@@ -124,10 +126,52 @@ def _load_single_dataset(source: DatasetSource, seed: int, cache_dir: str) -> Da
     return dataset
 
 
-def _load_local_json_datasets(files: list[str], cache_dir: str) -> Dataset:
-    """Load one or more local JSON/JSONL files as a single training split."""
+def _detect_and_load_dataset(file_path: str, cache_dir: str) -> Dataset:
+    """Load a dataset file with automatic format detection."""
 
-    datasets = [load_dataset("json", data_files=path, split="train", cache_dir=cache_dir) for path in files]
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+
+    format_map = {
+        '.parquet': 'parquet',
+        '.json': 'json',
+        '.jsonl': 'json',
+    }
+
+    if suffix not in format_map:
+        raise ValueError(f"Unsupported file format: {suffix}. Supported: {list(format_map.keys())}")
+
+    return load_dataset(
+        format_map[suffix],
+        data_files=str(path),
+        split="train",
+        cache_dir=cache_dir
+    )
+
+
+def _load_local_datasets(file_patterns: list[str], cache_dir: str) -> Dataset:
+    """Load multiple local datasets with format auto-detection and wildcard support."""
+
+    datasets = []
+
+    for pattern in file_patterns:
+        matched_files = glob.glob(pattern)
+
+        if not matched_files:
+            matched_files = [pattern]
+
+        for file_path in matched_files:
+            try:
+                dataset = _detect_and_load_dataset(file_path, cache_dir)
+                datasets.append(dataset)
+                print(f"Loaded: {file_path} ({len(dataset)} samples)")
+            except Exception as e:
+                print(f"Error loading {file_path}: {e}")
+                raise
+
+    if not datasets:
+        raise ValueError(f"No valid datasets found for patterns: {file_patterns}")
+
     return concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
 
 
@@ -152,11 +196,11 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
 
     if data_config.train_files:
         dataset_dict = DatasetDict({
-            data_config.train_split: _load_local_json_datasets(data_config.train_files, data_config.cache_dir)
+            data_config.train_split: _load_local_datasets(data_config.train_files, data_config.cache_dir)
         })
         if data_config.val_files:
             val_split_name = data_config.val_split or DEFAULT_VAL_SPLIT_NAME
-            dataset_dict[val_split_name] = _load_local_json_datasets(data_config.val_files, data_config.cache_dir)
+            dataset_dict[val_split_name] = _load_local_datasets(data_config.val_files, data_config.cache_dir)
     elif data_config.dataset_mixture:
         datasets = [
             _load_single_dataset(source, seed=data_config.split_seed, cache_dir=data_config.cache_dir)
