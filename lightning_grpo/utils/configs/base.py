@@ -211,9 +211,11 @@ class DistributedConfig:
     fsdp_cpu_offload: bool = False
     fsdp_activation_checkpointing: bool = True
     fsdp_sharding_strategy: Literal["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"] = "FULL_SHARD"
+    fsdp_backward_prefetch: Literal["BACKWARD_PRE", "BACKWARD_POST"] = "BACKWARD_PRE"
     fsdp_auto_wrap_policy_classes: list[str] = field(default_factory=list)
     fsdp_activation_checkpointing_policy_classes: list[str] = field(default_factory=list)
     fsdp_state_dict_type: Literal["full", "sharded"] = "full"
+    fsdp_specific_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

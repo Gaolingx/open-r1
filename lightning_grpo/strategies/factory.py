@@ -26,6 +26,18 @@ def _resolve_sharding_strategy(name: str) -> ShardingStrategy:
     return mapping[name]
 
 
+def _resolve_backward_prefetch_strategy(name: str) -> BackwardPrefetch:
+    """Map string configuration to an FSDP backward prefetch strategy."""
+
+    mapping = {
+        "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
+        "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
+    }
+    if name not in mapping:
+        raise ValueError(f"Unsupported FSDP backward prefetch strategy: {name}")
+    return mapping[name]
+
+
 def _import_module_class(path: str) -> type[Module]:
     """Import a module class from a fully-qualified dotted path."""
 
@@ -87,8 +99,9 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | FSDPStrateg
             auto_wrap_policy=auto_wrap_policy,
             activation_checkpointing_policy=activation_checkpointing_policy,
             sharding_strategy=_resolve_sharding_strategy(config.fsdp_sharding_strategy),
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            backward_prefetch=_resolve_backward_prefetch_strategy(config.fsdp_backward_prefetch),
             state_dict_type=config.fsdp_state_dict_type,
+            **config.fsdp_specific_kwargs,
         )
     raise ValueError(f"Unknown distributed strategy: {config.strategy}")
 
