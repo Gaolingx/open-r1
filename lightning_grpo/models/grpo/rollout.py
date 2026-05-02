@@ -65,6 +65,7 @@ class GRPORolloutCoordinator:
 
         repeated_prompts = [prompt for prompt in batch["prompt_text"] for _ in range(num_generations)]
         repeated_metadata = [meta for meta in batch["metadata"] for _ in range(num_generations)]
+        repeated_sample_ids = batch["sample_id"].to(rollout.prompt_ids.device).repeat_interleave(num_generations)
 
         return {
             "prompt_ids": rollout.prompt_ids,
@@ -78,6 +79,7 @@ class GRPORolloutCoordinator:
             "completions": structured_completions,
             "completion_id_lists": rollout.completion_id_lists,
             "metadata": repeated_metadata,
+            "sample_ids": repeated_sample_ids,
         }
 
     @torch.no_grad()

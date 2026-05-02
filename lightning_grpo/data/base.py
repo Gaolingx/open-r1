@@ -227,12 +227,15 @@ def map_dataset_with_config(
     preprocess_fn: Callable[[dict[str, list[Any]]], dict[str, list[Any]]],
     data_config: DataConfig,
     desc: str,
+    *,
+    with_indices: bool = False,
 ) -> Dataset:
     """Apply a batched dataset transform using shared preprocessing settings."""
 
     return dataset.map(
         preprocess_fn,
         batched=True,
+        with_indices=with_indices,
         batch_size=data_config.preprocessing_batch_size,
         num_proc=None if data_config.streaming else data_config.num_workers,
         remove_columns=list(dataset.column_names),
@@ -300,10 +303,18 @@ class BaseDataModule(LightningDataModule):
         dataset: Dataset,
         preprocess_fn: Callable[[dict[str, list[Any]]], dict[str, list[Any]]],
         desc: str,
+        *,
+        with_indices: bool = False,
     ) -> Dataset:
         """Apply a shared batched dataset preprocessing transform."""
 
-        return map_dataset_with_config(dataset, preprocess_fn, self.data_config, desc)
+        return map_dataset_with_config(
+            dataset,
+            preprocess_fn,
+            self.data_config,
+            desc,
+            with_indices=with_indices,
+        )
 
     def _build_dataloader(
         self,

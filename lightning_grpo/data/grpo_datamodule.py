@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from datasets import Dataset
+import torch
 from transformers import PreTrainedTokenizerBase
 
 from lightning_grpo.utils.configs.base import DataConfig, ModelConfig, OptimizationConfig
@@ -44,6 +45,7 @@ class GRPORolloutCollator:
             "attention_mask": tokenized["attention_mask"],
             "prompt_text": prompts,
             "metadata": [item.get("metadata", {}) for item in batch],
+            "sample_id": torch.tensor([int(item["sample_id"]) for item in batch], dtype=torch.long),
         }
 
 
@@ -81,7 +83,7 @@ class GRPODataModule(ChatTemplateDataModule):
     def _prepare_prompt_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
         """Build prompt text plus reward metadata for online optimization."""
 
-        def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        def preprocess_batch(batch: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
             prompt_texts: list[str] = []
             metadata: list[dict[str, Any]] = []
             for sample in self.iter_batch_samples(batch):
@@ -98,9 +100,14 @@ class GRPODataModule(ChatTemplateDataModule):
                     for key, value in sample.items()
                     if key != self.data_config.messages_column
                 })
-            return {"prompt_text": prompt_texts, "metadata": metadata}
+            return {"prompt_text": prompt_texts, "metadata": metadata, "sample_id": indices}
 
-        return self.map_dataset(dataset, preprocess_batch, desc="Formatting GRPO prompts")
+        return self.map_dataset(
+            dataset,
+            preprocess_batch,
+            desc="Formatting GRPO prompts",
+            with_indices=True,
+        )
 
     def train_dataloader(self):
         """Build the training prompt dataloader."""

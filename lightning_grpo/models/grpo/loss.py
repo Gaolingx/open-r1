@@ -48,6 +48,51 @@ class GRPOLossComputer:
         grouped_advantages = (grouped_rewards - grouped_mean) / (grouped_std + self.module.config.rollout.advantage_epsilon)
         return grouped_advantages.reshape(-1)
 
+    def normalize_grouped_advantages(
+        self,
+        *,
+        local_rewards: torch.Tensor,
+        global_rewards: torch.Tensor,
+        local_sample_ids: torch.Tensor,
+        global_sample_ids: torch.Tensor,
+        num_generations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize rewards by prompt groups gathered across all ranks.
+
+        The rollout sampler repeats each prompt `num_generations` times. In distributed
+        training those repeats can be split across GPUs, so local-only normalization can
+        mix incomplete groups or compute a different mean/std per rank. Following TRL's
+        GRPO flow, compute advantages from the globally gathered reward vector and slice
+        the current rank's contiguous shard back for loss computation.
+        """
+
+        if global_rewards.numel() % num_generations != 0:
+            raise ValueError(
+                f"Global rollout batch ({global_rewards.numel()}) must be divisible by num_generations "
+                f"({num_generations}) so prompt groups can be normalized correctly."
+            )
+
+        grouped_sample_ids = global_sample_ids.view(-1, num_generations)
+        if not torch.all(grouped_sample_ids == grouped_sample_ids[:, :1]):
+            raise RuntimeError(
+                "Distributed GRPO prompt groups are not contiguous after gather. "
+                "Each prompt must contribute exactly num_generations completions before advantage normalization."
+            )
+
+        global_advantages = self.compute_advantages(global_rewards, num_generations)
+        local_batch_size = local_rewards.numel()
+        process_index = getattr(getattr(self.module, "trainer", None), "global_rank", 0)
+        start = process_index * local_batch_size
+        end = start + local_batch_size
+        local_advantages = global_advantages[start:end]
+        expected_sample_ids = global_sample_ids[start:end].to(local_sample_ids.device)
+        if local_advantages.numel() != local_batch_size or not torch.equal(expected_sample_ids, local_sample_ids):
+            raise RuntimeError(
+                "Failed to recover this rank's advantages from the gathered reward tensor. "
+                "Ensure every rank receives the same local rollout batch size."
+            )
+        return local_advantages, global_advantages
+
     def compute_loss(self, rollout_batch: dict[str, torch.Tensor | list[Any]], *, training: bool) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         prompt_ids = rollout_batch["prompt_ids"]
         prompt_mask = rollout_batch["prompt_mask"]
@@ -55,6 +100,7 @@ class GRPOLossComputer:
         completion_mask = rollout_batch["completion_mask"]
         old_per_token_logps = rollout_batch["old_per_token_logps"]
         completion_truncated = rollout_batch["completion_truncated"]
+        sample_ids = rollout_batch["sample_ids"]
 
         model_input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
@@ -84,10 +130,17 @@ class GRPOLossComputer:
             metadata=rollout_batch["metadata"],
         )
         global_rewards_per_func = self.metrics_aggregator.gather_tensor(rewards_per_func.detach())
+        global_sample_ids = self.metrics_aggregator.gather_tensor(sample_ids.detach())
         num_generations = self.module.rollout_coordinator.resolve_num_generations(training)
         global_rewards = (global_rewards_per_func * self.module.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
-        global_advantages = self.compute_advantages(global_rewards, num_generations)
-        advantages = self.compute_advantages(rewards, num_generations).unsqueeze(1)
+        local_advantages, global_advantages = self.normalize_grouped_advantages(
+            local_rewards=rewards.detach(),
+            global_rewards=global_rewards,
+            local_sample_ids=sample_ids.detach(),
+            global_sample_ids=global_sample_ids,
+            num_generations=num_generations,
+        )
+        advantages = local_advantages.to(per_token_logps.device).unsqueeze(1)
 
         log_ratio = per_token_logps - old_per_token_logps
         importance_ratio = torch.exp(log_ratio)
