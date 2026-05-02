@@ -5,7 +5,7 @@
   "added_tokens": [
     {
       "id": 0,
-      "content": "<unk>",
+      "content": "<|endoftext|>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -14,7 +14,7 @@
     },
     {
       "id": 1,
-      "content": "<s>",
+      "content": "<|im_start|>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -23,12 +23,66 @@
     },
     {
       "id": 2,
-      "content": "</s>",
+      "content": "<|im_end|>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
       "normalized": false,
       "special": true
+    },
+    {
+      "id": 32000,
+      "content": "<tool_call>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 32001,
+      "content": "</tool_call>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 32002,
+      "content": "<tool_response>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 32003,
+      "content": "</tool_response>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 32004,
+      "content": "<think>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
+    },
+    {
+      "id": 32005,
+      "content": "</think>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": false
     }
   ],
   "normalizer": null,
@@ -43,7 +97,7 @@
     "single": [
       {
         "SpecialToken": {
-          "id": "<s>",
+          "id": "<|im_start|>",
           "type_id": 0
         }
       },
@@ -57,7 +111,7 @@
     "pair": [
       {
         "SpecialToken": {
-          "id": "<s>",
+          "id": "<|im_start|>",
           "type_id": 0
         }
       },
@@ -69,7 +123,7 @@
       },
       {
         "SpecialToken": {
-          "id": "<s>",
+          "id": "<|im_start|>",
           "type_id": 1
         }
       },
@@ -81,13 +135,13 @@
       }
     ],
     "special_tokens": {
-      "<s>": {
-        "id": "<s>",
+      "<|im_start|>": {
+        "id": "<|im_start|>",
         "ids": [
           1
         ],
         "tokens": [
-          "<s>"
+          "<|im_start|>"
         ]
       }
     }
@@ -119,16 +173,16 @@
   "model": {
     "type": "BPE",
     "dropout": null,
-    "unk_token": "<unk>",
+    "unk_token": null,
     "continuing_subword_prefix": null,
     "end_of_word_suffix": null,
-    "fuse_unk": true,
+    "fuse_unk": false,
     "byte_fallback": true,
     "ignore_merges": false,
     "vocab": {
-      "<unk>": 0,
-      "<s>": 1,
-      "</s>": 2,
+      "<|endoftext|>": 0,
+      "<|im_start|>": 1,
+      "<|im_end|>": 2,
       "<0x00>": 3,
       "<0x01>": 4,
       "<0x02>": 5,
@@ -32125,7 +32179,13 @@
       "執": 31996,
       "벨": 31997,
       "ゼ": 31998,
-      "梦": 31999
+      "梦": 31999,
+      "<tool_call>": 32000,
+      "</tool_call>": 32001,
+      "<tool_response>": 32002,
+      "</tool_response>": 32003,
+      "<think>": 32004,
+      "</think>": 32005
     },
     "merges": [
       "▁ t",
