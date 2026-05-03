@@ -21,7 +21,7 @@ from lightning_grpo.utils.modeling import load_tokenizer
 
 
 class SFTBatchCollator:
-    """Pad tokenized SFT samples into dense training batches."""
+    """Causal LM collator for pre-tokenized SFT samples."""
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self.tokenizer = tokenizer
@@ -30,8 +30,11 @@ class SFTBatchCollator:
         """Collate a list of tokenized examples."""
 
         input_ids = [torch.tensor(item["input_ids"], dtype=torch.long) for item in batch]
-        attention_mask = [torch.tensor(item["attention_mask"], dtype=torch.long) for item in batch]
         labels = [torch.tensor(item["labels"], dtype=torch.long) for item in batch]
+        if "attention_mask" in batch[0]:
+            attention_mask = [torch.tensor(item["attention_mask"], dtype=torch.long) for item in batch]
+        else:
+            attention_mask = [torch.ones_like(ids) for ids in input_ids]
 
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
@@ -111,15 +114,15 @@ class SFTDataModule(ChatTemplateDataModule):
         return [bool(value) for value in raw_mask]
 
     @staticmethod
-    def _build_labels_from_assistant_mask(full_ids: list[int], assistant_mask: list[bool]) -> list[int]:
-        """Keep loss only on assistant tokens across all assistant turns."""
+    def _labels_from_mask(full_ids: list[int], assistant_mask: list[bool]) -> list[int]:
+        """Keep loss only on tokens selected by a tokenizer-provided mask."""
 
         if len(assistant_mask) != len(full_ids):
             raise RuntimeError("Assistant token mask length does not match tokenized input length.")
         return [token_id if mask else -100 for token_id, mask in zip(full_ids, assistant_mask)]
 
     @staticmethod
-    def _build_labels_from_last_assistant_mask(
+    def _labels_from_last_assistant_mask(
         full_ids: list[int],
         assistant_mask: list[bool],
         prompt_len: int,
@@ -129,9 +132,12 @@ class SFTDataModule(ChatTemplateDataModule):
         if len(assistant_mask) != len(full_ids):
             raise RuntimeError("Assistant token mask length does not match tokenized input length.")
         prompt_len = min(prompt_len, len(full_ids))
-        return [token_id if mask and index >= prompt_len else -100 for index, (token_id, mask) in enumerate(zip(full_ids, assistant_mask))]
+        return [
+            token_id if mask and index >= prompt_len else -100
+            for index, (token_id, mask) in enumerate(zip(full_ids, assistant_mask))
+        ]
 
-    def _tokenize_chat_messages(
+    def _apply_chat_template_tokenize(
         self,
         messages: list[dict[str, Any]],
         tools: Any,
@@ -139,7 +145,7 @@ class SFTDataModule(ChatTemplateDataModule):
         add_generation_prompt: bool,
         return_assistant_tokens_mask: bool = False,
     ) -> dict[str, Any] | None:
-        """Tokenize chat messages via tokenizer templates when supported."""
+        """Tokenize chat messages with tokenizer templates when supported."""
 
         if not hasattr(self.tokenizer, "apply_chat_template"):
             return None
@@ -162,34 +168,56 @@ class SFTDataModule(ChatTemplateDataModule):
             return tokenized
         return {"input_ids": list(tokenized), "attention_mask": [1] * len(tokenized)}
 
-    def _build_labels_from_prompt_completion(
+    def _render_chat_tokenize(
         self,
         messages: list[dict[str, Any]],
         tools: Any,
-        full_ids: list[int],
-    ) -> list[int]:
-        """Mask prompt tokens while keeping completion tokens trainable."""
+        *,
+        add_generation_prompt: bool,
+    ) -> dict[str, list[int]]:
+        """Render chat text then tokenize it, matching the shared GRPO/pretrain abstractions."""
 
-        prompt_messages, _ = self._split_prompt_and_completion(messages)
-        prompt_text = apply_chat_template(
+        text = apply_chat_template(
             tokenizer=self.tokenizer,
-            messages=prompt_messages,
-            add_generation_prompt=self._should_add_generation_prompt(prompt_messages),
+            messages=messages,
+            add_generation_prompt=add_generation_prompt,
             tools=tools,
         )
-        prompt_text = postprocess_chat_text(prompt_text)
-        prompt_tokenized = self.tokenizer(
-            prompt_text,
+        text = postprocess_chat_text(text)
+        tokenized = self.tokenizer(
+            text,
             truncation=True,
             max_length=self.data_config.max_seq_length,
             padding=False,
             add_special_tokens=False,
         )
-        prompt_ids = list(prompt_tokenized["input_ids"])
-        prompt_len = min(len(prompt_ids), len(full_ids))
-        return [-100] * prompt_len + full_ids[prompt_len:]
+        return {
+            "input_ids": list(tokenized["input_ids"]),
+            "attention_mask": list(tokenized["attention_mask"]),
+        }
 
-    def _build_labels_for_mode(
+    def _prompt_token_count(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Any,
+    ) -> int:
+        """Tokenize the prompt prefix used by completion-only supervision."""
+
+        prompt_messages, _ = self._split_prompt_and_completion(messages)
+        processed = self._apply_chat_template_tokenize(
+            prompt_messages,
+            tools,
+            add_generation_prompt=self._should_add_generation_prompt(prompt_messages),
+        )
+        if processed is None:
+            processed = self._render_chat_tokenize(
+                prompt_messages,
+                tools,
+                add_generation_prompt=self._should_add_generation_prompt(prompt_messages),
+            )
+        return len(processed["input_ids"])
+
+    def _build_labels(
         self,
         messages: list[dict[str, Any]],
         tools: Any,
@@ -203,28 +231,47 @@ class SFTDataModule(ChatTemplateDataModule):
             return list(full_ids)
 
         assistant_mask = self._extract_assistant_mask(processed or {}) if processed is not None else []
+        if assistant_mask and label_mode == "all_assistant":
+            return self._labels_from_mask(full_ids, assistant_mask)
+        if assistant_mask and label_mode == "last_assistant":
+            return self._labels_from_last_assistant_mask(
+                full_ids,
+                assistant_mask,
+                self._prompt_token_count(messages, tools),
+            )
         if label_mode == "all_assistant":
-            if assistant_mask:
-                return self._build_labels_from_assistant_mask(full_ids, assistant_mask)
             raise RuntimeError(
                 "label_mode='all_assistant' requires tokenizer support for assistant token masks."
             )
 
-        if assistant_mask:
-            prompt_messages, _ = self._split_prompt_and_completion(messages)
-            prompt_processed = self._tokenize_chat_messages(
-                prompt_messages,
-                tools,
-                add_generation_prompt=self._should_add_generation_prompt(prompt_messages),
-            )
-            if prompt_processed is None:
-                raise RuntimeError(
-                    "label_mode='last_assistant' requires chat-template tokenization support when using assistant token masks."
-                )
-            prompt_ids = list(prompt_processed["input_ids"])
-            return self._build_labels_from_last_assistant_mask(full_ids, assistant_mask, len(prompt_ids))
+        prompt_len = min(self._prompt_token_count(messages, tools), len(full_ids))
+        return [-100] * prompt_len + full_ids[prompt_len:]
 
-        return self._build_labels_from_prompt_completion(messages, tools, full_ids)
+    def _tokenize_sample(
+        self,
+        sample: dict[str, Any],
+        label_mode: Literal["all_tokens", "last_assistant", "all_assistant"],
+    ) -> dict[str, list[int]]:
+        """Format one dataset row into token ids and SFT labels."""
+
+        messages, tools = normalize_conversation_messages(sample["messages"])
+        messages = preprocess_chat_messages(messages)
+        add_generation_prompt = self._should_add_generation_prompt(messages)
+        needs_assistant_mask = label_mode in {"last_assistant", "all_assistant"}
+
+        processed = self._apply_chat_template_tokenize(
+            messages,
+            tools,
+            add_generation_prompt=add_generation_prompt,
+            return_assistant_tokens_mask=needs_assistant_mask,
+        )
+        if processed is None:
+            processed = self._render_chat_tokenize(messages, tools, add_generation_prompt=add_generation_prompt)
+
+        input_ids = list(processed["input_ids"])
+        attention_mask = list(processed.get("attention_mask", [1] * len(input_ids)))
+        labels = self._build_labels(messages, tools, input_ids, processed, label_mode)
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
     def _tokenize_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
         """Convert dataset rows into tokenized causal language modeling samples."""
@@ -232,57 +279,12 @@ class SFTDataModule(ChatTemplateDataModule):
         def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
             samples = [formatter(sample) for sample in self.iter_batch_samples(batch)]
             label_mode = self.data_config.label_mode
-
-            input_ids_batch: list[list[int]] = []
-            attention_mask_batch: list[list[int]] = []
-            labels_batch: list[list[int]] = []
-
-            for sample in samples:
-                raw_messages = sample["messages"]
-                messages, tools = normalize_conversation_messages(raw_messages)
-                messages = preprocess_chat_messages(messages)
-                add_generation_prompt = self._should_add_generation_prompt(messages)
-
-                processed = None
-                if label_mode in {"last_assistant", "all_assistant"}:
-                    processed = self._tokenize_chat_messages(
-                        messages,
-                        tools,
-                        add_generation_prompt=add_generation_prompt,
-                        return_assistant_tokens_mask=True,
-                    )
-
-                if processed is not None:
-                    full_ids = list(processed["input_ids"])
-                    attention_mask = list(processed.get("attention_mask", [1] * len(full_ids)))
-                else:
-                    full_text = apply_chat_template(
-                        tokenizer=self.tokenizer,
-                        messages=messages,
-                        add_generation_prompt=add_generation_prompt,
-                        tools=tools,
-                    )
-                    full_text = postprocess_chat_text(full_text)
-                    full_tokenized = self.tokenizer(
-                        full_text,
-                        truncation=True,
-                        max_length=self.data_config.max_seq_length,
-                        padding=False,
-                        add_special_tokens=False,
-                    )
-                    full_ids = list(full_tokenized["input_ids"])
-                    attention_mask = list(full_tokenized["attention_mask"])
-
-                labels = self._build_labels_for_mode(messages, tools, full_ids, processed, label_mode)
-
-                input_ids_batch.append(full_ids)
-                attention_mask_batch.append(attention_mask)
-                labels_batch.append(labels)
+            tokenized_samples = [self._tokenize_sample(sample, label_mode) for sample in samples]
 
             return {
-                "input_ids": input_ids_batch,
-                "attention_mask": attention_mask_batch,
-                "labels": labels_batch,
+                "input_ids": [sample["input_ids"] for sample in tokenized_samples],
+                "attention_mask": [sample["attention_mask"] for sample in tokenized_samples],
+                "labels": [sample["labels"] for sample in tokenized_samples],
             }
 
         return self.map_dataset(dataset, preprocess_batch, desc="Tokenizing SFT dataset")
