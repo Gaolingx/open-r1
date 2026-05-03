@@ -71,7 +71,7 @@ def build_trainer(config: TrainingBaseConfig) -> L.Trainer:
         config.distributed,
         config.precision,
     )
-    has_validation_data = bool(config.data.val_files or config.data.val_split)
+    val_check_interval = config.val_check_interval if config.val_check_interval > 0 else None
 
     return L.Trainer(
         default_root_dir=config.output_dir,
@@ -82,8 +82,6 @@ def build_trainer(config: TrainingBaseConfig) -> L.Trainer:
         log_every_n_steps=config.logging.log_every_n_steps,
         callbacks=build_callbacks(config),
         logger=build_loggers(config),
-        val_check_interval=config.val_check_interval,
-        limit_val_batches=0 if not has_validation_data else None,
-        num_sanity_val_steps=0 if not has_validation_data else None,
+        val_check_interval=val_check_interval,
         **strategy_kwargs,
     )

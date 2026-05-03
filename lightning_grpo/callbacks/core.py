@@ -284,104 +284,66 @@ class PeriodicSampleGenerationCallback(Callback):
     """Generate text samples during training for qualitative inspection."""
 
     def __init__(self, logging_config: LoggingConfig, model_config: ModelConfig) -> None:
+        super().__init__()
         self.logging_config = logging_config
         self.tokenizer = load_tokenizer(model_config)
         self.rollout_engine: PolicyRolloutEngine | None = None
+        self.last_sample_step: int = -1
 
-    @staticmethod
-    def _extract_generations(decoded_sequences: list[str], prompts: list[str]) -> list[str]:
-        """Strip prompt prefixes from decoded full sequences when possible."""
+    def _ensure_rollout_engine(self, pl_module: L.LightningModule) -> PolicyRolloutEngine | None:
+        """Create or refresh the in-process rollout engine for the current policy."""
 
-        generations: list[str] = []
-        for prompt, text in zip(prompts, decoded_sequences):
-            if text.startswith(prompt):
-                generations.append(text[len(prompt):].lstrip())
-            else:
-                generations.append(text)
-        return generations
+        model = resolve_export_model(pl_module)
+        if model is None:
+            return None
 
-    @staticmethod
-    def _resolve_logger_collection(trainer: L.Trainer) -> list[Any]:
-        """Return all attached logger instances as a flat list."""
+        model_config = getattr(model, "config", None)
+        if self.rollout_engine is None:
+            self.rollout_engine = PolicyRolloutEngine(
+                policy_model=model,
+                tokenizer=self.tokenizer,
+                generation_config_path=self.logging_config.sample_generation_config_path,
+                model_config=model_config,
+            )
+        else:
+            self.rollout_engine.update_policy(model)
+        return self.rollout_engine
 
-        if trainer.loggers:
-            return list(trainer.loggers)
-        if trainer.logger is None:
-            return []
-        return [trainer.logger]
+    def _write_csv_samples(self, logger: CSVLogger, rows: list[dict[str, Any]]) -> None:
+        """Append generated samples to a CSV file under the CSV logger directory."""
 
-    def _log_samples_to_loggers(
-        self,
-        trainer: L.Trainer,
-        rows: list[dict[str, Any]],
-        sample_path: Path,
-    ) -> None:
-        """Push sample generations to configured experiment loggers."""
+        csv_path = Path(logger.log_dir) / "sample_generations.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not csv_path.exists()
+        with csv_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["step", "prompt_index", "prompt", "completion"])
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
 
-        loggers = self._resolve_logger_collection(trainer)
-        if not loggers:
+    def _write_wandb_samples(self, logger: WandbLogger, rows: list[dict[str, Any]], step: int) -> None:
+        """Log generated samples as a W&B table when W&B is enabled."""
+
+        try:
+            import wandb
+        except ImportError:
+            rank_zero_info("[PeriodicSampleGenerationCallback] wandb is not installed; skipping sample table logging.")
             return
 
-        preview_lines = [
-            f"[{index}] prompt: {row['prompt']}\n[{index}] generation: {row['generation']}"
-            for index, row in enumerate(rows)
-        ]
-        preview_text = "\n\n".join(preview_lines)
-        base_metrics = {
-            "samples/count": float(len(rows)),
-            "samples/path": str(sample_path),
-        }
+        table = wandb.Table(columns=["step", "prompt_index", "prompt", "completion"])
+        for row in rows:
+            table.add_data(row["step"], row["prompt_index"], row["prompt"], row["completion"])
+        logger.experiment.log({"samples/generations": table}, step=step)
 
-        for logger in loggers:
-            logger.log_metrics(base_metrics, step=trainer.global_step)
+    def _log_samples(self, trainer: L.Trainer, rows: list[dict[str, Any]], step: int) -> None:
+        """Print samples and persist them to supported loggers."""
 
-            experiment = getattr(logger, "experiment", None)
-            if isinstance(logger, WandbLogger) and experiment is not None:
-                try:
-                    import wandb
-
-                    experiment.log(
-                        {
-                            "samples/table": wandb.Table(
-                                columns=["step", "prompt", "generation", "path"],
-                                data=[
-                                    [trainer.global_step, row["prompt"], row["generation"], str(sample_path)]
-                                    for row in rows
-                                ],
-                            ),
-                            "samples/text": preview_text,
-                        },
-                        step=trainer.global_step,
-                    )
-                except Exception as exc:  # pragma: no cover - logger-specific best effort path
-                    rank_zero_info(f"[PeriodicSampleGenerationCallback] Failed to log samples to Weights & Biases: {exc}")
-            elif isinstance(logger, CSVLogger):
-                self._append_samples_csv(logger.log_dir, trainer.global_step, rows, sample_path)
-            elif experiment is not None:
-                add_text = getattr(experiment, "add_text", None)
-                if callable(add_text):
-                    add_text("samples/text", preview_text, global_step=trainer.global_step)
-
-    @staticmethod
-    def _append_samples_csv(log_dir: str, step: int, rows: list[dict[str, Any]], sample_path: Path) -> None:
-        """Persist sample rows under the CSV logger directory for easy inspection."""
-
-        csv_path = Path(log_dir) / "sample_generations.csv"
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        file_exists = csv_path.exists()
-        with csv_path.open("a", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["step", "prompt", "generation", "path"])
-            if not file_exists:
-                writer.writeheader()
-            for row in rows:
-                writer.writerow(
-                    {
-                        "step": step,
-                        "prompt": row["prompt"],
-                        "generation": row["generation"],
-                        "path": str(sample_path),
-                    }
-                )
+        loggers = trainer.loggers if isinstance(trainer.loggers, list) else [trainer.logger]
+        for logger in [item for item in loggers if item is not None]:
+            if isinstance(logger, CSVLogger):
+                self._write_csv_samples(logger, rows)
+            elif isinstance(logger, WandbLogger):
+                self._write_wandb_samples(logger, rows, step)
 
     @rank_zero_only
     def on_train_batch_end(
@@ -389,30 +351,37 @@ class PeriodicSampleGenerationCallback(Callback):
         trainer: L.Trainer,
         pl_module: L.LightningModule,
         outputs: Any,
-        batch: dict[str, Any],
+        batch: Any,
         batch_idx: int,
     ) -> None:
-        """Generate periodic sample completions and save them to disk."""
+        """Periodically switch to inference mode and generate configured samples."""
 
-        every_n_steps = self.logging_config.sample_every_n_steps
-        if every_n_steps <= 0 or not self.logging_config.sample_prompts:
+        step = int(trainer.global_step)
+        every_n_steps = max(1, int(self.logging_config.sample_every_n_steps))
+        if step <= 0 or step == self.last_sample_step or step % every_n_steps != 0:
             return
-        if trainer.global_step == 0 or trainer.global_step % every_n_steps != 0:
+
+        rollout_engine = self._ensure_rollout_engine(pl_module)
+        if rollout_engine is None:
+            rank_zero_info("[PeriodicSampleGenerationCallback] No exportable model found; skipping sample generation.")
             return
+
+        prompts = list(self.logging_config.sample_prompts)
+        if not prompts:
+            return
+
+        tokenized = self.tokenizer(prompts, padding=True, return_tensors="pt")
+        device = pl_module.device
+        prompt_ids = tokenized["input_ids"].to(device)
+        attention_mask = tokenized["attention_mask"].to(device)
 
         model = resolve_export_model(pl_module)
-        if model is None:
-            return
-
-        prompts = self.logging_config.sample_prompts
-        tokenized = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-        prompt_ids = tokenized["input_ids"].to(pl_module.device)
-        attention_mask = tokenized["attention_mask"].to(pl_module.device)
-
-        rollout_engine = self._get_rollout_engine(model)
-        was_training = model.training
-        if hasattr(model, "eval"):
+        was_training = bool(model.training) if model is not None else bool(pl_module.training)
+        if model is not None:
             model.eval()
+        else:
+            pl_module.eval()
+
         try:
             with torch.inference_mode():
                 rollout = rollout_engine.rollout(
@@ -421,41 +390,23 @@ class PeriodicSampleGenerationCallback(Callback):
                     num_generations=1,
                 )
         finally:
-            if was_training and hasattr(model, "train"):
-                model.train()
+            if was_training:
+                if model is not None:
+                    model.train()
+                else:
+                    pl_module.train()
 
-        texts = rollout.completions_text
-        decoded_sequences = self.tokenizer.batch_decode(rollout.output_ids, skip_special_tokens=True)
-        output_dir = Path(trainer.default_root_dir) / "samples"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        sample_path = output_dir / f"step-{trainer.global_step:08d}.json"
-        payload = {
-            "step": trainer.global_step,
-            "timestamp": time.time(),
-            "samples": [
-                {
-                    "prompt": prompt,
-                    "generation": generation,
-                    "full_text": full_text,
-                }
-                for prompt, generation, full_text in zip(prompts, texts, decoded_sequences)
-            ],
-        }
-        save_json_config(payload, sample_path)
-        self._log_samples_to_loggers(trainer, payload["samples"], sample_path)
-
-    def _get_rollout_engine(self, model: torch.nn.Module) -> PolicyRolloutEngine:
-        """Lazily build and refresh the local rollout engine for sample logging."""
-
-        if self.rollout_engine is None:
-            self.rollout_engine = PolicyRolloutEngine(
-                policy_model=model,
-                tokenizer=self.tokenizer,
-                generation_config_path=self.logging_config.sample_generation_config_path,
-            )
-        else:
-            self.rollout_engine.update_policy(model)
-        return self.rollout_engine
+        rows = [
+            {
+                "step": step,
+                "prompt_index": index,
+                "prompt": prompt,
+                "completion": completion,
+            }
+            for index, (prompt, completion) in enumerate(zip(prompts, rollout.completions_text))
+        ]
+        self._log_samples(trainer, rows, step)
+        self.last_sample_step = step
 
 
 class NaNLossCallback(Callback):
