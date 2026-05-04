@@ -13,6 +13,7 @@ class PretrainDataConfig(DataConfig):
     """Dataset configuration used by plain text pretraining."""
 
     text_column: str = "text"
+    ignore_index: int = -100
 
 
 @dataclass

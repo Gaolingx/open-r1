@@ -44,7 +44,7 @@ class SFTLightningModule(L.LightningModule):
         return F.cross_entropy(
             shift_logits.view(-1, vocab_size),
             shift_labels.view(-1),
-            ignore_index=-100,
+            ignore_index=self.config.data.ignore_index,
             label_smoothing=self.config.label_smoothing,
         )
 
@@ -57,7 +57,7 @@ class SFTLightningModule(L.LightningModule):
             loss = outputs.loss
         else:
             loss = self._compute_loss(outputs.logits, labels)
-        stats = masked_token_stats(outputs.logits, labels)
+        stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
 
         on_step = stage == "train"
         prog_bar = stage in {"train", "val"}

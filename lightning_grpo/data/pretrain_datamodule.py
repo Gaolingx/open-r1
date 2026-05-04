@@ -15,8 +15,9 @@ from lightning_grpo.utils.modeling import load_tokenizer
 class PretrainBatchCollator:
     """Pad tokenized pretraining samples into dense training batches."""
 
-    def __init__(self, pad_token_id: int) -> None:
+    def __init__(self, pad_token_id: int, ignore_index: int = -100) -> None:
         self.pad_token_id = pad_token_id
+        self.ignore_index = ignore_index
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         """Collate a list of tokenized examples."""
@@ -28,7 +29,7 @@ class PretrainBatchCollator:
         return {
             "input_ids": torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id),
             "attention_mask": torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0),
-            "labels": torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100),
+            "labels": torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=self.ignore_index),
         }
 
 
@@ -39,7 +40,7 @@ class PretrainDataModule(BaseLMDataModule):
         super().__init__(data_config=config.data, model_config=config.model)
         self.config = config
         self.tokenizer = load_tokenizer(config.model)
-        self.collator = PretrainBatchCollator(self.tokenizer.pad_token_id)
+        self.collator = PretrainBatchCollator(self.tokenizer.pad_token_id, ignore_index=config.data.ignore_index)
 
     def _tokenize_dataset(self, dataset: Dataset) -> Dataset:
         text_column = self.config.data.text_column
