@@ -9,11 +9,12 @@ import glob
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from datasets import Features, Value
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
+from datasets.exceptions import DatasetGenerationError
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader
 
+from lightning_grpo.data.features import LOCAL_CHAT_DATASET_FEATURES
 from lightning_grpo.utils.configs.base import DataConfig, DatasetSource, ModelConfig
 
 
@@ -127,167 +128,37 @@ def _load_single_dataset(source: DatasetSource, seed: int, cache_dir: str) -> Da
     return dataset
 
 
-def _json_dumps_if_needed(value: Any) -> Any:
-    """Serialize nested optional JSON fields so Arrow can infer a stable schema."""
-
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False)
-
-
-def _normalize_message_schema(message: Any) -> Any:
-    """Normalize chat message keys used by tool-call SFT samples."""
-
-    if not isinstance(message, dict):
-        return {
-            "role": "",
-            "content": str(message),
-            "reasoning_content": "",
-            "tools": "",
-            "tool_calls": "",
-        }
-
-    normalized = dict(message)
-    for key in ("role", "content", "reasoning_content", "tools", "tool_calls"):
-        normalized[key] = _json_dumps_if_needed(normalized.get(key))
-    normalized["tools"] = _json_dumps_if_needed(normalized.get("tools"))
-    normalized["tool_calls"] = _json_dumps_if_needed(normalized.get("tool_calls"))
-    return normalized
-
-
-MESSAGE_FEATURE = {
-    "role": Value("string"),
-    "content": Value("string"),
-    "reasoning_content": Value("string"),
-    "tools": Value("string"),
-    "tool_calls": Value("string"),
-}
-
-
-def _normalize_tool_call_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    """Make chat samples Arrow-compatible without dropping tool-call fields."""
-
-    normalized = dict(sample)
-    for key, value in list(normalized.items()):
-        if key not in {"messages", "conversations"} and isinstance(value, (dict, list)):
-            normalized[key] = json.dumps(value, ensure_ascii=False)
-    for messages_key in ("messages", "conversations"):
-        messages = normalized.get(messages_key)
-        if isinstance(messages, list):
-            normalized[messages_key] = [_normalize_message_schema(message) for message in messages]
-    return normalized
-
-
-def _infer_json_dataset_features(file_path: str) -> Features:
-    """Infer stable string/list features from an initial sample to avoid null-column casts."""
-
-    with open(file_path, "r", encoding="utf-8") as handle:
-        first_char = handle.read(1)
-        handle.seek(0)
-        if first_char == "[":
-            data = json.load(handle)
-            first_sample = data[0] if data else None
-        else:
-            first_sample = next((sample for _, sample in _iter_jsonl_records(handle, file_path)), None)
-
-    if first_sample is None:
-        return Features({})
-    if not isinstance(first_sample, dict):
-        raise ValueError(f"Expected JSON object at record 0 of {file_path}.")
-
-    normalized = _normalize_tool_call_sample(first_sample)
-    return Features({
-        key: [MESSAGE_FEATURE] if key in {"messages", "conversations"} else Value("string")
-        for key in normalized
-    })
-
-
-def _load_json_dataset(file_path: str, cache_dir: str) -> Dataset:
-    """Load JSON/JSONL without materializing the entire file in Python memory."""
-
-    features = _infer_json_dataset_features(file_path)
-
-    def generate_rows():
-        with open(file_path, "r", encoding="utf-8") as handle:
-            first_char = handle.read(1)
-            handle.seek(0)
-            if first_char == "[":
-                data = json.load(handle)
-                if not isinstance(data, list):
-                    raise ValueError(f"Expected top-level JSON array in {file_path}.")
-                iterator = enumerate(data)
-            else:
-                iterator = _iter_jsonl_records(handle, file_path)
-
-            for index, sample in iterator:
-                if not isinstance(sample, dict):
-                    raise ValueError(f"Expected JSON object at record {index} of {file_path}.")
-                yield _normalize_tool_call_sample(sample)
-
-    return Dataset.from_generator(generate_rows, features=features, cache_dir=cache_dir)
-
-
-def _iter_jsonl_records(handle: Any, file_path: str):
-    """Yield JSONL records one at a time with helpful line-number errors."""
-
-    record_index = 0
-    for line_number, line in enumerate(handle, start=1):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            sample = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON on line {line_number} of {file_path}: {exc}") from exc
-        yield record_index, sample
-        record_index += 1
-
-
-def _load_arrow_dataset(file_path: str, cache_dir: str, file_format: str) -> Dataset:
-    """Load Arrow-backed formats through Hugging Face Datasets."""
-
-    return load_dataset(
-        file_format,
-        data_files=file_path,
-        split="train",
-        cache_dir=cache_dir,
-    )
-
-
-def _normalize_loaded_dataset(dataset: Dataset) -> Dataset:
-    """Apply the same chat/tool-call normalization to any loaded dataset format."""
-
-    if not {"messages", "conversations"}.intersection(dataset.column_names):
-        return dataset
-
-    return dataset.map(
-        _normalize_tool_call_sample,
-        desc="Normalizing chat/tool-call schema",
-        load_from_cache_file=False,
-    )
-
-
-LOCAL_DATASET_LOADERS: dict[str, Callable[[str, str], Dataset]] = {
-    ".json": lambda file_path, cache_dir: _load_json_dataset(file_path, cache_dir),
-    ".jsonl": lambda file_path, cache_dir: _load_json_dataset(file_path, cache_dir),
-    ".parquet": lambda file_path, cache_dir: _load_arrow_dataset(file_path, cache_dir, "parquet"),
-}
-
-
 def _detect_and_load_dataset(file_path: str, cache_dir: str) -> Dataset:
-    """Load a local dataset file and normalize chat/tool-call fields consistently."""
+    """Load a dataset file with automatic format detection."""
 
     path = Path(file_path)
     suffix = path.suffix.lower()
 
-    loader = LOCAL_DATASET_LOADERS.get(suffix)
-    if loader is None:
-        raise ValueError(f"Unsupported file format: {suffix}. Supported: {list(LOCAL_DATASET_LOADERS)}")
+    format_map = {
+        '.parquet': 'parquet',
+        '.json': 'json',
+        '.jsonl': 'json',
+    }
 
-    dataset = loader(str(path), cache_dir)
-    return _normalize_loaded_dataset(dataset)
+    if suffix not in format_map:
+        raise ValueError(f"Unsupported file format: {suffix}. Supported: {list(format_map.keys())}")
+
+    load_kwargs = {
+        "path": format_map[suffix],
+        "data_files": str(path),
+        "split": "train",
+        "cache_dir": cache_dir,
+    }
+
+    try:
+        return load_dataset(**load_kwargs)
+    except DatasetGenerationError:
+        if suffix not in {'.json', '.jsonl'}:
+            raise
+        return load_dataset(
+            **load_kwargs,
+            features=LOCAL_CHAT_DATASET_FEATURES,
+        )
 
 
 def _load_local_datasets(file_patterns: list[str], cache_dir: str) -> Dataset:
@@ -370,6 +241,7 @@ def map_dataset_with_config(
     desc: str,
     *,
     with_indices: bool = False,
+    features: Any = None,
 ) -> Dataset:
     """Apply a batched dataset transform using shared preprocessing settings."""
 
@@ -380,6 +252,7 @@ def map_dataset_with_config(
         batch_size=data_config.preprocessing_batch_size,
         num_proc=None if data_config.streaming else data_config.num_workers,
         remove_columns=list(dataset.column_names),
+        features=features,
         load_from_cache_file=data_config.preprocessing_use_cache,
         keep_in_memory=data_config.preprocessing_keep_in_memory,
         desc=desc,
@@ -446,6 +319,7 @@ class BaseDataModule(LightningDataModule):
         desc: str,
         *,
         with_indices: bool = False,
+        features: Any = None,
     ) -> Dataset:
         """Apply a shared batched dataset preprocessing transform."""
 
@@ -455,6 +329,7 @@ class BaseDataModule(LightningDataModule):
             self.data_config,
             desc,
             with_indices=with_indices,
+            features=features,
         )
 
     def _build_dataloader(

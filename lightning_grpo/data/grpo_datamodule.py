@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from datasets import Dataset
@@ -9,6 +10,7 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 from lightning_grpo.utils.configs.base import DataConfig, ModelConfig, OptimizationConfig
+from lightning_grpo.data.features import GRPO_PROMPT_FEATURES
 from lightning_grpo.utils.configs.grpo import RolloutConfig
 from lightning_grpo.data.base import (
     ChatTemplateDataModule,
@@ -28,6 +30,12 @@ class GRPORolloutCollator:
         """Collate raw prompt strings and metadata for GRPO rollouts."""
 
         prompts = [item["prompt_text"] for item in batch]
+        metadata = [
+            json.loads(item.get("metadata") or "{}")
+            if isinstance(item.get("metadata"), str)
+            else item.get("metadata", {})
+            for item in batch
+        ]
         original_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
         try:
@@ -44,7 +52,7 @@ class GRPORolloutCollator:
             "input_ids": tokenized["input_ids"],
             "attention_mask": tokenized["attention_mask"],
             "prompt_text": prompts,
-            "metadata": [item.get("metadata", {}) for item in batch],
+            "metadata": metadata,
             "sample_id": torch.tensor([int(item["sample_id"]) for item in batch], dtype=torch.long),
         }
 
@@ -85,7 +93,7 @@ class GRPODataModule(ChatTemplateDataModule):
 
         def preprocess_batch(batch: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
             prompt_texts: list[str] = []
-            metadata: list[dict[str, Any]] = []
+            metadata: list[str] = []
             for sample in self.iter_batch_samples(batch):
                 formatted = formatter(sample)
                 prompt_texts.append(
@@ -95,11 +103,11 @@ class GRPODataModule(ChatTemplateDataModule):
                         add_generation_prompt=self.data_config.add_generation_prompt,
                     )
                 )
-                metadata.append({
+                metadata.append(json.dumps({
                     key: value
                     for key, value in sample.items()
                     if key != self.data_config.messages_column
-                })
+                }, ensure_ascii=False))
             return {"prompt_text": prompt_texts, "metadata": metadata, "sample_id": indices}
 
         return self.map_dataset(
@@ -107,6 +115,7 @@ class GRPODataModule(ChatTemplateDataModule):
             preprocess_batch,
             desc="Formatting GRPO prompts",
             with_indices=True,
+            features=GRPO_PROMPT_FEATURES,
         )
 
     def train_dataloader(self):

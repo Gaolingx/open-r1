@@ -43,6 +43,7 @@ if stale_egg_info.exists():
 _deps = [
     "accelerate==1.4.0",
     "bitsandbytes>=0.43.0",
+    "dacite>=1.8.0",
     "datasets>=3.2.0",
     "deepspeed==0.16.8",
     "distilabel[vllm,ray,openai]>=1.5.2",
@@ -101,6 +102,7 @@ extras["dev"] = extras["quality"] + extras["tests"] + extras["eval"] + extras["c
 install_requires = [
     deps["accelerate"],
     deps["bitsandbytes"],
+    deps["dacite"],
     deps["einops"],
     deps["datasets"],
     deps["deepspeed"],

@@ -9,6 +9,7 @@ from datasets import Dataset
 
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
 from lightning_grpo.data.base import BaseLMDataModule
+from lightning_grpo.data.features import TOKENIZED_PRETRAIN_FEATURES
 from lightning_grpo.utils.modeling import load_tokenizer
 
 
@@ -74,7 +75,12 @@ class PretrainDataModule(BaseLMDataModule):
                 "labels": labels_batch,
             }
 
-        return self.map_dataset(dataset, preprocess_batch, desc="Tokenizing pretraining dataset")
+        return self.map_dataset(
+            dataset,
+            preprocess_batch,
+            desc="Tokenizing pretraining dataset",
+            features=TOKENIZED_PRETRAIN_FEATURES,
+        )
 
     def setup(self, stage: Optional[str] = None) -> None:
         """Load and tokenize the pretraining dataset."""
