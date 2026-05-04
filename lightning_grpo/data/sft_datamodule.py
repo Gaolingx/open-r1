@@ -145,10 +145,24 @@ def _normalize_tool_call(tool_call: Any) -> Any:
 def _normalize_sft_message_schema(message: Any) -> dict[str, Any]:
     """Normalize one SFT chat message and parse nested JSON schema fields."""
 
+    message = _json_loads_if_needed(message)
     if not isinstance(message, dict):
         message = {"content": message}
 
     normalized = dict(message)
+    if "content" not in normalized and "value" in normalized:
+        normalized["content"] = normalized["value"]
+    if "role" not in normalized and "from" in normalized:
+        role = normalized["from"]
+        normalized["role"] = {
+            "human": "user",
+            "user": "user",
+            "gpt": "assistant",
+            "assistant": "assistant",
+            "bot": "assistant",
+            "system": "system",
+        }.get(str(role).lower(), role)
+    normalized.setdefault("content", "")
     if "tools" in normalized:
         tools = _json_loads_if_needed(normalized["tools"])
         normalized["tools"] = [_normalize_tool_definition(tool) for tool in tools] if isinstance(tools, list) else tools
@@ -174,8 +188,12 @@ def _normalize_sft_message_schema(message: Any) -> dict[str, Any]:
     return {**extras, **known}
 
 
-def normalize_sft_conversation_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], Any]:
+def normalize_sft_conversation_messages(messages: Any) -> tuple[list[dict[str, Any]], Any]:
     """Normalize SFT messages and extract parsed tool definitions from system prompts."""
+
+    messages = _json_loads_if_needed(messages)
+    if not isinstance(messages, list):
+        messages = [messages]
 
     normalized: list[dict[str, Any]] = []
     tools = None
