@@ -6,6 +6,7 @@ from typing import Any, Literal, Optional
 
 import torch
 from datasets import Dataset
+from lightning.pytorch.utilities import rank_zero_warn
 from transformers import PreTrainedTokenizerBase
 
 from lightning_grpo.utils.configs.base import ModelConfig, OptimizationConfig
@@ -59,6 +60,10 @@ class SFTBatchCollator:
             "attention_mask": attention_mask,
             "labels": labels,
         }
+
+
+class RenderedAssistantSpanError(RuntimeError):
+    """Raised when assistant spans cannot be aligned in rendered chat tokens."""
 
 
 class SFTDataModule(ChatTemplateDataModule):
@@ -139,6 +144,189 @@ class SFTDataModule(ChatTemplateDataModule):
             for index, (token_id, mask) in enumerate(zip(full_ids, assistant_mask))
         ]
 
+    @staticmethod
+    def _find_token_subsequence(haystack: list[int], needle: list[int], start: int = 0) -> int:
+        """Return the first token-subsequence match at or after start, or -1 when absent."""
+
+        if not needle:
+            return start
+        max_start = len(haystack) - len(needle)
+        for index in range(start, max_start + 1):
+            if haystack[index:index + len(needle)] == needle:
+                return index
+        return -1
+
+    @staticmethod
+    def _tokenize_text_without_specials(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
+        """Tokenize rendered chat text without adding extra tokenizer special tokens."""
+
+        if not text:
+            return []
+        return list(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    def _render_chat_text(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Any,
+        *,
+        add_generation_prompt: bool,
+    ) -> str:
+        """Render chat messages to text without tokenizing."""
+
+        return self.chat_processor.render(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+        )
+
+    def _build_rendered_turn_spans(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Any,
+        full_ids: list[int],
+    ) -> list[tuple[str, int, int]]:
+        """Align each rendered chat turn to token spans without relying on template generation blocks."""
+
+        spans: list[tuple[str, int, int]] = []
+        rendered_prefix = ""
+        token_offset = 0
+
+        for index, message in enumerate(messages):
+            prefix_messages = messages[:index]
+            current_messages = messages[:index + 1]
+            prefix_text = self._render_chat_text(prefix_messages, tools, add_generation_prompt=False) if prefix_messages else ""
+            current_text = self._render_chat_text(current_messages, tools, add_generation_prompt=False)
+
+            if rendered_prefix and current_text.startswith(rendered_prefix):
+                turn_text = current_text[len(rendered_prefix):]
+            elif prefix_text and current_text.startswith(prefix_text):
+                turn_text = current_text[len(prefix_text):]
+            else:
+                raise RenderedAssistantSpanError("rendered chat template is not prefix-stable")
+
+            turn_ids = self._tokenize_text_without_specials(self.tokenizer, turn_text)
+            start = self._find_token_subsequence(full_ids, turn_ids, token_offset)
+            if start < 0:
+                raise RenderedAssistantSpanError("rendered chat turn tokens could not be aligned")
+            end = min(start + len(turn_ids), len(full_ids))
+            spans.append((str(message.get("role", "")), start, end))
+            rendered_prefix = current_text
+            token_offset = end
+
+        return spans
+
+    def _assistant_target_span(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Any,
+        full_ids: list[int],
+        assistant_index: int,
+        span_start: int,
+        span_end: int,
+    ) -> tuple[int, int]:
+        """Return assistant target span: generated content plus the assistant turn-closing EOS."""
+
+        assistant_prompt = self._render_chat_text(
+            messages[:assistant_index],
+            tools,
+            add_generation_prompt=True,
+        )
+        assistant_prompt_ids = self._tokenize_text_without_specials(self.tokenizer, assistant_prompt)
+        prompt_start = self._find_token_subsequence(full_ids, assistant_prompt_ids, 0)
+        if prompt_start < 0:
+            return span_start, span_end
+        target_start = min(max(prompt_start + len(assistant_prompt_ids), span_start), span_end)
+        return target_start, span_end
+
+    def _labels_from_rendered_assistant_spans(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Any,
+        full_ids: list[int],
+        label_mode: Literal["last_assistant", "all_assistant"],
+    ) -> list[int]:
+        """Mask labels by assistant turns at the data-processing layer."""
+
+        labels = [-100] * len(full_ids)
+        spans = self._build_rendered_turn_spans(messages, tools, full_ids)
+        assistant_spans = [
+            (index, start, end)
+            for index, (role, start, end) in enumerate(spans)
+            if role == "assistant"
+        ]
+        if label_mode == "last_assistant":
+            assistant_spans = assistant_spans[-1:]
+        for index, start, end in assistant_spans:
+            target_start, target_end = self._assistant_target_span(messages, tools, full_ids, index, start, end)
+            labels[target_start:target_end] = full_ids[target_start:target_end]
+        return labels
+
+    def _tokenize_render_input_only_sample(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Any,
+        label_mode: Literal["last_assistant", "all_assistant"],
+    ) -> dict[str, list[int]]:
+        """Tokenize SFT data by separately rendering prompt and assistant answer segments.
+
+        This supports modern chat templates that do not expose Hugging Face
+        ``{% generation %}`` blocks.  For each assistant turn, the prompt segment is
+        rendered with ``add_generation_prompt=True`` and masked out, while the
+        assistant answer suffix is rendered from the completed turn and kept as
+        labels.  This mirrors the render-input-only strategy used by LLaMA-Factory
+        style preprocessing.
+        """
+
+        input_ids: list[int] = []
+        labels: list[int] = []
+        consumed_text = ""
+        assistant_answer_ranges: list[tuple[int, int]] = []
+
+        for assistant_index, message in enumerate(messages):
+            if message.get("role") != "assistant":
+                continue
+
+            prompt_text = self._render_chat_text(
+                messages[:assistant_index],
+                tools,
+                add_generation_prompt=True,
+            )
+            completed_text = self._render_chat_text(
+                messages[:assistant_index + 1],
+                tools,
+                add_generation_prompt=False,
+            )
+            if not prompt_text.startswith(consumed_text) or not completed_text.startswith(prompt_text):
+                raise RenderedAssistantSpanError("render-input-only chat template is not prefix-stable")
+
+            prompt_segment_text = prompt_text[len(consumed_text):]
+            answer_segment_text = completed_text[len(prompt_text):]
+            prompt_ids = self._tokenize_text_without_specials(self.tokenizer, prompt_segment_text)
+            answer_ids = self._tokenize_text_without_specials(self.tokenizer, answer_segment_text)
+
+            input_ids.extend(prompt_ids)
+            labels.extend([-100] * len(prompt_ids))
+            answer_start = len(input_ids)
+            input_ids.extend(answer_ids)
+            labels.extend(answer_ids)
+            assistant_answer_ranges.append((answer_start, len(input_ids)))
+            consumed_text = completed_text
+
+        if label_mode == "last_assistant" and assistant_answer_ranges:
+            last_start, last_end = assistant_answer_ranges[-1]
+            labels = [
+                token_id if last_start <= index < last_end else -100
+                for index, token_id in enumerate(input_ids)
+            ]
+
+        input_ids = input_ids[:self.data_config.max_seq_length]
+        labels = labels[:self.data_config.max_seq_length]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
+            "labels": labels,
+        }
+
     def _apply_chat_template_tokenize(
         self,
         messages: list[dict[str, Any]],
@@ -208,21 +396,16 @@ class SFTDataModule(ChatTemplateDataModule):
             return list(full_ids)
 
         assistant_mask = self._extract_assistant_mask(processed or {}) if processed is not None else []
-        if assistant_mask and label_mode == "all_assistant":
+        has_assistant_mask = len(assistant_mask) == len(full_ids) and any(assistant_mask)
+        if has_assistant_mask and label_mode == "all_assistant":
             return self._labels_from_mask(full_ids, assistant_mask)
-        if assistant_mask and label_mode == "last_assistant":
+        if has_assistant_mask and label_mode == "last_assistant":
             return self._labels_from_last_assistant_mask(
                 full_ids,
                 assistant_mask,
                 self._prompt_token_count(messages, tools),
             )
-        if label_mode == "all_assistant":
-            raise RuntimeError(
-                "label_mode='all_assistant' requires tokenizer support for assistant token masks."
-            )
-
-        prompt_len = min(self._prompt_token_count(messages, tools), len(full_ids))
-        return [-100] * prompt_len + full_ids[prompt_len:]
+        return self._labels_from_rendered_assistant_spans(messages, tools, full_ids, label_mode)
 
     @staticmethod
     def _message_has_text(message: dict[str, Any]) -> bool:
@@ -278,6 +461,10 @@ class SFTDataModule(ChatTemplateDataModule):
         if processed is None:
             processed = self._render_chat_tokenize(messages, tools, add_generation_prompt=add_generation_prompt)
 
+        assistant_mask = self._extract_assistant_mask(processed) if needs_assistant_mask else []
+        if needs_assistant_mask and not any(assistant_mask):
+            return self._tokenize_render_input_only_sample(messages, tools, label_mode)
+
         input_ids = list(processed["input_ids"])
         attention_mask = list(processed.get("attention_mask", [1] * len(input_ids)))
         labels = self._build_labels(messages, tools, input_ids, processed, label_mode)
@@ -292,19 +479,20 @@ class SFTDataModule(ChatTemplateDataModule):
             label_mode = self.data_config.label_mode
             tokenized_samples: list[dict[str, list[int]]] = []
             skipped_reasons: dict[str, int] = {}
+
             for raw_sample in self.iter_batch_samples(batch):
                 try:
                     sample = formatter(raw_sample)
                     tokenized_samples.append(self._tokenize_sample(sample, label_mode))
-                except SkipSFTSampleError as exc:
-                    reason = str(exc)
-                    skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
                 except Exception as exc:
+                    exc_message = str(exc)
                     reason = f"preprocessing error: {type(exc).__name__}"
+                    if exc_message:
+                        reason = f"{reason}: {exc_message}"
                     skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
 
             if skipped_reasons:
-                print(
+                rank_zero_warn(
                     "Skipped SFT samples: "
                     + ", ".join(f"{reason}={count}" for reason, count in sorted(skipped_reasons.items()))
                 )
