@@ -128,6 +128,9 @@ class ChatTemplateProcessor:
         tools = row_tools
         for message in parsed_messages:
             current = dict(message) if isinstance(message, Mapping) else {"role": "user", "content": message}
+            current.setdefault("content", "")
+            if current["content"] is None:
+                current["content"] = ""
             if current.get("role") == "system" and current.get("tools") and tools is None:
                 tools = current["tools"]
             normalized.append(current)

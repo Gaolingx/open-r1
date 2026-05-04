@@ -19,6 +19,10 @@ from lightning_grpo.data.base import (
 from lightning_grpo.utils.modeling import load_tokenizer
 
 
+class SkipSFTSampleError(ValueError):
+    """Raised when a malformed or non-trainable SFT sample should be skipped."""
+
+
 class SFTBatchCollator:
     """Causal LM collator for pre-tokenized SFT samples."""
 
@@ -220,6 +224,38 @@ class SFTDataModule(ChatTemplateDataModule):
         prompt_len = min(self._prompt_token_count(messages, tools), len(full_ids))
         return [-100] * prompt_len + full_ids[prompt_len:]
 
+    @staticmethod
+    def _message_has_text(message: dict[str, Any]) -> bool:
+        """Return whether a message has non-empty text content."""
+
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return bool(content.strip())
+        if content is None:
+            return False
+        return bool(content)
+
+    @staticmethod
+    def _validate_messages_for_training(messages: list[dict[str, Any]]) -> None:
+        """Skip samples that do not contain a usable SFT prompt/completion pair."""
+
+        user_messages = [message for message in messages if message.get("role") == "user"]
+        assistant_messages = [message for message in messages if message.get("role") == "assistant"]
+        if not user_messages:
+            raise SkipSFTSampleError("missing user message")
+        if not assistant_messages:
+            raise SkipSFTSampleError("missing assistant message")
+        if not any(SFTDataModule._message_has_text(message) for message in user_messages):
+            raise SkipSFTSampleError("empty prompt")
+        if not any(SFTDataModule._message_has_text(message) for message in assistant_messages):
+            raise SkipSFTSampleError("empty response")
+
+    @staticmethod
+    def _has_trainable_labels(labels: list[int]) -> bool:
+        """Return whether at least one token contributes to the SFT loss."""
+
+        return any(label != -100 for label in labels)
+
     def _tokenize_sample(
         self,
         sample: dict[str, Any],
@@ -229,6 +265,7 @@ class SFTDataModule(ChatTemplateDataModule):
 
         messages, tools = self.chat_processor.prepare_sample(sample)
         messages = preprocess_chat_messages(messages)
+        self._validate_messages_for_training(messages)
         add_generation_prompt = self._should_add_generation_prompt(messages)
         needs_assistant_mask = label_mode in {"last_assistant", "all_assistant"}
 
@@ -244,15 +281,33 @@ class SFTDataModule(ChatTemplateDataModule):
         input_ids = list(processed["input_ids"])
         attention_mask = list(processed.get("attention_mask", [1] * len(input_ids)))
         labels = self._build_labels(messages, tools, input_ids, processed, label_mode)
+        if not self._has_trainable_labels(labels):
+            raise SkipSFTSampleError("assistant mask produced no trainable labels")
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
     def _tokenize_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
         """Convert dataset rows into tokenized causal language modeling samples."""
 
         def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
-            samples = [formatter(sample) for sample in self.iter_batch_samples(batch)]
             label_mode = self.data_config.label_mode
-            tokenized_samples = [self._tokenize_sample(sample, label_mode) for sample in samples]
+            tokenized_samples: list[dict[str, list[int]]] = []
+            skipped_reasons: dict[str, int] = {}
+            for raw_sample in self.iter_batch_samples(batch):
+                try:
+                    sample = formatter(raw_sample)
+                    tokenized_samples.append(self._tokenize_sample(sample, label_mode))
+                except SkipSFTSampleError as exc:
+                    reason = str(exc)
+                    skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+                except Exception as exc:
+                    reason = f"preprocessing error: {type(exc).__name__}"
+                    skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+
+            if skipped_reasons:
+                print(
+                    "Skipped SFT samples: "
+                    + ", ".join(f"{reason}={count}" for reason, count in sorted(skipped_reasons.items()))
+                )
 
             return {
                 "input_ids": [sample["input_ids"] for sample in tokenized_samples],

@@ -279,6 +279,7 @@ def _attach_tools(messages: list[dict[str, Any]], tools: Any) -> list[dict[str, 
     normalized = [dict(message) for message in messages]
     for message in normalized:
         if message.get("role") == "system":
+            message.setdefault("content", "")
             message.setdefault("tools", tools)
             return normalized
     return [{"role": "system", "content": "", "tools": tools}, *normalized]
