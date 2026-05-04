@@ -10,7 +10,6 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 from lightning_grpo.utils.configs.base import DataConfig, ModelConfig, OptimizationConfig
-from lightning_grpo.data.features import GRPO_PROMPT_FEATURES
 from lightning_grpo.utils.configs.grpo import RolloutConfig
 from lightning_grpo.data.base import (
     ChatTemplateProcessor,
@@ -117,7 +116,6 @@ class GRPODataModule(ChatTemplateDataModule):
             preprocess_batch,
             desc="Formatting GRPO prompts",
             with_indices=True,
-            features=GRPO_PROMPT_FEATURES,
         )
 
     def train_dataloader(self):

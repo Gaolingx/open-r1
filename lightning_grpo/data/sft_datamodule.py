@@ -10,7 +10,6 @@ from lightning.pytorch.utilities import rank_zero_warn
 from transformers import PreTrainedTokenizerBase
 
 from lightning_grpo.utils.configs.base import ModelConfig, OptimizationConfig
-from lightning_grpo.data.features import TOKENIZED_SFT_FEATURES
 from lightning_grpo.utils.configs.sft import SFTDataConfig
 from lightning_grpo.data.base import (
     ChatTemplateProcessor,
@@ -507,7 +506,6 @@ class SFTDataModule(ChatTemplateDataModule):
             dataset,
             preprocess_batch,
             desc="Tokenizing SFT dataset",
-            features=TOKENIZED_SFT_FEATURES,
         )
 
     def train_dataloader(self):

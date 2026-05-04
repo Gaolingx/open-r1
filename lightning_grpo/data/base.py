@@ -10,13 +10,12 @@ import glob
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset
+from datasets import Features, Value, Dataset, DatasetDict, concatenate_datasets, load_dataset
 from datasets.exceptions import DatasetGenerationError
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader
 
 from lightning_grpo.data.converter import DatasetFormat, convert_sft_sample
-from lightning_grpo.data.features import LOCAL_CHAT_DATASET_FEATURES
 from lightning_grpo.utils.configs.base import DataConfig, DatasetSource, ModelConfig
 
 
@@ -219,6 +218,16 @@ class ChatTemplateProcessor:
 
 DEFAULT_VAL_SPLIT_NAME = "test"
 
+LOCAL_CHAT_DATASET_FEATURES = Features({
+    "conversations": [{
+        "role": Value("string"),
+        "content": Value("string"),
+        "reasoning_content": Value("string"),
+        "tools": Value("string"),
+        "tool_calls": Value("string"),
+    }],
+})
+
 
 def _load_single_dataset(source: DatasetSource, seed: int, cache_dir: str) -> Dataset:
     """Load one dataset source from the Hugging Face hub."""
@@ -348,23 +357,20 @@ def map_dataset_with_config(
     preprocess_fn: Callable[[dict[str, list[Any]]], dict[str, list[Any]]],
     data_config: DataConfig,
     desc: str,
-    *,
-    with_indices: bool = False,
-    features: Any = None,
+    **kwargs: Any,
 ) -> Dataset:
     """Apply a batched dataset transform using shared preprocessing settings."""
 
     return dataset.map(
         preprocess_fn,
         batched=True,
-        with_indices=with_indices,
         batch_size=data_config.preprocessing_batch_size,
         num_proc=None if data_config.streaming else data_config.num_workers,
         remove_columns=list(dataset.column_names),
-        features=features,
         load_from_cache_file=data_config.preprocessing_use_cache,
         keep_in_memory=data_config.preprocessing_keep_in_memory,
         desc=desc,
+        **kwargs,
     )
 
 
@@ -426,9 +432,7 @@ class BaseDataModule(LightningDataModule):
         dataset: Dataset,
         preprocess_fn: Callable[[dict[str, list[Any]]], dict[str, list[Any]]],
         desc: str,
-        *,
-        with_indices: bool = False,
-        features: Any = None,
+        **kwargs: Any,
     ) -> Dataset:
         """Apply a shared batched dataset preprocessing transform."""
 
@@ -437,8 +441,7 @@ class BaseDataModule(LightningDataModule):
             preprocess_fn,
             self.data_config,
             desc,
-            with_indices=with_indices,
-            features=features,
+            **kwargs,
         )
 
     def _build_dataloader(
