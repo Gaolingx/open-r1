@@ -297,9 +297,10 @@ class SFTDataModule(ChatTemplateDataModule):
             return list(full_ids)
 
         assistant_mask = self._extract_assistant_mask(processed or {}) if processed is not None else []
-        if assistant_mask and label_mode == "all_assistant":
+        has_assistant_mask_tokens = assistant_mask and any(assistant_mask)
+        if has_assistant_mask_tokens and label_mode == "all_assistant":
             return self._labels_from_mask(full_ids, assistant_mask)
-        if assistant_mask and label_mode == "last_assistant":
+        if has_assistant_mask_tokens and label_mode == "last_assistant":
             return self._labels_from_last_assistant_mask(
                 full_ids,
                 assistant_mask,
