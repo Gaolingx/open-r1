@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict
 import json
 import random
@@ -14,6 +15,7 @@ from datasets.exceptions import DatasetGenerationError
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader
 
+from lightning_grpo.data.converter import DatasetFormat, convert_sft_sample
 from lightning_grpo.data.features import LOCAL_CHAT_DATASET_FEATURES
 from lightning_grpo.utils.configs.base import DataConfig, DatasetSource, ModelConfig
 
@@ -26,32 +28,25 @@ class ConversationTemplate:
         prompt_column: str,
         response_column: str,
         messages_column: str = "messages",
+        dataset_format: DatasetFormat | str = "auto",
         system_prompt: Optional[str] = None,
     ) -> None:
         self.prompt_column = prompt_column
         self.response_column = response_column
         self.messages_column = messages_column
+        self.dataset_format = dataset_format
         self.system_prompt = system_prompt
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         """Create a canonical message list for one sample."""
 
-        if self.messages_column in sample and sample[self.messages_column] is not None:
-            return {"messages": sample[self.messages_column]}
-        if "conversations" in sample and sample["conversations"] is not None:
-            return {"messages": sample["conversations"]}
-
-        messages: list[dict[str, str]] = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-
-        if self.prompt_column not in sample:
-            raise KeyError(f"Prompt column '{self.prompt_column}' not found in sample.")
-
-        messages.append({"role": "user", "content": str(sample[self.prompt_column])})
-        if self.response_column in sample and sample[self.response_column] is not None:
-            messages.append({"role": "assistant", "content": str(sample[self.response_column])})
-        return {"messages": messages}
+        converted = convert_sft_sample(sample, self.dataset_format)
+        if not converted.get("messages"):
+            raise KeyError(f"No chat messages could be built from sample using dataset_format='{self.dataset_format}'.")
+        if self.system_prompt and not any(message.get("role") == "system" for message in converted["messages"]):
+            converted = dict(converted)
+            converted["messages"] = [{"role": "system", "content": self.system_prompt}, *converted["messages"]]
+        return converted
 
 
 SYSTEM_PROMPTS = [
@@ -106,6 +101,117 @@ def normalize_conversation_messages(messages: list[dict[str, Any]]) -> tuple[lis
             current["tool_calls"] = json.loads(current["tool_calls"])
         normalized.append(current)
     return normalized, tools
+
+
+class ChatTemplateProcessor:
+    """Shared renderer/tokenizer for converter-normalized chat samples."""
+
+    def __init__(self, tokenizer: Any) -> None:
+        self.tokenizer = tokenizer
+
+    @staticmethod
+    def normalize_messages(messages: Any, row_tools: Any = None) -> tuple[list[dict[str, Any]], Any]:
+        """Normalize message containers and resolve tool definitions."""
+
+        if isinstance(messages, str):
+            try:
+                parsed_messages = json.loads(messages)
+            except json.JSONDecodeError:
+                parsed_messages = messages
+        else:
+            parsed_messages = messages
+
+        if not isinstance(parsed_messages, list):
+            parsed_messages = [parsed_messages]
+
+        normalized: list[dict[str, Any]] = []
+        tools = row_tools
+        for message in parsed_messages:
+            current = dict(message) if isinstance(message, Mapping) else {"role": "user", "content": message}
+            if current.get("role") == "system" and current.get("tools") and tools is None:
+                tools = current["tools"]
+            normalized.append(current)
+        return normalized, tools
+
+    @staticmethod
+    def should_add_generation_prompt(messages: list[dict[str, Any]], enabled: bool) -> bool:
+        """Decide whether chat rendering should append a generation prompt."""
+
+        return enabled and (not messages or messages[-1].get("role") != "assistant")
+
+    def render(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool = False,
+        tools: Any = None,
+        postprocess: bool = True,
+        **chat_template_kwargs: Any,
+    ) -> str:
+        """Render messages to text with optional shared postprocessing."""
+
+        text = apply_chat_template(
+            tokenizer=self.tokenizer,
+            messages=messages,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            **chat_template_kwargs,
+        )
+        return postprocess_chat_text(text) if postprocess else text
+
+    def tokenize(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool = False,
+        tools: Any = None,
+        max_length: int,
+        return_assistant_tokens_mask: bool = False,
+    ) -> dict[str, Any]:
+        """Tokenize chat messages through tokenizer templates with a text fallback."""
+
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                tokenized = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=add_generation_prompt,
+                    tools=tools,
+                    truncation=True,
+                    max_length=max_length,
+                    return_dict=True,
+                    return_assistant_tokens_mask=return_assistant_tokens_mask,
+                )
+                if isinstance(tokenized, Mapping):
+                    return dict(tokenized)
+                if hasattr(tokenized, "keys"):
+                    return {key: tokenized[key] for key in tokenized.keys()}
+                return {"input_ids": list(tokenized), "attention_mask": [1] * len(tokenized)}
+            except TypeError:
+                pass
+
+        text = self.render(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+        )
+        tokenized = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+            add_special_tokens=False,
+        )
+        return {
+            "input_ids": list(tokenized["input_ids"]),
+            "attention_mask": list(tokenized["attention_mask"]),
+        }
+
+    def prepare_sample(self, sample: Mapping[str, Any]) -> tuple[list[dict[str, Any]], Any]:
+        """Return messages and tools from a converted sample."""
+
+        messages, tools = self.normalize_messages(sample["messages"], sample.get("tools"))
+        return messages, tools
 
 
 DEFAULT_VAL_SPLIT_NAME = "test"
@@ -380,10 +486,12 @@ class ChatTemplateDataModule(BaseLMDataModule):
         prompt_column = getattr(self.data_config, "prompt_column")
         response_column = getattr(self.data_config, "response_column")
         messages_column = getattr(self.data_config, "messages_column", "messages")
+        dataset_format = getattr(self.data_config, "dataset_format", "auto")
         return ConversationTemplate(
             prompt_column=prompt_column,
             response_column=response_column,
             messages_column=messages_column,
+            dataset_format=dataset_format,
             system_prompt=self.system_prompt,
         )
 

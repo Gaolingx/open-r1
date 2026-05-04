@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
-import json
 from typing import Any, Literal, Optional
 
-from dacite import Config, from_dict
 import torch
 from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
@@ -16,193 +12,11 @@ from lightning_grpo.utils.configs.base import ModelConfig, OptimizationConfig
 from lightning_grpo.data.features import TOKENIZED_SFT_FEATURES
 from lightning_grpo.utils.configs.sft import SFTDataConfig
 from lightning_grpo.data.base import (
+    ChatTemplateProcessor,
     ChatTemplateDataModule,
-    apply_chat_template,
-    postprocess_chat_text,
     preprocess_chat_messages,
 )
 from lightning_grpo.utils.modeling import load_tokenizer
-
-
-@dataclass
-class SFTToolFunctionSchema:
-    """Nested function schema used by chat-template tool definitions."""
-
-    name: str = ""
-    description: str = ""
-    parameters: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class SFTToolSchema:
-    """OpenAI-compatible tool definition with a nested JSON schema."""
-
-    type: str = "function"
-    function: SFTToolFunctionSchema = field(default_factory=SFTToolFunctionSchema)
-
-
-@dataclass
-class SFTToolCallFunctionSchema:
-    """Nested function call emitted by assistant messages."""
-
-    name: str = ""
-    arguments: Any = field(default_factory=dict)
-
-
-@dataclass
-class SFTToolCallSchema:
-    """OpenAI-compatible assistant tool-call payload."""
-
-    id: str = ""
-    type: str = "function"
-    function: Optional[SFTToolCallFunctionSchema] = None
-    name: str = ""
-    arguments: Any = field(default_factory=dict)
-
-
-@dataclass
-class SFTMessageSchema:
-    """Chat message schema with nested tool JSON parsed through dacite."""
-
-    role: str = ""
-    content: Any = ""
-    reasoning_content: str = ""
-    tools: Optional[list[SFTToolSchema]] = None
-    tool_calls: Optional[list[SFTToolCallSchema]] = None
-
-
-DACITE_SFT_JSON_CONFIG = Config(
-    cast=[str],
-    strict=False,
-)
-
-
-def _json_loads_if_needed(value: Any) -> Any:
-    """Parse JSON-looking strings while preserving ordinary strings."""
-
-    if not isinstance(value, str):
-        return value
-    stripped = value.strip()
-    if not stripped or stripped[0] not in "[{":
-        return value
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        return value
-
-
-def _drop_empty_schema_values(value: Any) -> Any:
-    """Remove dacite/default placeholders that should not be sent to chat templates."""
-
-    if isinstance(value, dict):
-        return {
-            key: _drop_empty_schema_values(item)
-            for key, item in value.items()
-            if item is not None and item != "" and item != {} and item != []
-        }
-    if isinstance(value, list):
-        return [_drop_empty_schema_values(item) for item in value]
-    return value
-
-
-def _normalize_tool_definition(tool: Any) -> Any:
-    """Convert one nested tool schema dict into a stable dacite-backed structure."""
-
-    tool = _json_loads_if_needed(tool)
-    if not isinstance(tool, dict):
-        return tool
-    normalized = from_dict(
-        data_class=SFTToolSchema,
-        data=tool,
-        config=DACITE_SFT_JSON_CONFIG,
-    )
-    return _drop_empty_schema_values(asdict(normalized))
-
-
-def _normalize_tool_call(tool_call: Any) -> Any:
-    """Convert one assistant tool-call payload into a stable dacite-backed structure."""
-
-    tool_call = _json_loads_if_needed(tool_call)
-    if not isinstance(tool_call, dict):
-        return tool_call
-    normalized_call = dict(tool_call)
-    if "function" in normalized_call:
-        normalized_call["function"] = _json_loads_if_needed(normalized_call["function"])
-        if isinstance(normalized_call["function"], dict) and "arguments" in normalized_call["function"]:
-            normalized_call["function"]["arguments"] = _json_loads_if_needed(
-                normalized_call["function"]["arguments"]
-            )
-    if "arguments" in normalized_call:
-        normalized_call["arguments"] = _json_loads_if_needed(normalized_call["arguments"])
-    normalized = from_dict(
-        data_class=SFTToolCallSchema,
-        data=normalized_call,
-        config=DACITE_SFT_JSON_CONFIG,
-    )
-    return _drop_empty_schema_values(asdict(normalized))
-
-
-def _normalize_sft_message_schema(message: Any) -> dict[str, Any]:
-    """Normalize one SFT chat message and parse nested JSON schema fields."""
-
-    message = _json_loads_if_needed(message)
-    if not isinstance(message, dict):
-        message = {"content": message}
-
-    normalized = dict(message)
-    if "content" not in normalized and "value" in normalized:
-        normalized["content"] = normalized["value"]
-    if "role" not in normalized and "from" in normalized:
-        role = normalized["from"]
-        normalized["role"] = {
-            "human": "user",
-            "user": "user",
-            "gpt": "assistant",
-            "assistant": "assistant",
-            "bot": "assistant",
-            "system": "system",
-        }.get(str(role).lower(), role)
-    normalized.setdefault("content", "")
-    if "tools" in normalized:
-        tools = _json_loads_if_needed(normalized["tools"])
-        normalized["tools"] = [_normalize_tool_definition(tool) for tool in tools] if isinstance(tools, list) else tools
-    if "tool_calls" in normalized:
-        tool_calls = _json_loads_if_needed(normalized["tool_calls"])
-        normalized["tool_calls"] = (
-            [_normalize_tool_call(tool_call) for tool_call in tool_calls]
-            if isinstance(tool_calls, list)
-            else tool_calls
-        )
-
-    schema = from_dict(
-        data_class=SFTMessageSchema,
-        data=normalized,
-        config=DACITE_SFT_JSON_CONFIG,
-    )
-    known = _drop_empty_schema_values(asdict(schema))
-    extras = {
-        key: _json_loads_if_needed(value)
-        for key, value in normalized.items()
-        if key not in SFTMessageSchema.__dataclass_fields__
-    }
-    return {**extras, **known}
-
-
-def normalize_sft_conversation_messages(messages: Any) -> tuple[list[dict[str, Any]], Any]:
-    """Normalize SFT messages and extract parsed tool definitions from system prompts."""
-
-    messages = _json_loads_if_needed(messages)
-    if not isinstance(messages, list):
-        messages = [messages]
-
-    normalized: list[dict[str, Any]] = []
-    tools = None
-    for message in messages:
-        current = _normalize_sft_message_schema(message)
-        if current.get("role") == "system" and current.get("tools"):
-            tools = current["tools"]
-        normalized.append(current)
-    return normalized, tools
 
 
 class SFTBatchCollator:
@@ -256,6 +70,7 @@ class SFTDataModule(ChatTemplateDataModule):
         super().__init__(data_config=data_config, model_config=model_config, system_prompt=system_prompt)
         self.optimization_config = optimization_config
         self.tokenizer = load_tokenizer(model_config)
+        self.chat_processor = ChatTemplateProcessor(self.tokenizer)
         self.collator = SFTBatchCollator(self.tokenizer)
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -283,9 +98,7 @@ class SFTDataModule(ChatTemplateDataModule):
     def _should_add_generation_prompt(self, messages: list[dict[str, Any]]) -> bool:
         """Decide whether chat rendering should append a generation prompt."""
 
-        if not self.data_config.add_generation_prompt:
-            return False
-        return not messages or messages[-1].get("role") != "assistant"
+        return self.chat_processor.should_add_generation_prompt(messages, self.data_config.add_generation_prompt)
 
     @staticmethod
     def _extract_assistant_mask(processed: dict[str, Any]) -> list[bool]:
@@ -332,28 +145,13 @@ class SFTDataModule(ChatTemplateDataModule):
     ) -> dict[str, Any] | None:
         """Tokenize chat messages with tokenizer templates when supported."""
 
-        if not hasattr(self.tokenizer, "apply_chat_template"):
-            return None
-
-        try:
-            tokenized = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=add_generation_prompt,
-                tools=tools,
-                truncation=True,
-                max_length=self.data_config.max_seq_length,
-                return_dict=True,
-                return_assistant_tokens_mask=return_assistant_tokens_mask,
-            )
-        except TypeError:
-            return None
-
-        if isinstance(tokenized, Mapping):
-            return dict(tokenized)
-        if hasattr(tokenized, "keys"):
-            return {key: tokenized[key] for key in tokenized.keys()}
-        return {"input_ids": list(tokenized), "attention_mask": [1] * len(tokenized)}
+        return self.chat_processor.tokenize(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            max_length=self.data_config.max_seq_length,
+            return_assistant_tokens_mask=return_assistant_tokens_mask,
+        )
 
     def _render_chat_tokenize(
         self,
@@ -364,24 +162,12 @@ class SFTDataModule(ChatTemplateDataModule):
     ) -> dict[str, list[int]]:
         """Render chat text then tokenize it, matching the shared GRPO/pretrain abstractions."""
 
-        text = apply_chat_template(
-            tokenizer=self.tokenizer,
-            messages=messages,
+        return self.chat_processor.tokenize(
+            messages,
             add_generation_prompt=add_generation_prompt,
             tools=tools,
-        )
-        text = postprocess_chat_text(text)
-        tokenized = self.tokenizer(
-            text,
-            truncation=True,
             max_length=self.data_config.max_seq_length,
-            padding=False,
-            add_special_tokens=False,
         )
-        return {
-            "input_ids": list(tokenized["input_ids"]),
-            "attention_mask": list(tokenized["attention_mask"]),
-        }
 
     def _prompt_token_count(
         self,
@@ -441,7 +227,7 @@ class SFTDataModule(ChatTemplateDataModule):
     ) -> dict[str, list[int]]:
         """Format one dataset row into token ids and SFT labels."""
 
-        messages, tools = normalize_sft_conversation_messages(sample["messages"])
+        messages, tools = self.chat_processor.prepare_sample(sample)
         messages = preprocess_chat_messages(messages)
         add_generation_prompt = self._should_add_generation_prompt(messages)
         needs_assistant_mask = label_mode in {"last_assistant", "all_assistant"}

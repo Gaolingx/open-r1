@@ -13,8 +13,8 @@ from lightning_grpo.utils.configs.base import DataConfig, ModelConfig, Optimizat
 from lightning_grpo.data.features import GRPO_PROMPT_FEATURES
 from lightning_grpo.utils.configs.grpo import RolloutConfig
 from lightning_grpo.data.base import (
+    ChatTemplateProcessor,
     ChatTemplateDataModule,
-    apply_chat_template,
 )
 from lightning_grpo.utils.modeling import load_tokenizer
 
@@ -72,6 +72,7 @@ class GRPODataModule(ChatTemplateDataModule):
         self.optimization_config = optimization_config
         self.rollout_config = rollout_config
         self.tokenizer = load_tokenizer(model_config)
+        self.chat_processor = ChatTemplateProcessor(self.tokenizer)
         self.collator = GRPORolloutCollator(self.tokenizer, rollout_config)
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -96,17 +97,18 @@ class GRPODataModule(ChatTemplateDataModule):
             metadata: list[str] = []
             for sample in self.iter_batch_samples(batch):
                 formatted = formatter(sample)
+                messages, tools = self.chat_processor.prepare_sample(formatted)
                 prompt_texts.append(
-                    apply_chat_template(
-                        tokenizer=self.tokenizer,
-                        messages=formatted["messages"],
-                        add_generation_prompt=self.data_config.add_generation_prompt,
+                    self.chat_processor.render(
+                        messages,
+                        add_generation_prompt=getattr(self.data_config, "add_generation_prompt", True),
+                        tools=tools,
                     )
                 )
                 metadata.append(json.dumps({
                     key: value
                     for key, value in sample.items()
-                    if key != self.data_config.messages_column
+                    if key != getattr(self.data_config, "messages_column", "messages")
                 }, ensure_ascii=False))
             return {"prompt_text": prompt_texts, "metadata": metadata, "sample_id": indices}
 
