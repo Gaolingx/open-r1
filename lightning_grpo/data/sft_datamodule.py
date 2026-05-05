@@ -93,19 +93,6 @@ class SFTDataModule(ChatTemplateDataModule):
             self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name], formatter)
 
     @staticmethod
-    def _split_prompt_and_completion(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Split a chat transcript into prompt messages and the final assistant completion."""
-
-        if messages and messages[-1].get("role") == "assistant":
-            return messages[:-1], [messages[-1]]
-        return list(messages), []
-
-    def _should_add_generation_prompt(self, messages: list[dict[str, Any]]) -> bool:
-        """Decide whether chat rendering should append a generation prompt."""
-
-        return self.chat_processor.should_add_generation_prompt(messages, self.data_config.add_generation_prompt)
-
-    @staticmethod
     def _extract_assistant_mask(processed: dict[str, Any]) -> list[bool]:
         """Normalize assistant-token masks returned by chat templates across tokenizer variants."""
 
@@ -115,29 +102,6 @@ class SFTDataModule(ChatTemplateDataModule):
         if raw_mask is None:
             return []
         return [bool(value) for value in raw_mask]
-
-    def _labels_from_mask(self, full_ids: list[int], assistant_mask: list[bool]) -> list[int]:
-        """Keep loss only on tokens selected by a tokenizer-provided mask."""
-
-        if len(assistant_mask) != len(full_ids):
-            raise RuntimeError("Assistant token mask length does not match tokenized input length.")
-        return [token_id if mask else self.data_config.ignore_index for token_id, mask in zip(full_ids, assistant_mask)]
-
-    def _labels_from_last_assistant_mask(
-        self,
-        full_ids: list[int],
-        assistant_mask: list[bool],
-        prompt_len: int,
-    ) -> list[int]:
-        """Keep loss only on the final assistant turn using the assistant mask and prompt boundary."""
-
-        if len(assistant_mask) != len(full_ids):
-            raise RuntimeError("Assistant token mask length does not match tokenized input length.")
-        prompt_len = min(prompt_len, len(full_ids))
-        return [
-            token_id if mask and index >= prompt_len else self.data_config.ignore_index
-            for index, (token_id, mask) in enumerate(zip(full_ids, assistant_mask))
-        ]
 
     @staticmethod
     def _find_subsequence_starts(sequence: list[int], subsequence: list[int]) -> list[int]:
@@ -149,175 +113,14 @@ class SFTDataModule(ChatTemplateDataModule):
         return [
             index
             for index in range(len(sequence) - template_len + 1)
-            if sequence[index : index + template_len] == subsequence
+            if sequence[index: index + template_len] == subsequence
         ]
-
-    def _assistant_response_template_ids(self) -> list[int]:
-        """Resolve the configured assistant response marker into token ids."""
-
-        if self.data_config.assistant_response_template_ids is not None:
-            return list(self.data_config.assistant_response_template_ids)
-        if self.data_config.assistant_response_template is None:
-            return []
-        return list(self.tokenizer.encode(self.data_config.assistant_response_template, add_special_tokens=False))
-
-    def _instruction_template_ids(self) -> list[int]:
-        """Resolve the configured instruction/user marker into token ids."""
-
-        if self.data_config.instruction_template_ids is not None:
-            return list(self.data_config.instruction_template_ids)
-        if self.data_config.instruction_template is None:
-            return []
-        return list(self.tokenizer.encode(self.data_config.instruction_template, add_special_tokens=False))
 
     @staticmethod
     def _next_marker_start(marker_starts: list[int], after: int, sequence_len: int) -> int:
         """Return the next marker offset after a position, or the sequence end."""
 
         return next((start for start in marker_starts if start > after), sequence_len)
-
-    def _labels_from_response_template(
-        self,
-        full_ids: list[int],
-        label_mode: Literal["last_assistant", "all_assistant"],
-    ) -> list[int]:
-        """Keep loss after configured assistant response markers when chat templates lack generation masks."""
-
-        response_template_ids = self._assistant_response_template_ids()
-        if not response_template_ids:
-            raise RuntimeError(
-                "Tokenizer did not provide assistant token masks. Configure data.assistant_response_template "
-                "or data.assistant_response_template_ids to mask SFT labels from assistant response markers."
-            )
-
-        response_starts = self._find_subsequence_starts(full_ids, response_template_ids)
-        if not response_starts:
-            raise RuntimeError(
-                "Configured assistant response template was not found in the tokenized sample. Check that "
-                "data.assistant_response_template exactly matches the model chat template output, or configure "
-                "data.assistant_response_template_ids."
-            )
-
-        instruction_template_ids = self._instruction_template_ids()
-        instruction_starts = (
-            self._find_subsequence_starts(full_ids, instruction_template_ids) if instruction_template_ids else []
-        )
-        if instruction_template_ids and not instruction_starts:
-            raise RuntimeError(
-                "Configured instruction template was not found in the tokenized sample. Check that "
-                "data.instruction_template exactly matches the model chat template output, or configure "
-                "data.instruction_template_ids."
-            )
-        if label_mode == "all_assistant" and len(response_starts) > 1 and not instruction_starts:
-            raise RuntimeError(
-                "Multi-turn assistant-only masking requires data.instruction_template or "
-                "data.instruction_template_ids so user spans between assistant responses can be ignored."
-            )
-        all_marker_starts = sorted({*response_starts, *instruction_starts})
-        labels = [self.data_config.ignore_index] * len(full_ids)
-        if label_mode == "last_assistant":
-            response_start = response_starts[-1]
-            label_start = response_start + len(response_template_ids)
-            label_end = self._next_marker_start(all_marker_starts, response_start, len(full_ids))
-            labels[label_start:label_end] = full_ids[label_start:label_end]
-            return labels
-
-        for response_start in response_starts:
-            label_start = response_start + len(response_template_ids)
-            label_end = self._next_marker_start(all_marker_starts, response_start, len(full_ids))
-            labels[label_start:label_end] = full_ids[label_start:label_end]
-        return labels
-
-    def _apply_chat_template_tokenize(
-        self,
-        messages: list[dict[str, Any]],
-        tools: Any,
-        *,
-        add_generation_prompt: bool,
-        return_assistant_tokens_mask: bool = False,
-    ) -> dict[str, Any] | None:
-        """Tokenize chat messages with tokenizer templates when supported."""
-
-        return self.chat_processor.tokenize(
-            messages,
-            add_generation_prompt=add_generation_prompt,
-            tools=tools,
-            max_length=self.data_config.max_seq_length,
-            return_assistant_tokens_mask=return_assistant_tokens_mask,
-        )
-
-    def _render_chat_tokenize(
-        self,
-        messages: list[dict[str, Any]],
-        tools: Any,
-        *,
-        add_generation_prompt: bool,
-    ) -> dict[str, list[int]]:
-        """Render chat text then tokenize it, matching the shared GRPO/pretrain abstractions."""
-
-        return self.chat_processor.tokenize(
-            messages,
-            add_generation_prompt=add_generation_prompt,
-            tools=tools,
-            max_length=self.data_config.max_seq_length,
-        )
-
-    def _prompt_token_count(
-        self,
-        messages: list[dict[str, Any]],
-        tools: Any,
-    ) -> int:
-        """Tokenize the prompt prefix used by completion-only supervision."""
-
-        prompt_messages, _ = self._split_prompt_and_completion(messages)
-        processed = self._apply_chat_template_tokenize(
-            prompt_messages,
-            tools,
-            add_generation_prompt=self._should_add_generation_prompt(prompt_messages),
-        )
-        if processed is None:
-            processed = self._render_chat_tokenize(
-                prompt_messages,
-                tools,
-                add_generation_prompt=self._should_add_generation_prompt(prompt_messages),
-            )
-        return len(processed["input_ids"])
-
-    def _build_labels(
-        self,
-        messages: list[dict[str, Any]],
-        tools: Any,
-        full_ids: list[int],
-        processed: dict[str, Any] | None,
-        label_mode: Literal["all_tokens", "last_assistant", "all_assistant"],
-    ) -> list[int]:
-        """Build labels according to the configured SFT supervision mode."""
-
-        if label_mode == "all_tokens":
-            return list(full_ids)
-
-        assistant_mask = self._extract_assistant_mask(processed or {}) if processed is not None else []
-        has_assistant_mask_tokens = assistant_mask and any(assistant_mask)
-        if has_assistant_mask_tokens and label_mode == "all_assistant":
-            return self._labels_from_mask(full_ids, assistant_mask)
-        if has_assistant_mask_tokens and label_mode == "last_assistant":
-            return self._labels_from_last_assistant_mask(
-                full_ids,
-                assistant_mask,
-                self._prompt_token_count(messages, tools),
-            )
-        if label_mode in {"last_assistant", "all_assistant"}:
-            response_template_ids = self._assistant_response_template_ids()
-            if response_template_ids:
-                return self._labels_from_response_template(full_ids, label_mode)
-        if label_mode == "all_assistant":
-            raise RuntimeError(
-                "label_mode='all_assistant' requires tokenizer support for assistant token masks or a configured "
-                "data.assistant_response_template/data.assistant_response_template_ids."
-            )
-
-        prompt_len = min(self._prompt_token_count(messages, tools), len(full_ids))
-        return [self.data_config.ignore_index] * prompt_len + full_ids[prompt_len:]
 
     @staticmethod
     def _message_has_text(message: dict[str, Any]) -> bool:
@@ -330,67 +133,217 @@ class SFTDataModule(ChatTemplateDataModule):
             return False
         return bool(content)
 
-    @staticmethod
-    def _validate_messages_for_training(messages: list[dict[str, Any]]) -> None:
-        """Skip samples that do not contain a usable SFT prompt/completion pair."""
-
-        user_messages = [message for message in messages if message.get("role") == "user"]
-        assistant_messages = [message for message in messages if message.get("role") == "assistant"]
-        if not user_messages:
-            raise SkipSFTSampleError("missing user message")
-        if not assistant_messages:
-            raise SkipSFTSampleError("missing assistant message")
-        if not any(SFTDataModule._message_has_text(message) for message in user_messages):
-            raise SkipSFTSampleError("empty prompt")
-        if not any(SFTDataModule._message_has_text(message) for message in assistant_messages):
-            raise SkipSFTSampleError("empty response")
-
-    def _has_trainable_labels(self, labels: list[int]) -> bool:
-        """Return whether at least one token contributes to the SFT loss."""
-
-        return any(label != self.data_config.ignore_index for label in labels)
-
-    def _tokenize_sample(
-        self,
-        sample: dict[str, Any],
-        label_mode: Literal["all_tokens", "last_assistant", "all_assistant"],
-    ) -> dict[str, list[int]]:
-        """Format one dataset row into token ids and SFT labels."""
-
-        messages, tools = self.chat_processor.prepare_sample(sample)
-        messages = preprocess_chat_messages(messages)
-        self._validate_messages_for_training(messages)
-        add_generation_prompt = self._should_add_generation_prompt(messages)
-        needs_assistant_mask = label_mode in {"last_assistant", "all_assistant"}
-
-        processed = self._apply_chat_template_tokenize(
-            messages,
-            tools,
-            add_generation_prompt=add_generation_prompt,
-            return_assistant_tokens_mask=needs_assistant_mask,
-        )
-        if processed is None:
-            processed = self._render_chat_tokenize(messages, tools, add_generation_prompt=add_generation_prompt)
-
-        input_ids = list(processed["input_ids"])
-        attention_mask = list(processed.get("attention_mask", [1] * len(input_ids)))
-        labels = self._build_labels(messages, tools, input_ids, processed, label_mode)
-        if not self._has_trainable_labels(labels):
-            raise SkipSFTSampleError("assistant mask produced no trainable labels")
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
-
     def _tokenize_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
         """Convert dataset rows into tokenized causal language modeling samples."""
 
+        tokenizer = self.tokenizer
+        chat_processor = self.chat_processor
+        max_seq_length = self.data_config.max_seq_length
+        label_mode = self.data_config.label_mode
+        ignore_index = self.data_config.ignore_index
+        add_generation_prompt_config = self.data_config.add_generation_prompt
+        assistant_response_template_ids_config = self.data_config.assistant_response_template_ids
+        assistant_response_template = self.data_config.assistant_response_template
+        instruction_template_ids_config = self.data_config.instruction_template_ids
+        instruction_template = self.data_config.instruction_template
+
+        iter_batch_samples = self.iter_batch_samples
+        extract_assistant_mask = self._extract_assistant_mask
+        find_subsequence_starts = self._find_subsequence_starts
+        next_marker_start = self._next_marker_start
+        message_has_text = self._message_has_text
+
+        def assistant_response_template_ids() -> list[int]:
+            if assistant_response_template_ids_config is not None:
+                return list(assistant_response_template_ids_config)
+            if assistant_response_template is None:
+                return []
+            return list(tokenizer.encode(assistant_response_template, add_special_tokens=False))
+
+        def instruction_template_ids() -> list[int]:
+            if instruction_template_ids_config is not None:
+                return list(instruction_template_ids_config)
+            if instruction_template is None:
+                return []
+            return list(tokenizer.encode(instruction_template, add_special_tokens=False))
+
+        def should_add_generation_prompt(messages: list[dict[str, Any]]) -> bool:
+            return chat_processor.should_add_generation_prompt(messages, add_generation_prompt_config)
+
+        def apply_chat_template_tokenize(
+            messages: list[dict[str, Any]],
+            tools: Any,
+            *,
+            add_generation_prompt: bool,
+            return_assistant_tokens_mask: bool = False,
+        ) -> dict[str, Any] | None:
+            return chat_processor.tokenize(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                tools=tools,
+                max_length=max_seq_length,
+                return_assistant_tokens_mask=return_assistant_tokens_mask,
+            )
+
+        def split_prompt_and_completion(
+            messages: list[dict[str, Any]],
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+            if messages and messages[-1].get("role") == "assistant":
+                return messages[:-1], [messages[-1]]
+            return list(messages), []
+
+        def prompt_token_count(messages: list[dict[str, Any]], tools: Any) -> int:
+            prompt_messages, _ = split_prompt_and_completion(messages)
+            processed = apply_chat_template_tokenize(
+                prompt_messages,
+                tools,
+                add_generation_prompt=should_add_generation_prompt(prompt_messages),
+            )
+            return len(processed["input_ids"])
+
+        def labels_from_mask(full_ids: list[int], assistant_mask: list[bool]) -> list[int]:
+            if len(assistant_mask) != len(full_ids):
+                raise RuntimeError("Assistant token mask length does not match tokenized input length.")
+            return [token_id if mask else ignore_index for token_id, mask in zip(full_ids, assistant_mask)]
+
+        def labels_from_last_assistant_mask(
+            full_ids: list[int],
+            assistant_mask: list[bool],
+            prompt_len: int,
+        ) -> list[int]:
+            if len(assistant_mask) != len(full_ids):
+                raise RuntimeError("Assistant token mask length does not match tokenized input length.")
+            prompt_len = min(prompt_len, len(full_ids))
+            return [
+                token_id if mask and index >= prompt_len else ignore_index
+                for index, (token_id, mask) in enumerate(zip(full_ids, assistant_mask))
+            ]
+
+        def labels_from_response_template(
+            full_ids: list[int],
+            current_label_mode: Literal["last_assistant", "all_assistant"],
+        ) -> list[int]:
+            response_template_ids = assistant_response_template_ids()
+            if not response_template_ids:
+                raise RuntimeError(
+                    "Tokenizer did not provide assistant token masks. Configure data.assistant_response_template "
+                    "or data.assistant_response_template_ids to mask SFT labels from assistant response markers."
+                )
+
+            response_starts = find_subsequence_starts(full_ids, response_template_ids)
+            if not response_starts:
+                raise RuntimeError(
+                    "Configured assistant response template was not found in the tokenized sample. Check that "
+                    "data.assistant_response_template exactly matches the model chat template output, or configure "
+                    "data.assistant_response_template_ids."
+                )
+
+            current_instruction_template_ids = instruction_template_ids()
+            instruction_starts = (
+                find_subsequence_starts(full_ids, current_instruction_template_ids)
+                if current_instruction_template_ids
+                else []
+            )
+            if current_instruction_template_ids and not instruction_starts:
+                raise RuntimeError(
+                    "Configured instruction template was not found in the tokenized sample. Check that "
+                    "data.instruction_template exactly matches the model chat template output, or configure "
+                    "data.instruction_template_ids."
+                )
+            if current_label_mode == "all_assistant" and len(response_starts) > 1 and not instruction_starts:
+                raise RuntimeError(
+                    "Multi-turn assistant-only masking requires data.instruction_template or "
+                    "data.instruction_template_ids so user spans between assistant responses can be ignored."
+                )
+
+            all_marker_starts = sorted({*response_starts, *instruction_starts})
+            labels = [ignore_index] * len(full_ids)
+            if current_label_mode == "last_assistant":
+                response_start = response_starts[-1]
+                label_start = response_start + len(response_template_ids)
+                label_end = next_marker_start(all_marker_starts, response_start, len(full_ids))
+                labels[label_start:label_end] = full_ids[label_start:label_end]
+                return labels
+
+            for response_start in response_starts:
+                label_start = response_start + len(response_template_ids)
+                label_end = next_marker_start(all_marker_starts, response_start, len(full_ids))
+                labels[label_start:label_end] = full_ids[label_start:label_end]
+            return labels
+
+        def build_labels(
+            messages: list[dict[str, Any]],
+            tools: Any,
+            full_ids: list[int],
+            processed: dict[str, Any] | None,
+        ) -> list[int]:
+            if label_mode == "all_tokens":
+                return list(full_ids)
+
+            assistant_mask = extract_assistant_mask(processed or {}) if processed is not None else []
+            has_assistant_mask_tokens = assistant_mask and any(assistant_mask)
+            if has_assistant_mask_tokens and label_mode == "all_assistant":
+                return labels_from_mask(full_ids, assistant_mask)
+            if has_assistant_mask_tokens and label_mode == "last_assistant":
+                return labels_from_last_assistant_mask(
+                    full_ids,
+                    assistant_mask,
+                    prompt_token_count(messages, tools),
+                )
+            if label_mode in {"last_assistant", "all_assistant"}:
+                response_template_ids = assistant_response_template_ids()
+                if response_template_ids:
+                    return labels_from_response_template(full_ids, label_mode)
+            if label_mode == "all_assistant":
+                raise RuntimeError(
+                    "label_mode='all_assistant' requires tokenizer support for assistant token masks or a configured "
+                    "data.assistant_response_template/data.assistant_response_template_ids."
+                )
+
+            prompt_len = min(prompt_token_count(messages, tools), len(full_ids))
+            return [ignore_index] * prompt_len + full_ids[prompt_len:]
+
+        def validate_messages_for_training(messages: list[dict[str, Any]]) -> None:
+            user_messages = [message for message in messages if message.get("role") == "user"]
+            assistant_messages = [message for message in messages if message.get("role") == "assistant"]
+            if not user_messages:
+                raise SkipSFTSampleError("missing user message")
+            if not assistant_messages:
+                raise SkipSFTSampleError("missing assistant message")
+            if not any(message_has_text(message) for message in user_messages):
+                raise SkipSFTSampleError("empty prompt")
+            if not any(message_has_text(message) for message in assistant_messages):
+                raise SkipSFTSampleError("empty response")
+
+        def tokenize_sample(sample: dict[str, Any]) -> dict[str, list[int]]:
+            messages, tools = chat_processor.prepare_sample(sample)
+            messages = preprocess_chat_messages(messages)
+            validate_messages_for_training(messages)
+            add_generation_prompt = should_add_generation_prompt(messages)
+            needs_assistant_mask = label_mode in {"last_assistant", "all_assistant"}
+
+            processed = apply_chat_template_tokenize(
+                messages,
+                tools,
+                add_generation_prompt=add_generation_prompt,
+                return_assistant_tokens_mask=needs_assistant_mask,
+            )
+
+            input_ids = list(processed["input_ids"])
+            attention_mask = list(processed.get("attention_mask", [1] * len(input_ids)))
+            labels = build_labels(messages, tools, input_ids, processed)
+            if not any(label != ignore_index for label in labels):
+                raise SkipSFTSampleError("assistant mask produced no trainable labels")
+            return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
         def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
-            label_mode = self.data_config.label_mode
             tokenized_samples: list[dict[str, list[int]]] = []
             skipped_reasons: dict[str, int] = {}
 
-            for raw_sample in self.iter_batch_samples(batch):
+            for raw_sample in iter_batch_samples(batch):
                 try:
                     sample = formatter(raw_sample)
-                    tokenized_samples.append(self._tokenize_sample(sample, label_mode))
+                    tokenized_samples.append(tokenize_sample(sample))
                 except Exception as exc:
                     exc_message = str(exc)
                     reason = f"preprocessing error: {type(exc).__name__}"
