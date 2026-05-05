@@ -16,7 +16,7 @@ from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 from transformers.optimization import get_scheduler
 
 from lightning_grpo.models.rollout_engine import PolicyRolloutEngine
-from lightning_grpo.utils.configs.base import CheckpointConfig, EarlyStoppingConfig, LoggingConfig, ModelConfig, TrainingBaseConfig
+from lightning_grpo.utils.configs.base import LoggingConfig, ModelConfig, TrainingBaseConfig
 from lightning_grpo.utils.modeling import save_pth_weights, load_tokenizer, resolve_export_model
 from lightning_grpo.utils.config import save_json_config
 
@@ -453,27 +453,6 @@ class ConfigSnapshotCallback(Callback):
         save_json_config(self.config.to_dict(), config_path)
 
 
-def build_early_stopping_callback(
-    early_stopping_config: EarlyStoppingConfig,
-    checkpoint_config: CheckpointConfig,
-) -> EarlyStopping | None:
-    """Create an early stopping callback when the feature is enabled."""
-
-    if not early_stopping_config.enabled:
-        return None
-
-    return EarlyStopping(
-        monitor=early_stopping_config.monitor or checkpoint_config.monitor,
-        mode=early_stopping_config.mode or checkpoint_config.mode,
-        patience=max(0, early_stopping_config.patience),
-        min_delta=early_stopping_config.min_delta,
-        check_finite=early_stopping_config.check_finite,
-        stopping_threshold=early_stopping_config.stopping_threshold,
-        divergence_threshold=early_stopping_config.divergence_threshold,
-        verbose=early_stopping_config.verbose,
-    )
-
-
 def build_callbacks(config: TrainingBaseConfig) -> list[Callback]:
     """Build the callback stack for Lightning training."""
 
@@ -490,7 +469,6 @@ def build_callbacks(config: TrainingBaseConfig) -> list[Callback]:
 
     callbacks: list[Callback] = [
         ckpt_callback,
-        LearningRateMonitor(logging_interval="step"),
         LRandSchedulerOverrideCallback(config),
         EfficiencyMonitorCallback(log_every_n_steps=config.logging.log_every_n_steps),
         GlobalSampleCountCallback(log_every_n_steps=config.logging.log_every_n_steps),
@@ -499,14 +477,21 @@ def build_callbacks(config: TrainingBaseConfig) -> list[Callback]:
         ConfigSnapshotCallback(config),
         RichProgressBar(),
     ]
-    early_stopping_callback = build_early_stopping_callback(config.early_stopping, config.checkpoint)
-    if early_stopping_callback is not None:
-        callbacks.append(early_stopping_callback)
-    if config.logging.sample_every_n_steps > 0 and config.logging.sample_prompts:
+    if config.logging.enable_csv or config.logging.enable_wandb:
+        callbacks.append(LearningRateMonitor(logging_interval="step"))
+    if config.early_stopping.enabled:
         callbacks.append(
-            PeriodicSampleGenerationCallback(
-                logging_config=config.logging,
-                model_config=config.model,
+            EarlyStopping(
+                monitor=config.early_stopping.monitor or config.checkpoint.monitor,
+                mode=config.early_stopping.mode or config.checkpoint.mode,
+                patience=max(0, config.early_stopping.patience),
+                min_delta=config.early_stopping.min_delta,
+                check_finite=config.early_stopping.check_finite,
+                stopping_threshold=config.early_stopping.stopping_threshold,
+                divergence_threshold=config.early_stopping.divergence_threshold,
+                verbose=config.early_stopping.verbose,
             )
         )
+    if config.logging.sample_every_n_steps > 0 and config.logging.sample_prompts:
+        callbacks.append(PeriodicSampleGenerationCallback(logging_config=config.logging, model_config=config.model))
     return callbacks

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 import torch
 from datasets import Dataset
@@ -139,7 +139,8 @@ class SFTDataModule(ChatTemplateDataModule):
         tokenizer = self.tokenizer
         chat_processor = self.chat_processor
         max_seq_length = self.data_config.max_seq_length
-        label_mode = self.data_config.label_mode
+        completion_only_loss = self.data_config.completion_only_loss
+        assistant_only_loss = self.data_config.assistant_only_loss
         ignore_index = self.data_config.ignore_index
         add_generation_prompt_config = self.data_config.add_generation_prompt
         assistant_response_template_ids_config = self.data_config.assistant_response_template_ids
@@ -206,23 +207,13 @@ class SFTDataModule(ChatTemplateDataModule):
                 raise RuntimeError("Assistant token mask length does not match tokenized input length.")
             return [token_id if mask else ignore_index for token_id, mask in zip(full_ids, assistant_mask)]
 
-        def labels_from_last_assistant_mask(
-            full_ids: list[int],
-            assistant_mask: list[bool],
-            prompt_len: int,
-        ) -> list[int]:
-            if len(assistant_mask) != len(full_ids):
-                raise RuntimeError("Assistant token mask length does not match tokenized input length.")
-            prompt_len = min(prompt_len, len(full_ids))
-            return [
-                token_id if mask and index >= prompt_len else ignore_index
-                for index, (token_id, mask) in enumerate(zip(full_ids, assistant_mask))
-            ]
+        def completion_mask_from_prompt_len(full_ids: list[int], prompt_len: int) -> list[bool]:
+            """Build a completion mask from tokenized prompt length."""
 
-        def labels_from_response_template(
-            full_ids: list[int],
-            current_label_mode: Literal["last_assistant", "all_assistant"],
-        ) -> list[int]:
+            prompt_len = min(prompt_len, len(full_ids))
+            return [index >= prompt_len for index in range(len(full_ids))]
+
+        def labels_from_response_template(full_ids: list[int]) -> list[int]:
             response_template_ids = assistant_response_template_ids()
             if not response_template_ids:
                 raise RuntimeError(
@@ -250,21 +241,14 @@ class SFTDataModule(ChatTemplateDataModule):
                     "data.instruction_template exactly matches the model chat template output, or configure "
                     "data.instruction_template_ids."
                 )
-            if current_label_mode == "all_assistant" and len(response_starts) > 1 and not instruction_starts:
+            if len(response_starts) > 1 and not instruction_starts:
                 raise RuntimeError(
-                    "Multi-turn assistant-only masking requires data.instruction_template or "
+                    "Multi-turn assistant-only masking with response templates requires data.instruction_template or "
                     "data.instruction_template_ids so user spans between assistant responses can be ignored."
                 )
 
             all_marker_starts = sorted({*response_starts, *instruction_starts})
             labels = [ignore_index] * len(full_ids)
-            if current_label_mode == "last_assistant":
-                response_start = response_starts[-1]
-                label_start = response_start + len(response_template_ids)
-                label_end = next_marker_start(all_marker_starts, response_start, len(full_ids))
-                labels[label_start:label_end] = full_ids[label_start:label_end]
-                return labels
-
             for response_start in response_starts:
                 label_start = response_start + len(response_template_ids)
                 label_end = next_marker_start(all_marker_starts, response_start, len(full_ids))
@@ -277,31 +261,28 @@ class SFTDataModule(ChatTemplateDataModule):
             full_ids: list[int],
             processed: dict[str, Any] | None,
         ) -> list[int]:
-            if label_mode == "all_tokens":
-                return list(full_ids)
+            labels = list(full_ids)
 
-            assistant_mask = extract_assistant_mask(processed or {}) if processed is not None else []
-            has_assistant_mask_tokens = assistant_mask and any(assistant_mask)
-            if has_assistant_mask_tokens and label_mode == "all_assistant":
-                return labels_from_mask(full_ids, assistant_mask)
-            if has_assistant_mask_tokens and label_mode == "last_assistant":
-                return labels_from_last_assistant_mask(
-                    full_ids,
-                    assistant_mask,
-                    prompt_token_count(messages, tools),
-                )
-            if label_mode in {"last_assistant", "all_assistant"}:
-                response_template_ids = assistant_response_template_ids()
-                if response_template_ids:
-                    return labels_from_response_template(full_ids, label_mode)
-            if label_mode == "all_assistant":
-                raise RuntimeError(
-                    "label_mode='all_assistant' requires tokenizer support for assistant token masks or a configured "
-                    "data.assistant_response_template/data.assistant_response_template_ids."
-                )
+            if completion_only_loss:
+                completion_mask = completion_mask_from_prompt_len(full_ids, prompt_token_count(messages, tools))
+                labels = [token_id if mask else ignore_index for token_id, mask in zip(labels, completion_mask)]
 
-            prompt_len = min(prompt_token_count(messages, tools), len(full_ids))
-            return [ignore_index] * prompt_len + full_ids[prompt_len:]
+            if assistant_only_loss:
+                assistant_mask = extract_assistant_mask(processed or {}) if processed is not None else []
+                if assistant_mask and any(assistant_mask):
+                    if len(assistant_mask) != len(full_ids):
+                        raise RuntimeError("Assistant token mask length does not match tokenized input length.")
+                    labels = [label if mask else ignore_index for label, mask in zip(labels, assistant_mask)]
+                elif assistant_response_template_ids():
+                    assistant_labels = labels_from_response_template(full_ids)
+                    labels = [label if assistant_label != ignore_index else ignore_index for label, assistant_label in zip(labels, assistant_labels)]
+                else:
+                    raise RuntimeError(
+                        "assistant_only_loss=True requires tokenizer support for assistant token masks or a configured "
+                        "data.assistant_response_template/data.assistant_response_template_ids."
+                    )
+
+            return labels
 
         def validate_messages_for_training(messages: list[dict[str, Any]]) -> None:
             user_messages = [message for message in messages if message.get("role") == "user"]
@@ -320,7 +301,7 @@ class SFTDataModule(ChatTemplateDataModule):
             messages = preprocess_chat_messages(messages)
             validate_messages_for_training(messages)
             add_generation_prompt = should_add_generation_prompt(messages)
-            needs_assistant_mask = label_mode in {"last_assistant", "all_assistant"}
+            needs_assistant_mask = assistant_only_loss
 
             processed = apply_chat_template_tokenize(
                 messages,

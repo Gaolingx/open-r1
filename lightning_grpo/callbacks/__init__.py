@@ -5,7 +5,6 @@ from lightning_grpo.callbacks.core import (
     EfficiencyMonitorCallback,
     PeriodicSampleGenerationCallback,
     build_callbacks,
-    build_early_stopping_callback,
 )
 
 __all__ = [
@@ -13,5 +12,4 @@ __all__ = [
     "EfficiencyMonitorCallback",
     "PeriodicSampleGenerationCallback",
     "build_callbacks",
-    "build_early_stopping_callback",
 ]

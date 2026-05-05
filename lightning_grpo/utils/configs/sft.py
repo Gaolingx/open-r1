@@ -24,7 +24,8 @@ class ChatDataConfig(DataConfig):
 class SFTDataConfig(ChatDataConfig):
     """Dataset configuration specific to supervised fine-tuning."""
 
-    label_mode: Literal["all_tokens", "last_assistant", "all_assistant"] = "last_assistant"
+    completion_only_loss: Optional[bool] = None
+    assistant_only_loss: bool = False
     assistant_response_template: Optional[str] = None
     assistant_response_template_ids: Optional[list[int]] = None
     instruction_template: Optional[str] = None

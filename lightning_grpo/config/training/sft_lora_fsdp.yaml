@@ -30,7 +30,8 @@ data:
   preprocessing_batch_size: 128
   preprocessing_use_cache: false
   preprocessing_keep_in_memory: true
-  label_mode: last_assistant
+  completion_only_loss: true
+  assistant_only_loss: false
 
 optimization:
   optimizer:
