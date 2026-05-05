@@ -352,28 +352,6 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
     return dataset_dict
 
 
-def map_dataset_with_config(
-    dataset: Dataset,
-    preprocess_fn: Callable[[dict[str, list[Any]]], dict[str, list[Any]]],
-    data_config: DataConfig,
-    desc: str,
-    **kwargs: Any,
-) -> Dataset:
-    """Apply a batched dataset transform using shared preprocessing settings."""
-
-    return dataset.map(
-        preprocess_fn,
-        batched=True,
-        batch_size=data_config.preprocessing_batch_size,
-        num_proc=None if data_config.streaming else data_config.num_workers,
-        remove_columns=list(dataset.column_names),
-        load_from_cache_file=data_config.preprocessing_use_cache,
-        keep_in_memory=data_config.preprocessing_keep_in_memory,
-        desc=desc,
-        **kwargs,
-    )
-
-
 def apply_chat_template(
     tokenizer: Any,
     messages: list[dict[str, str]],
@@ -436,11 +414,15 @@ class BaseDataModule(LightningDataModule):
     ) -> Dataset:
         """Apply a shared batched dataset preprocessing transform."""
 
-        return map_dataset_with_config(
-            dataset,
+        return dataset.map(
             preprocess_fn,
-            self.data_config,
-            desc,
+            batched=True,
+            batch_size=self.data_config.preprocessing_batch_size,
+            num_proc=None if self.data_config.streaming else self.data_config.num_workers,
+            remove_columns=list(dataset.column_names),
+            load_from_cache_file=self.data_config.preprocessing_use_cache,
+            keep_in_memory=self.data_config.preprocessing_keep_in_memory,
+            desc=desc,
             **kwargs,
         )
 
