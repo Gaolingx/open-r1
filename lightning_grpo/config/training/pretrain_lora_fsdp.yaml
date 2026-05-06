@@ -51,8 +51,6 @@ logging:
   enable_csv: true
   enable_wandb: false
   log_every_n_steps: 100
-  sample_every_n_steps: 0
-  sample_prompts: []
 
 checkpoint:
   dirpath: outputs/lightning_pretrain_demo/checkpoints

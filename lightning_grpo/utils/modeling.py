@@ -99,9 +99,9 @@ def _apply_lora_if_needed(model: PreTrainedModel, model_config: ModelConfig) -> 
         lora_dropout=model_config.lora.dropout,
         bias=model_config.lora.bias,
         target_modules=model_config.lora.target_modules,
-        modules_to_save=model_config.lora.modules_to_save or None,
-        ensure_weight_tying=model_config.lora.ensure_weight_tying,
+        modules_to_save=model_config.lora.modules_to_save,
         task_type=TaskType.CAUSAL_LM,
+        **model_config.lora.lora_specific_kwargs,
     )
     model = get_peft_model(model, lora_config)
 

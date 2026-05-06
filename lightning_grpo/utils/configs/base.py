@@ -31,7 +31,7 @@ class LoRAConfig:
     bias: Literal["none", "all", "lora_only"] = "none"
     target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
     modules_to_save: list[str] = field(default_factory=list)
-    ensure_weight_tying: bool = False
+    lora_specific_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

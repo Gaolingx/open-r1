@@ -48,11 +48,9 @@ optimization:
 logging:
   project: open-r1-lightning
   run_name: pretrain-demo
-  enable_csv: false
-  enable_wandb: true
-  log_every_n_steps: 5
-  sample_every_n_steps: 0
-  sample_prompts: []
+  enable_csv: true
+  enable_wandb: false
+  log_every_n_steps: 100
 
 checkpoint:
   dirpath: outputs/lightning_pretrain_demo/checkpoints

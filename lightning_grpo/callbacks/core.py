@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from copy import copy
 import json
 import time
 from pathlib import Path
@@ -286,7 +287,8 @@ class PeriodicSampleGenerationCallback(Callback):
     def __init__(self, logging_config: LoggingConfig, model_config: ModelConfig) -> None:
         super().__init__()
         self.logging_config = logging_config
-        self.tokenizer = load_tokenizer(model_config)
+        self.tokenizer = copy(load_tokenizer(model_config))
+        self.tokenizer.padding_side = "left"
         self.rollout_engine: PolicyRolloutEngine | None = None
         self.last_sample_step: int = -1
 

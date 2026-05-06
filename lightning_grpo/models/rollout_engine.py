@@ -27,12 +27,16 @@ def compute_per_token_logps(
     n_keep: int,
     *,
     attention_mask: Optional[torch.Tensor] = None,
-    temperature: float = 1.0,
+    temperature: float,
 ) -> torch.Tensor:
     """Compute per-token log-probabilities for the sampled completion suffix."""
 
     if n_keep <= 0:
         return input_ids.new_empty((input_ids.size(0), 0), dtype=torch.float32)
+
+    temperature = 1.0 if temperature is None else float(temperature)
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive when computing log-probabilities, got {temperature}.")
 
     unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
     outputs = unwrapped(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
@@ -191,6 +195,7 @@ class PolicyRolloutEngine(RolloutEngine):
                 attention_mask=attention_mask[start:end],
                 use_cache=True,
                 generation_config=self._build_generation_config(num_generations),
+                output_router_logits=False,
             )
             generated_chunks.append(generated_chunk)
 

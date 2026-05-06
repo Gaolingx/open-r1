@@ -87,7 +87,6 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | FSDPStrateg
             gradient_as_bucket_view=config.gradient_as_bucket_view,
         )
     if config.strategy == "fsdp":
-        auto_wrap_policy = _resolve_policy_classes(config.fsdp_auto_wrap_policy_classes)
         activation_checkpointing_policy = None
         if config.fsdp_activation_checkpointing:
             activation_checkpointing_policy = _resolve_policy_classes(
@@ -96,7 +95,7 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | FSDPStrateg
 
         return FSDPStrategy(
             cpu_offload=CPUOffload(offload_params=config.fsdp_cpu_offload),
-            auto_wrap_policy=auto_wrap_policy,
+            auto_wrap_policy=_resolve_policy_classes(config.fsdp_auto_wrap_policy_classes),
             activation_checkpointing_policy=activation_checkpointing_policy,
             sharding_strategy=_resolve_sharding_strategy(config.fsdp_sharding_strategy),
             backward_prefetch=_resolve_backward_prefetch_strategy(config.fsdp_backward_prefetch),
