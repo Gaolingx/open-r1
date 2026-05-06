@@ -161,7 +161,7 @@ class PolicyRolloutEngine(RolloutEngine):
 
         generation_config = {
             key: value
-            for key, value in self.generation_config.config.to_dict().items()
+            for key, value in self.generation_config.to_dict().items()
             if key not in self._GENERATION_CONFIG_OVERRIDE_KEYS and value is not None
         }
         generation_config["num_return_sequences"] = num_generations
@@ -347,7 +347,7 @@ class SGLangRolloutEngine(RolloutEngine):
 
         sampling_params = {
             key: value
-            for key, value in self.generation_config.config.to_dict().items()
+            for key, value in self.generation_config.to_dict().items()
             if key not in self._SAMPLING_CONFIG_EXCLUDE_KEYS and value is not None
         }
 
