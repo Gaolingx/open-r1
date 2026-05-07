@@ -34,6 +34,23 @@ def resolve_torch_dtype(precision_config: PrecisionConfig) -> torch.dtype:
     return DTYPE_MAP[precision_config.parameter_dtype]
 
 
+def resolve_generation_config(
+    pretrained_model_path: Optional[str] = None,
+    generation_config_path: Optional[str] = None,
+    model_config: Optional[PreTrainedConfig] = None,
+) -> GenerationConfig:
+    """Resolve the generation config that should be saved with final exports."""
+
+    if pretrained_model_path:
+        return GenerationConfig.from_pretrained(pretrained_model_path)
+    elif generation_config_path:
+        return GenerationConfig.from_dict(load_json_config(generation_config_path))
+    elif model_config:
+        return GenerationConfig.from_model_config(model_config)
+    else:
+        raise ValueError("One of pretrained_model_path, generation_config_path, or model_config must be provided.")
+
+
 def load_tokenizer(model_config: ModelConfig) -> PreTrainedTokenizerBase:
     """Load and normalize the tokenizer."""
 
@@ -215,6 +232,9 @@ def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig)
     if hasattr(model, "config"):
         model.config.use_cache = model_config.use_cache
 
+    if model_config.model_generation_config_path:
+        model.generation_config = resolve_generation_config(generation_config_path=model_config.model_generation_config_path)
+
     if model_config.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -263,7 +283,6 @@ def export_configured_model(
     base_dir: str | Path,
     *,
     tokenizer: PreTrainedTokenizerBase | None = None,
-    generation_config: GenerationConfig | None = None,
 ) -> dict[str, Path]:
     """Export model artifacts according to config flags using standard directory names."""
 
@@ -285,7 +304,6 @@ def export_configured_model(
             model_config,
             hf_dir,
             tokenizer=tokenizer,
-            generation_config=generation_config,
             safe_serialization=True,
         )
         exported_paths["safetensors"] = hf_dir
@@ -303,7 +321,6 @@ def export_hf_model(
     export_dir: str | Path,
     *,
     tokenizer: PreTrainedTokenizerBase | None = None,
-    generation_config: GenerationConfig | None = None,
     state_dict: dict[str, torch.Tensor] | None = None,
     safe_serialization: bool = False,
 ) -> Path:
@@ -326,8 +343,6 @@ def export_hf_model(
         resolved_tokenizer = load_tokenizer(model_config)
     if resolved_tokenizer is not None:
         resolved_tokenizer.save_pretrained(str(export_path))
-    if generation_config is not None:
-        generation_config.save_pretrained(str(export_path))
 
     return export_path
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-from copy import copy
 import json
 import time
 from pathlib import Path
@@ -287,7 +286,7 @@ class PeriodicSampleGenerationCallback(Callback):
     def __init__(self, logging_config: LoggingConfig, model_config: ModelConfig) -> None:
         super().__init__()
         self.logging_config = logging_config
-        self.tokenizer = copy(load_tokenizer(model_config))
+        self.tokenizer = load_tokenizer(model_config)
         self.tokenizer.padding_side = "left"
         self.rollout_engine: PolicyRolloutEngine | None = None
         self.last_sample_step: int = -1
@@ -304,8 +303,6 @@ class PeriodicSampleGenerationCallback(Callback):
             self.rollout_engine = PolicyRolloutEngine(
                 policy_model=model,
                 tokenizer=self.tokenizer,
-                generation_config_path=self.logging_config.sample_generation_config_path,
-                model_config=model_config,
             )
         else:
             self.rollout_engine.update_policy(model)
@@ -324,18 +321,15 @@ class PeriodicSampleGenerationCallback(Callback):
             writer.writerows(rows)
 
     def _write_wandb_samples(self, logger: WandbLogger, rows: list[dict[str, Any]], step: int) -> None:
-        """Log generated samples as a W&B table when W&B is enabled."""
+        """Log generated samples as a W&B table."""
 
-        try:
-            import wandb
-        except ImportError:
-            rank_zero_info("[PeriodicSampleGenerationCallback] wandb is not installed; skipping sample table logging.")
-            return
+        columns = ["step", "prompt_index", "prompt", "completion"]
+        data = [
+            [row["step"], row["prompt_index"], row["prompt"], row["completion"]]
+            for row in rows
+        ]
 
-        table = wandb.Table(columns=["step", "prompt_index", "prompt", "completion"])
-        for row in rows:
-            table.add_data(row["step"], row["prompt_index"], row["prompt"], row["completion"])
-        logger.experiment.log({"samples/generations": table}, step=step)
+        logger.log_table(key="samples/generations", columns=columns, data=data, step=step)
 
     def _log_samples(self, trainer: L.Trainer, rows: list[dict[str, Any]], step: int) -> None:
         """Print samples and persist them to supported loggers."""

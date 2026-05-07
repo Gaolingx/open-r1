@@ -61,6 +61,7 @@ class BaseRewardConfig:
     code_eval_test_batch_size: int = 1
     code_eval_scoring_mode: str = "weighted_sum"
     ioi_provider: str = "piston"
+    max_completion_len: int = 16384
     soft_punish_cache: int = 0
 
 
@@ -110,7 +111,6 @@ class DebugConfig:
     enabled: bool = False
     every_n_steps: int = 0
     questions: list[str] = field(default_factory=list)
-    generation_config_path: Optional[str] = None
 
 
 @dataclass
@@ -120,7 +120,7 @@ class RolloutConfig:
     num_generations: int = 8
     num_generations_eval: int | None = None
     max_prompt_length: int = 2048
-    generation_config_path: Optional[str] = None
+    sampling_config_path: Optional[str] = None
     kl_beta: float = 0.04
     epsilon: float = 0.2
     epsilon_high: float = 5.0

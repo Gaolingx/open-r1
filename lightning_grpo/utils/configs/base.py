@@ -44,6 +44,7 @@ class ModelConfig:
     model_revision: str = "main"
     tokenizer_name_or_path: Optional[str] = None
     model_config_path: Optional[str] = None
+    model_generation_config_path: Optional[str] = None
     model_init_kwargs: dict[str, Any] = field(default_factory=dict)
     custom_weight_dir: str = None
     trust_remote_code: bool = False
@@ -167,7 +168,6 @@ class LoggingConfig:
     enable_csv: bool = True
     sample_prompts: list[str] = field(default_factory=list)
     sample_every_n_steps: int = 0
-    sample_generation_config_path: Optional[str] = None
 
 
 @dataclass

@@ -12,11 +12,10 @@ from typing import Any, Optional
 import requests
 import torch
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig, PreTrainedConfig, PreTrainedTokenizerBase
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
 
-from lightning_grpo.models.common import resolve_generation_config
 from lightning_grpo.utils.configs.grpo import RewardModelConfig
-from lightning_grpo.utils.modeling import DTYPE_MAP
+from lightning_grpo.utils.modeling import DTYPE_MAP, resolve_generation_config
 
 
 logger = logging.getLogger(__name__)
@@ -94,13 +93,10 @@ class PolicyRolloutEngine(RolloutEngine):
         self,
         policy_model: torch.nn.Module,
         tokenizer: PreTrainedTokenizerBase,
-        generation_config_path: Optional[str],
-        model_config: Optional[PreTrainedConfig] = None,
         generation_batch_size: int = 0,
     ) -> None:
         self.policy_model = policy_model
         self.tokenizer = tokenizer
-        self.generation_config = resolve_generation_config(generation_config_path, model_config)
         self.generation_batch_size = max(0, int(generation_batch_size))
 
     def rollout(
@@ -143,7 +139,7 @@ class PolicyRolloutEngine(RolloutEngine):
             model_input_ids,
             completion_ids.shape[1],
             attention_mask=model_attention_mask,
-            temperature=self.generation_config.temperature,
+            temperature=self.policy_model.generation_config.temperature,
         )
         return RolloutResult(
             output_ids=model_input_ids,
@@ -165,7 +161,7 @@ class PolicyRolloutEngine(RolloutEngine):
 
         generation_config = {
             key: value
-            for key, value in self.generation_config.to_dict().items()
+            for key, value in self.policy_model.generation_config.to_dict().items()
             if key not in self._GENERATION_CONFIG_OVERRIDE_KEYS and value is not None
         }
         generation_config["num_return_sequences"] = num_generations
@@ -193,7 +189,6 @@ class PolicyRolloutEngine(RolloutEngine):
             generated_chunk = model.generate(
                 input_ids=prompt_ids[start:end],
                 attention_mask=attention_mask[start:end],
-                use_cache=True,
                 generation_config=self._build_generation_config(num_generations),
                 output_router_logits=False,
             )
@@ -305,8 +300,7 @@ class SGLangRolloutEngine(RolloutEngine):
         model_path: str,
         shared_ckpt_path: str,
         timeout: int,
-        generation_config_path: Optional[str],
-        model_config: Optional[PreTrainedConfig] = None,
+        sampling_config_path: str,
         max_retries: int,
         retry_backoff_seconds: float,
         retry_max_backoff_seconds: float,
@@ -319,7 +313,7 @@ class SGLangRolloutEngine(RolloutEngine):
         self.retry_max_backoff_seconds = max(self.retry_backoff_seconds, float(retry_max_backoff_seconds))
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.http = requests
-        self.generation_config = resolve_generation_config(generation_config_path, model_config)
+        self.generation_config = resolve_generation_config(generation_config_path=sampling_config_path)
 
     def _request_with_retry(self, endpoint: str, payload: dict[str, Any]) -> Any:
         """Execute an HTTP request with bounded retries and backoff."""
@@ -482,8 +476,7 @@ def create_rollout_engine(
     engine_type: str,
     policy_model: torch.nn.Module,
     tokenizer: PreTrainedTokenizerBase,
-    generation_config_path: Optional[str],
-    model_config: Optional[PreTrainedConfig] = None,
+    sampling_config_path: str,
     generation_batch_size: int = 0,
     sglang_base_url: Optional[str] = None,
     sglang_model_path: Optional[str] = None,
@@ -500,8 +493,6 @@ def create_rollout_engine(
         return PolicyRolloutEngine(
             policy_model=policy_model,
             tokenizer=tokenizer,
-            generation_config_path=generation_config_path,
-            model_config=model_config,
             generation_batch_size=generation_batch_size,
         )
     if engine_type == "sglang":
@@ -512,8 +503,7 @@ def create_rollout_engine(
             model_path=sglang_model_path,
             shared_ckpt_path=sglang_shared_path or "./sglang_ckpt_grpo",
             timeout=request_timeout,
-            generation_config_path=generation_config_path,
-            model_config=model_config,
+            sampling_config_path=sampling_config_path,
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
             retry_max_backoff_seconds=retry_max_backoff_seconds,

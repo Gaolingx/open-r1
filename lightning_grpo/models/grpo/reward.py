@@ -51,7 +51,7 @@ class GRPORewardManager:
             code_eval_test_batch_size=getattr(reward, "code_eval_test_batch_size", 1),
             code_eval_scoring_mode=getattr(reward, "code_eval_scoring_mode", "weighted_sum"),
             ioi_provider=getattr(reward, "ioi_provider", "piston"),
-            max_completion_len=getattr(self.rollout_engine.generation_config, "max_new_tokens", None),
+            max_completion_len=getattr(reward, "max_completion_len", 16384),
             soft_punish_cache=getattr(reward, "soft_punish_cache", 0),
             reward_model_engine=self.reward_model_engine,
         )
