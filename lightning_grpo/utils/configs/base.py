@@ -38,9 +38,10 @@ class LoRAConfig:
 class ModelConfig:
     """Model loading and architecture adaptation settings."""
 
-    custom_model: bool = False
     model_name_or_path: str = None
     model_revision: str = "main"
+    custom_model: bool = False
+    model_class_path: Optional[str] = None
     tokenizer_name_or_path: Optional[str] = None
     model_config_path: Optional[str] = None
     model_generation_config_path: Optional[str] = None

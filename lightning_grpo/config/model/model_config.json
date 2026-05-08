@@ -35,9 +35,5 @@
   "transformers_version": "4.51.0",
   "use_cache": true,
   "use_sliding_window": false,
-  "vocab_size": 32006,
-  "auto_map": {
-    "AutoConfig": "configuration_nekomind_moe.NekoMindMoeConfig",
-    "AutoModelForCausalLM": "modeling_nekomind_moe.NekoMindMoeForCausalLM"
-  }
+  "vocab_size": 32006
 }

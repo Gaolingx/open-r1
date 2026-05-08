@@ -49,7 +49,9 @@ class PretrainLightningModule(L.LightningModule):
                 ignore_index=self.config.data.ignore_index,
             )
 
-        stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
+        with torch.no_grad():
+            stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
+
         on_step = stage == "train"
         self.log(f"{stage}/loss", loss, prog_bar=True, on_step=on_step, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
