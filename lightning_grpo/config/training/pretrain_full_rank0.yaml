@@ -9,8 +9,7 @@ precision:
 model:
   custom_model: true
   tokenizer_name_or_path: lightning_grpo/module/nekomind/tokenizer
-  model_config_path: lightning_grpo/config/model/model_config.json
-  pretrained_weight: none
+  model_config_path: lightning_grpo/module/nekomind/nekomind_moe
   gradient_checkpointing: true
   use_cache: false
   lora:

@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
 
 from lightning_grpo.utils.configs.grpo import RewardModelConfig
-from lightning_grpo.utils.modeling import DTYPE_MAP, resolve_generation_config
+from lightning_grpo.utils.modeling import DTYPE_MAP
 
 
 logger = logging.getLogger(__name__)
@@ -312,8 +312,8 @@ class SGLangRolloutEngine(RolloutEngine):
         self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self.retry_max_backoff_seconds = max(self.retry_backoff_seconds, float(retry_max_backoff_seconds))
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.generation_config = GenerationConfig.from_pretrained(generation_config_path=sampling_config_path)
         self.http = requests
-        self.generation_config = resolve_generation_config(generation_config_path=sampling_config_path)
 
     def _request_with_retry(self, endpoint: str, payload: dict[str, Any]) -> Any:
         """Execute an HTTP request with bounded retries and backoff."""

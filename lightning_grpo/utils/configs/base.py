@@ -39,14 +39,12 @@ class ModelConfig:
     """Model loading and architecture adaptation settings."""
 
     custom_model: bool = False
-    model_class_path: Optional[str] = None
     model_name_or_path: str = None
     model_revision: str = "main"
     tokenizer_name_or_path: Optional[str] = None
     model_config_path: Optional[str] = None
     model_generation_config_path: Optional[str] = None
     model_init_kwargs: dict[str, Any] = field(default_factory=dict)
-    custom_weight_dir: str = None
     trust_remote_code: bool = False
     attn_implementation: Optional[str] = "flash_attention_2"
     chat_template: Optional[str] = None
