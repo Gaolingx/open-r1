@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from lightning_grpo.models.common import entropy_from_logits, masked_mean
+from lightning_grpo.models.common import entropy_from_logits, masked_mean, materialize_vocab_parallel_logits
 from lightning_grpo.models.rollout_engine import compute_per_token_logps
 from lightning_grpo.utils.modeling import collect_moe_metrics
 
@@ -107,7 +107,7 @@ class GRPOLossComputer:
         logits_to_keep = completion_ids.shape[1]
 
         outputs = self.module.policy(input_ids=model_input_ids, attention_mask=model_attention_mask, use_cache=False)
-        logits = outputs.logits[:, :-1, :]
+        logits = materialize_vocab_parallel_logits(outputs.logits)[:, :-1, :]
         logits = logits[:, -logits_to_keep:, :] / self.rollout_temperature
         per_token_logps = self.selective_log_softmax(logits, completion_ids)
         moe_metrics = collect_moe_metrics(outputs)

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.nn.functional as F
+from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor.parallel import loss_parallel
 from transformers.optimization import get_scheduler
 
 from lightning_grpo.utils.configs.base import OptimizationConfig
@@ -156,9 +160,24 @@ def selective_log_softmax(logits: torch.Tensor, target_ids: torch.Tensor) -> tor
     return torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
 
 
+def tensor_parallel_loss_context(enabled: bool) -> Any:
+    """Return the PyTorch loss-parallel context when vocab logits are sharded."""
+
+    return loss_parallel() if enabled else nullcontext()
+
+
+def materialize_vocab_parallel_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Gather DTensor vocabulary-sharded logits for metrics that require full vocab tensors."""
+
+    if isinstance(logits, DTensor):
+        return logits.redistribute(placements=[Replicate()]).to_local()
+    return logits
+
+
 def masked_token_stats(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int = -100) -> dict[str, torch.Tensor]:
     """Compute reusable masked token-level metrics for LM training."""
 
+    logits = materialize_vocab_parallel_logits(logits)
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
     mask = shift_labels != ignore_index
@@ -183,3 +202,19 @@ def masked_token_stats(logits: torch.Tensor, labels: torch.Tensor, ignore_index:
         "mean_logprob": mean_logprob,
         "perplexity": perplexity,
     }
+
+
+def compute_cross_entropy_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Compute token-level next-token loss with optional label smoothing."""
+
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    vocab_size = shift_logits.size(-1)
+
+    with tensor_parallel_loss_context(self.config.distributed.tensor_parallel.loss_parallel):
+        return F.cross_entropy(
+            shift_logits.reshape(-1, vocab_size),
+            shift_labels.reshape(-1),
+            ignore_index=self.config.data.ignore_index,
+            label_smoothing=self.config.label_smoothing,
+        )

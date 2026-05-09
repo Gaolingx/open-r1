@@ -16,6 +16,7 @@ from lightning_grpo.models.grpo import (
     GRPORolloutCoordinator,
 )
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
+from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.utils.modeling import count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer
 
@@ -72,8 +73,9 @@ class GRPOLightningModule(L.LightningModule):
         return self.policy(**batch)
 
     def configure_model(self) -> None:
-        """Apply composable FSDP2 wrapping to the trainable policy model."""
+        """Apply tensor parallelism, then composable FSDP2 to the trainable policy model."""
 
+        configure_tensor_parallel(self.policy, self.config.distributed, getattr(self, "device_mesh", None))
         configure_fully_shard(self.policy, self.config.distributed, getattr(self, "device_mesh", None))
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:

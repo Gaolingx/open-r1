@@ -6,12 +6,12 @@ from typing import Any
 
 import lightning as L
 import torch
-import torch.nn.functional as F
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.sft import SFTConfig
-from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats
+from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats, compute_cross_entropy_loss
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
+from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
@@ -35,33 +35,24 @@ class SFTLightningModule(L.LightningModule):
         return self.model(**batch)
 
     def configure_model(self) -> None:
-        """Apply composable FSDP2 wrapping after Lightning creates the device mesh."""
+        """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
+        configure_tensor_parallel(self.model, self.config.distributed, getattr(self, "device_mesh", None))
         configure_fully_shard(self.model, self.config.distributed, getattr(self, "device_mesh", None))
-
-    def _compute_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Compute token-level next-token loss with optional label smoothing."""
-
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        vocab_size = shift_logits.size(-1)
-
-        return F.cross_entropy(
-            shift_logits.view(-1, vocab_size),
-            shift_labels.view(-1),
-            ignore_index=self.config.data.ignore_index,
-            label_smoothing=self.config.label_smoothing,
-        )
 
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """Run one SFT optimization/evaluation step and log metrics."""
 
         labels = batch["labels"]
-        outputs = self(**{**batch, "use_cache": False})
-        if hasattr(outputs, "loss") and outputs.loss is not None:
-            loss = outputs.loss
+        if self.config.distributed.tensor_parallel.loss_parallel:
+            outputs = self(**{key: value for key, value in batch.items() if key != "labels"}, use_cache=False)
+            loss = compute_cross_entropy_loss(outputs.logits, labels)
         else:
-            loss = self._compute_loss(outputs.logits, labels)
+            outputs = self(**{**batch, "use_cache": False})
+            if hasattr(outputs, "loss") and outputs.loss is not None:
+                loss = outputs.loss
+            else:
+                loss = self._compute_loss(outputs.logits, labels)
 
         with torch.no_grad():
             stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)

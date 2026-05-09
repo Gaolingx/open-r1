@@ -14,6 +14,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
 
+from lightning_grpo.models.common import materialize_vocab_parallel_logits
 from lightning_grpo.utils.configs.grpo import RewardModelConfig
 from lightning_grpo.utils.modeling import DTYPE_MAP
 
@@ -39,7 +40,7 @@ def compute_per_token_logps(
 
     unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
     outputs = unwrapped(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-    logits = outputs.logits[:, :-1, :]
+    logits = materialize_vocab_parallel_logits(outputs.logits)[:, :-1, :]
     logits = logits[:, -n_keep:, :] / temperature
     target_ids = input_ids[:, -n_keep:]
     log_probs = torch.log_softmax(logits, dim=-1)

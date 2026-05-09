@@ -71,4 +71,15 @@ distributed:
   accelerator: gpu
   devices: 8
   num_nodes: 1
+  data_parallel_size: auto
+  tensor_parallel_size: 1
   sync_batchnorm: false
+  tensor_parallel:
+    enabled: false
+    plan: auto
+    sequence_parallel: false
+    parallelize_mlp: false
+    parallelize_embedding: false
+    parallelize_lm_head: false
+    vocab_parallel: false
+    loss_parallel: false
