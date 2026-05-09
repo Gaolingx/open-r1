@@ -202,11 +202,6 @@ class SFTDataModule(ChatTemplateDataModule):
             )
             return len(processed["input_ids"])
 
-        def labels_from_mask(full_ids: list[int], assistant_mask: list[bool]) -> list[int]:
-            if len(assistant_mask) != len(full_ids):
-                raise RuntimeError("Assistant token mask length does not match tokenized input length.")
-            return [token_id if mask else ignore_index for token_id, mask in zip(full_ids, assistant_mask)]
-
         def completion_mask_from_prompt_len(full_ids: list[int], prompt_len: int) -> list[bool]:
             """Build a completion mask from tokenized prompt length."""
 
