@@ -204,17 +204,23 @@ def masked_token_stats(logits: torch.Tensor, labels: torch.Tensor, ignore_index:
     }
 
 
-def compute_cross_entropy_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def compute_cross_entropy_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+    loss_parallel_enabled: bool = False,
+) -> torch.Tensor:
     """Compute token-level next-token loss with optional label smoothing."""
 
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
     vocab_size = shift_logits.size(-1)
 
-    with tensor_parallel_loss_context(self.config.distributed.tensor_parallel.loss_parallel):
+    with tensor_parallel_loss_context(loss_parallel_enabled):
         return F.cross_entropy(
             shift_logits.reshape(-1, vocab_size),
             shift_labels.reshape(-1),
-            ignore_index=self.config.data.ignore_index,
-            label_smoothing=self.config.label_smoothing,
+            ignore_index=ignore_index,
+            label_smoothing=label_smoothing,
         )

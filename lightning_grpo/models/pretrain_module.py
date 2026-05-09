@@ -46,13 +46,22 @@ class PretrainLightningModule(L.LightningModule):
         labels = batch["labels"]
         if self.config.distributed.tensor_parallel.loss_parallel:
             outputs = self(**{key: value for key, value in batch.items() if key != "labels"}, use_cache=False)
-            loss = compute_cross_entropy_loss(outputs.logits, labels)
+            loss = compute_cross_entropy_loss(
+                outputs.logits,
+                labels,
+                ignore_index=self.config.data.ignore_index,
+                loss_parallel_enabled=True,
+            )
         else:
             outputs = self(**{**batch, "use_cache": False})
             if hasattr(outputs, "loss") and outputs.loss is not None:
                 loss = outputs.loss
             else:
-                loss = self._compute_loss(outputs.logits, labels)
+                loss = compute_cross_entropy_loss(
+                    outputs.logits,
+                    labels,
+                    ignore_index=self.config.data.ignore_index,
+                )
 
         with torch.no_grad():
             stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
