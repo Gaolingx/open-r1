@@ -111,5 +111,3 @@ distributed:
   accelerator: gpu
   devices: 1
   num_nodes: 1
-  fsdp_activation_checkpointing: true
-  fsdp_sharding_strategy: FULL_SHARD

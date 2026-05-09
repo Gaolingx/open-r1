@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats
+from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
 from lightning_grpo.utils.modeling import count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
@@ -32,6 +33,11 @@ class PretrainLightningModule(L.LightningModule):
         """Forward tokens through the wrapped language model."""
 
         return self.model(**batch)
+
+    def configure_model(self) -> None:
+        """Apply composable FSDP2 wrapping after Lightning creates the device mesh."""
+
+        configure_fully_shard(self.model, self.config.distributed, getattr(self, "device_mesh", None))
 
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """Run one pretraining optimization/evaluation step and log metrics."""

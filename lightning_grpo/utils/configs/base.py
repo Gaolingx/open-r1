@@ -55,6 +55,7 @@ class ModelConfig:
     gradient_checkpointing: bool = True
     use_cache: bool = False
     compile_model: bool = False
+    compile_specific_kwargs: dict[str, Any] = field(default_factory=dict)
     save_pth_format: bool = True
     save_safetensors_format: bool = False
     lora: LoRAConfig = field(default_factory=LoRAConfig)
@@ -201,21 +202,20 @@ class EarlyStoppingConfig:
 class DistributedConfig:
     """Distributed strategy configuration for Lightning."""
 
-    strategy: Literal["auto", "ddp", "fsdp"] = "auto"
+    strategy: Literal["auto", "ddp", "fsdp2", "model_parallel"] = "auto"
     devices: int | str = "auto"
     num_nodes: int = 1
     accelerator: Literal["auto", "gpu", "cpu"] = "auto"
     sync_batchnorm: bool = False
+    data_parallel_size: int | str = "auto"
+    tensor_parallel_size: int = 1
     find_unused_parameters: bool = False
     gradient_as_bucket_view: bool = True
-    fsdp_cpu_offload: bool = False
-    fsdp_activation_checkpointing: bool = True
-    fsdp_sharding_strategy: Literal["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"] = "FULL_SHARD"
-    fsdp_backward_prefetch: Literal["BACKWARD_PRE", "BACKWARD_POST"] = "BACKWARD_PRE"
     fsdp_auto_wrap_policy_classes: list[str] = field(default_factory=list)
-    fsdp_activation_checkpointing_policy_classes: list[str] = field(default_factory=list)
-    fsdp_state_dict_type: Literal["full", "sharded"] = "full"
-    fsdp_specific_kwargs: dict[str, Any] = field(default_factory=dict)
+    fsdp_fully_shard_module_names: list[str] = field(default_factory=list)
+    fsdp_fully_shard_root: bool = True
+    fsdp_fully_shard_kwargs: dict[str, Any] = field(default_factory=dict)
+    model_parallel_specific_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

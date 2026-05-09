@@ -204,7 +204,7 @@ def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig)
     model = _apply_lora_if_needed(model, model_config)
 
     if model_config.compile_model and hasattr(torch, "compile"):
-        model = torch.compile(model)
+        model = torch.compile(model, **model_config.compile_specific_kwargs)
 
     return model
 

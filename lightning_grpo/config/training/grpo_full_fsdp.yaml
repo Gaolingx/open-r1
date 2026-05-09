@@ -101,9 +101,7 @@ checkpoint:
   every_n_train_steps: 100
 
 distributed:
-  strategy: fsdp
+  strategy: fsdp2
   accelerator: gpu
   devices: 8
   num_nodes: 1
-  fsdp_activation_checkpointing: true
-  fsdp_sharding_strategy: FULL_SHARD

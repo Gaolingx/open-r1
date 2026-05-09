@@ -65,7 +65,7 @@ def build_loggers(config: TrainingBaseConfig) -> list[Any]:
 
 
 def build_trainer(config: TrainingBaseConfig) -> L.Trainer:
-    """Create a Lightning trainer with DDP or FSDP support."""
+    """Create a Lightning trainer with DDP or FSDP2 support."""
 
     strategy_kwargs = trainer_strategy_kwargs(
         config.distributed,

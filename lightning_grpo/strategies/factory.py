@@ -2,65 +2,12 @@
 
 from __future__ import annotations
 
-from importlib import import_module
 from typing import Any
 
 import torch
-from lightning.pytorch.strategies import DDPStrategy, FSDPStrategy
-from torch.distributed.fsdp import BackwardPrefetch, CPUOffload, ShardingStrategy
-from torch.nn import Module
+from lightning.pytorch.strategies import DDPStrategy, ModelParallelStrategy
 
 from lightning_grpo.utils.configs.base import DistributedConfig, PrecisionConfig
-
-
-def _resolve_sharding_strategy(name: str) -> ShardingStrategy:
-    """Map string configuration to an FSDP sharding strategy."""
-
-    mapping = {
-        "FULL_SHARD": ShardingStrategy.FULL_SHARD,
-        "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
-        "NO_SHARD": ShardingStrategy.NO_SHARD,
-    }
-    if name not in mapping:
-        raise ValueError(f"Unsupported FSDP sharding strategy: {name}")
-    return mapping[name]
-
-
-def _resolve_backward_prefetch_strategy(name: str) -> BackwardPrefetch:
-    """Map string configuration to an FSDP backward prefetch strategy."""
-
-    mapping = {
-        "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
-        "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
-    }
-    if name not in mapping:
-        raise ValueError(f"Unsupported FSDP backward prefetch strategy: {name}")
-    return mapping[name]
-
-
-def _import_module_class(path: str) -> type[Module]:
-    """Import a module class from a fully-qualified dotted path."""
-
-    module_path, _, class_name = path.rpartition(".")
-    if not module_path or not class_name:
-        raise ValueError(
-            "FSDP policy class paths must be fully-qualified, for example "
-            "`transformers.models.llama.modeling_llama.LlamaDecoderLayer`."
-        )
-
-    module = import_module(module_path)
-    class_object = getattr(module, class_name)
-    if not isinstance(class_object, type) or not issubclass(class_object, Module):
-        raise TypeError(f"FSDP policy target must be a torch.nn.Module subclass: {path}")
-    return class_object
-
-
-def _resolve_policy_classes(class_paths: list[str]) -> set[type[Module]] | None:
-    """Resolve YAML-configured class paths into an FSDP policy set."""
-
-    if not class_paths:
-        return None
-    return {_import_module_class(class_path) for class_path in class_paths}
 
 
 def configure_cuda_precision(
@@ -76,7 +23,7 @@ def configure_cuda_precision(
     torch.set_float32_matmul_precision("high" if precision_config.tf32 else "highest")
 
 
-def build_strategy(config: DistributedConfig) -> str | DDPStrategy | FSDPStrategy:
+def build_strategy(config: DistributedConfig) -> str | DDPStrategy | ModelParallelStrategy:
     """Build the Lightning strategy object from configuration."""
 
     if config.strategy == "auto":
@@ -86,21 +33,11 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | FSDPStrateg
             find_unused_parameters=config.find_unused_parameters,
             gradient_as_bucket_view=config.gradient_as_bucket_view,
         )
-    if config.strategy == "fsdp":
-        activation_checkpointing_policy = None
-        if config.fsdp_activation_checkpointing:
-            activation_checkpointing_policy = _resolve_policy_classes(
-                config.fsdp_activation_checkpointing_policy_classes
-            )
-
-        return FSDPStrategy(
-            cpu_offload=CPUOffload(offload_params=config.fsdp_cpu_offload),
-            auto_wrap_policy=_resolve_policy_classes(config.fsdp_auto_wrap_policy_classes),
-            activation_checkpointing_policy=activation_checkpointing_policy,
-            sharding_strategy=_resolve_sharding_strategy(config.fsdp_sharding_strategy),
-            backward_prefetch=_resolve_backward_prefetch_strategy(config.fsdp_backward_prefetch),
-            state_dict_type=config.fsdp_state_dict_type,
-            **config.fsdp_specific_kwargs,
+    if config.strategy in {"fsdp2", "model_parallel"}:
+        return ModelParallelStrategy(
+            data_parallel_size=config.data_parallel_size,
+            tensor_parallel_size=config.tensor_parallel_size,
+            **config.model_parallel_specific_kwargs,
         )
     raise ValueError(f"Unknown distributed strategy: {config.strategy}")
 

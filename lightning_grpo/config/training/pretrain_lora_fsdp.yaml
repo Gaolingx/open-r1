@@ -60,7 +60,7 @@ checkpoint:
   every_n_train_steps: 1000
 
 distributed:
-  strategy: fsdp
+  strategy: fsdp2
   accelerator: gpu
   devices: 8
   num_nodes: 1
