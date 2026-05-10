@@ -64,6 +64,8 @@ def configure_fully_shard(
         pp_enabled=False,
         shard_kwargs=dict(distributed_config.fsdp_fully_shard_kwargs),
         cpu_offload=distributed_config.fsdp_cpu_offload,
+        forward_prefetch=distributed_config.fsdp_forward_prefetch,
+        backward_prefetch=distributed_config.fsdp_backward_prefetch,
         reshard_after_forward_policy=distributed_config.fsdp_reshard_after_forward,
     )
 
@@ -76,6 +78,8 @@ def _apply_fsdp(
     pp_enabled: bool,
     shard_kwargs: dict[str, Any],
     cpu_offload: bool = False,
+    forward_prefetch: bool = True,
+    backward_prefetch: bool = True,
     reshard_after_forward_policy: str = "default",
 ) -> None:
     """
@@ -87,7 +91,10 @@ def _apply_fsdp(
         param_dtype (torch.dtype): The data type to use for model parameters.
         reduce_dtype (torch.dtype): The data type to use for reduction operations.
         pp_enabled (bool): Whether pipeline parallelism is enabled.
+        shard_kwargs (dict[str, Any]): Extra keyword arguments passed to ``fully_shard``.
         cpu_offload (bool, optional): Whether to offload model parameters to CPU. Defaults to False.
+        forward_prefetch (bool, optional): Whether to configure forward prefetch between FSDP modules. Defaults to True.
+        backward_prefetch (bool, optional): Whether to configure backward prefetch between FSDP modules. Defaults to True.
         reshard_after_forward_policy (str, optional): The policy to use for resharding after forward pass. Defaults to "default".
             Other options: "never", "always".
             - "default" applies default resharding behavior, implementing "smart defaults" for known optimal scenarios.
@@ -135,41 +142,43 @@ def _apply_fsdp(
     fully_shard(model, **fsdp_config)
 
     # forward
-    transformer_blocks = list(model.layers.values())
-    next_transformer_blocks = transformer_blocks[1:] + [None]
+    if forward_prefetch:
+        transformer_blocks = list(model.layers.values())
+        next_transformer_blocks = transformer_blocks[1:] + [None]
 
-    if model.tok_embeddings is not None and model.layers is not None:
-        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
+        if model.tok_embeddings is not None and model.layers is not None:
+            model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
 
-    for transformer_block, next_transformer_block in zip(
-        transformer_blocks, next_transformer_blocks
-    ):
-        if next_transformer_block is not None:
-            transformer_block.set_modules_to_forward_prefetch(
-                [next_transformer_block]
-            )
-        elif model.norm is not None and model.lm_head is not None:
-            transformer_block.set_modules_to_forward_prefetch(
-                [model.norm, model.lm_head]
-            )
+        for transformer_block, next_transformer_block in zip(
+            transformer_blocks, next_transformer_blocks
+        ):
+            if next_transformer_block is not None:
+                transformer_block.set_modules_to_forward_prefetch(
+                    [next_transformer_block]
+                )
+            elif model.norm is not None and model.lm_head is not None:
+                transformer_block.set_modules_to_forward_prefetch(
+                    [model.norm, model.lm_head]
+                )
 
     # backward
-    reversed_transformer_blocks = list(reversed(model.layers.values()))
-    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+    if backward_prefetch:
+        reversed_transformer_blocks = list(reversed(model.layers.values()))
+        prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
-    if (
-        model.norm is not None
-        and model.lm_head is not None
-        and model.layers is not None
-    ):
-        model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+        if (
+            model.norm is not None
+            and model.lm_head is not None
+            and model.layers is not None
+        ):
+            model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
 
-    for transformer_block, prev_transformer_block in zip(
-        reversed_transformer_blocks, prev_transformer_blocks
-    ):
-        if prev_transformer_block is not None:
-            transformer_block.set_modules_to_backward_prefetch(
-                [prev_transformer_block]
-            )
-        elif model.tok_embeddings is not None:
-            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
+        for transformer_block, prev_transformer_block in zip(
+            reversed_transformer_blocks, prev_transformer_blocks
+        ):
+            if prev_transformer_block is not None:
+                transformer_block.set_modules_to_backward_prefetch(
+                    [prev_transformer_block]
+                )
+            elif model.tok_embeddings is not None:
+                transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])

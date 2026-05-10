@@ -225,6 +225,8 @@ class DistributedConfig:
     gradient_as_bucket_view: bool = True
     fsdp_cpu_offload: bool = False
     fsdp_reshard_after_forward: Literal["always", "never", "default"] = "default"
+    fsdp_forward_prefetch: bool = True
+    fsdp_backward_prefetch: bool = True
     fsdp_fully_shard_kwargs: dict[str, Any] = field(default_factory=dict)
     tensor_parallel: TensorParallelConfig = field(default_factory=TensorParallelConfig)
     model_parallel_specific_kwargs: dict[str, Any] = field(default_factory=dict)
