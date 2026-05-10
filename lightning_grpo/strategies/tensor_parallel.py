@@ -2,51 +2,26 @@
 
 from __future__ import annotations
 
-from fnmatch import fnmatch
+from collections.abc import Sequence
+from functools import partial
 from typing import Any
 
 from lightning.pytorch.utilities import rank_zero_info
-from torch.distributed.tensor import Replicate, Shard
-from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel, parallelize_module
-from torch.nn import Module
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_module
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    parallelize_module,
+    PrepareModuleInput,
+    RowwiseParallel,
+    SequenceParallel,
+    ParallelStyle,
+)
+import torch
+import torch.nn as nn
 
 from lightning_grpo.utils.configs.base import DistributedConfig, TensorParallelConfig
-
-_PARALLEL_STYLES = {
-    "colwise",
-    "colwise_gather_output",
-    "rowwise",
-    "sequence",
-    "replicated_with_grad_allreduce",
-    "vocab_parallel_lm_head",
-}
-_UNSUPPORTED_STYLES = {
-    "packed_colwise",
-    "moe_tp_experts",
-}
-_DEFAULT_ATTENTION_PLAN = {
-    "layers.*.self_attn.q_proj": "colwise",
-    "layers.*.self_attn.k_proj": "colwise",
-    "layers.*.self_attn.v_proj": "colwise",
-    "layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
-    "layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
-    "layers.*.self_attn.o_proj": "rowwise",
-}
-_DEFAULT_DENSE_MLP_PLAN = {
-    "layers.*.mlp.gate_proj": "colwise",
-    "layers.*.mlp.up_proj": "colwise",
-    "layers.*.mlp.down_proj": "rowwise",
-    "layers.*.mlp.shared_expert.gate_proj": "colwise",
-    "layers.*.mlp.shared_expert.up_proj": "colwise",
-    "layers.*.mlp.shared_expert.down_proj": "rowwise",
-    "layers.*.mlp.shared_expert_gate": "colwise",
-}
-_DEFAULT_EMBEDDING_PLAN = {
-    "embed_tokens": "rowwise",
-}
-_DEFAULT_LM_HEAD_PLAN = {
-    "lm_head": "colwise_gather_output",
-}
 
 
 def _resolve_tensor_parallel_mesh(device_mesh: Any) -> Any | None:
@@ -71,17 +46,17 @@ def _mesh_size(mesh: Any) -> int:
     return int(size) if size is not None else 1
 
 
-def _unwrap_base_model(root_module: Module) -> Module:
+def _unwrap_base_model(root_module: nn.Module) -> nn.Module:
     """Return the module that owns decoder layers for common Hugging Face CausalLM wrappers."""
 
     base_model_prefix = getattr(root_module, "base_model_prefix", None)
     if isinstance(base_model_prefix, str) and hasattr(root_module, base_model_prefix):
         candidate = getattr(root_module, base_model_prefix)
-        if isinstance(candidate, Module):
+        if isinstance(candidate, nn.Module):
             return candidate
     for attribute in ("model", "transformer"):
         candidate = getattr(root_module, attribute, None)
-        if isinstance(candidate, Module) and hasattr(candidate, "layers"):
+        if isinstance(candidate, nn.Module) and hasattr(candidate, "layers"):
             return candidate
     return root_module
 
@@ -97,113 +72,302 @@ def _tp_enabled(distributed_config: DistributedConfig) -> bool:
     return str(distributed_config.tensor_parallel_size) != "1"
 
 
-def _module_exists(root_module: Module, pattern: str) -> bool:
-    """Return whether at least one module name matches the plan pattern."""
+def _has_supported_torchtitan_layout(root_module: nn.Module, base_model: nn.Module) -> bool:
+    """Return whether the model exposes the module names expected by ``apply_non_moe_tp``."""
 
-    return any(fnmatch(name, pattern) for name, _ in root_module.named_modules())
-
-
-def _style_to_parallel_style(style: str, tensor_parallel: TensorParallelConfig) -> Any | None:
-    """Map a YAML/string TP style to PyTorch parallel style objects."""
-
-    if style == "colwise":
-        return ColwiseParallel()
-    if style == "colwise_gather_output":
-        return ColwiseParallel(output_layouts=Replicate())
-    if style == "vocab_parallel_lm_head":
-        return ColwiseParallel(output_layouts=Shard(-1), use_local_output=False)
-    if style == "rowwise":
-        return RowwiseParallel()
-    if style in {"sequence", "replicated_with_grad_allreduce"}:
-        return SequenceParallel(sequence_dim=tensor_parallel.sequence_dim)
-    return None
+    if not hasattr(base_model, "layers"):
+        return False
+    has_embedding = hasattr(base_model, "tok_embeddings") or hasattr(base_model, "embed_tokens")
+    has_lm_head = hasattr(base_model, "lm_head") or hasattr(root_module, "lm_head")
+    return has_embedding and has_lm_head
 
 
-def _auto_plan_from_model_config(base_model: Module, tensor_parallel: TensorParallelConfig) -> dict[str, str]:
-    """Resolve an auto TP plan from the model config, then filter unsupported features."""
+def _attach_wrapper_lm_head_for_tp(root_module: nn.Module, base_model: nn.Module) -> bool:
+    """Temporarily expose wrapper-level ``lm_head`` on the base model for TorchTitan-style TP."""
 
-    config = getattr(base_model, "config", None)
-    plan = dict(getattr(config, "base_model_tp_plan", {}) or {})
-    if not plan or tensor_parallel.plan in {"default", "qwen_llama"}:
-        plan = dict(_DEFAULT_ATTENTION_PLAN)
-        if tensor_parallel.parallelize_mlp:
-            plan.update(_DEFAULT_DENSE_MLP_PLAN)
-    if tensor_parallel.parallelize_embedding:
-        plan.update(_DEFAULT_EMBEDDING_PLAN)
-
-    filtered_plan: dict[str, str] = {}
-    for pattern, style in plan.items():
-        if style in _UNSUPPORTED_STYLES:
-            continue
-        if style not in _PARALLEL_STYLES:
-            continue
-        if not tensor_parallel.parallelize_mlp and ".mlp." in pattern:
-            continue
-        if not tensor_parallel.parallelize_embedding and "embed" in pattern:
-            continue
-        if not tensor_parallel.parallelize_lm_head and "lm_head" in pattern:
-            continue
-        if not tensor_parallel.sequence_parallel and style in {"sequence", "replicated_with_grad_allreduce"}:
-            continue
-        filtered_plan[pattern] = style
-    filtered_plan.update(tensor_parallel.plan_overrides)
-    return filtered_plan
+    if hasattr(base_model, "lm_head") or not hasattr(root_module, "lm_head"):
+        return False
+    base_model.lm_head = root_module.lm_head
+    return True
 
 
-def _lm_head_plan_from_model(root_module: Module, tensor_parallel: TensorParallelConfig) -> dict[str, str]:
-    """Resolve TP plan entries that live on the CausalLM wrapper, such as ``lm_head``."""
+def _detach_wrapper_lm_head_after_tp(base_model: nn.Module, attached: bool) -> None:
+    """Remove a temporary ``lm_head`` alias created for TP planning."""
 
-    if not (tensor_parallel.parallelize_lm_head or tensor_parallel.vocab_parallel or tensor_parallel.loss_parallel):
-        return {}
-
-    plan = dict(getattr(root_module, "_tp_plan", {}) or {})
-    if not plan or tensor_parallel.plan in {"default", "qwen_llama"}:
-        plan.update(_DEFAULT_LM_HEAD_PLAN)
-
-    if tensor_parallel.vocab_parallel or tensor_parallel.loss_parallel:
-        for pattern in list(plan):
-            if "lm_head" in pattern:
-                plan[pattern] = "vocab_parallel_lm_head"
-
-    plan.update({pattern: style for pattern, style in tensor_parallel.plan_overrides.items() if _module_exists(root_module, pattern)})
-    return {pattern: style for pattern, style in plan.items() if "lm_head" in pattern}
+    if attached:
+        delattr(base_model, "lm_head")
 
 
-def _build_parallelize_plan(base_model: Module, tensor_parallel: TensorParallelConfig) -> dict[str, Any]:
-    """Build a PyTorch ``parallelize_module`` plan from YAML/model-config strings."""
+def _attach_hf_embedding_for_tp(base_model: nn.Module) -> bool:
+    """Temporarily expose HF ``embed_tokens`` as TorchTitan-style ``tok_embeddings``."""
 
-    if tensor_parallel.plan == "none":
-        return {}
-
-    string_plan = tensor_parallel.plan_overrides if tensor_parallel.plan == "config" else _auto_plan_from_model_config(base_model, tensor_parallel)
-    parallelize_plan: dict[str, Any] = {}
-    for pattern, style in string_plan.items():
-        if not _module_exists(base_model, pattern):
-            continue
-        parallel_style = _style_to_parallel_style(style, tensor_parallel)
-        if parallel_style is not None:
-            parallelize_plan[pattern] = parallel_style
-    return parallelize_plan
+    if hasattr(base_model, "tok_embeddings") or not hasattr(base_model, "embed_tokens"):
+        return False
+    base_model.tok_embeddings = base_model.embed_tokens
+    return True
 
 
-def _build_lm_head_parallelize_plan(root_module: Module, tensor_parallel: TensorParallelConfig) -> dict[str, Any]:
-    """Build wrapper-level TP plan entries for CausalLM heads."""
+def _detach_hf_embedding_after_tp(base_model: nn.Module, attached: bool) -> None:
+    """Remove a temporary ``tok_embeddings`` alias created for TP planning."""
 
-    if tensor_parallel.plan == "none":
-        return {}
+    if attached:
+        delattr(base_model, "tok_embeddings")
 
-    parallelize_plan: dict[str, Any] = {}
-    for pattern, style in _lm_head_plan_from_model(root_module, tensor_parallel).items():
-        if not _module_exists(root_module, pattern):
-            continue
-        parallel_style = _style_to_parallel_style(style, tensor_parallel)
-        if parallel_style is not None:
-            parallelize_plan[pattern] = parallel_style
-    return parallelize_plan
+
+def _apply_torchtitan_tensor_parallel(
+    root_module: nn.Module,
+    base_model: nn.Module,
+    tp_mesh: DeviceMesh,
+    tensor_parallel: TensorParallelConfig,
+) -> bool:
+    """Apply the TorchTitan-style non-MoE tensor parallel plan when possible."""
+
+    if tensor_parallel.plan in {"none", "config"}:
+        return False
+    if not _has_supported_torchtitan_layout(root_module, base_model):
+        return False
+
+    attached_embedding = _attach_hf_embedding_for_tp(base_model)
+    attached_lm_head = _attach_wrapper_lm_head_for_tp(root_module, base_model)
+    try:
+        apply_non_moe_tp(
+            base_model,
+            tp_mesh,
+            enable_loss_parallel=tensor_parallel.loss_parallel or tensor_parallel.vocab_parallel,
+        )
+    finally:
+        _detach_wrapper_lm_head_after_tp(base_model, attached_lm_head)
+        _detach_hf_embedding_after_tp(base_model, attached_embedding)
+    rank_zero_info(f"Applied TorchTitan-style tensor parallel plan to {root_module.__class__.__name__}.")
+    return True
+
+
+class NoParallel(ParallelStyle):
+    """Replicate computation on the TP mesh without sharding.
+
+    This style does nothing other than:
+    (1) setting the module parameters as DTensors on the given mesh, and
+    (2) inserting hooks at module boundary to convert torch.Tensor to DTensor and back.
+
+    The reason we need this wrapping is to ensure all parameters are on the same 1D/2D mesh,
+    which is assumed by (1) gradient norm clipping, and (2) optimizer fused implementation.
+
+    Used for modules like the MoE router gate that need replicated computation on TP mesh.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_layout: Placement | None = None,
+        output_layout: Placement | None = None,
+        local_output_grad_placements: Sequence[Placement] | None = None,
+    ):
+        super().__init__()
+        self.input_layout = input_layout or Replicate()
+        self.output_layout = output_layout or Replicate()
+        self.desired_input_layout = Replicate()
+        # If None, output stays as DTensor.
+        # If provided, output is cast to local tensor via
+        # to_local(grad_placements=local_output_grad_placements).
+        self.local_output_grad_placements = local_output_grad_placements
+
+    @staticmethod
+    def _prepare_input_fn(
+        input_layout: Placement | None,
+        desired_input_layout: Placement | None,
+        mod: nn.Module,
+        inputs: Any,
+        device_mesh: DeviceMesh,
+    ):
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, DTensor):
+            assert input_layout is not None
+            input_tensor = DTensor.from_local(
+                input_tensor, device_mesh, (input_layout,), run_check=False
+            )
+
+        if input_layout != desired_input_layout:
+            assert input_layout is not None
+            assert desired_input_layout is not None
+            input_tensor = input_tensor.redistribute(
+                placements=(desired_input_layout,), async_op=True
+            )
+        return (input_tensor, *inputs[1:])
+
+    @staticmethod
+    def _prepare_output_fn(
+        output_layout: Placement,
+        local_output_grad_placements: Sequence[Placement] | None,
+        mod: nn.Module,
+        outputs: DTensor,
+        device_mesh: DeviceMesh,
+    ) -> torch.Tensor | DTensor:
+        if outputs.placements != (output_layout,):
+            outputs = outputs.redistribute(placements=(output_layout,), async_op=True)
+        if local_output_grad_placements is not None:
+            return outputs.to_local(grad_placements=local_output_grad_placements)
+        else:
+            return outputs
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        return distribute_module(
+            module,
+            device_mesh,
+            None,
+            partial(
+                self._prepare_input_fn,  # pyrefly: ignore [bad-argument-type]
+                self.input_layout,
+                self.desired_input_layout,
+            ),
+            partial(
+                self._prepare_output_fn,  # pyrefly: ignore [bad-argument-type]
+                self.output_layout,
+                self.local_output_grad_placements,
+            ),
+        )
+
+
+def apply_non_moe_tp(
+    model: nn.Module,
+    tp_mesh: DeviceMesh,
+    enable_loss_parallel: bool,
+):
+    """Apply tensor parallelism."""
+    # 1. Parallelize the embedding and shard its outputs (which are the first
+    # transformer block's inputs)
+    # 2. Parallelize the root norm layer over the sequence dim
+    # 3. Parallelize the final linear output layer
+
+    # skipping nn.Identity modules (which are added by pipeline parallelism for unused modules)
+    root_plan = {}
+
+    if hasattr(model, "tok_embeddings"):
+        if isinstance(model.tok_embeddings, nn.Identity):
+            root_plan["tok_embeddings"] = NoParallel(
+                local_output_grad_placements=(Replicate(),),
+            )
+        else:
+            root_plan["tok_embeddings"] = RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            )
+
+    if hasattr(model, "norm"):
+        if isinstance(model.norm, nn.Identity):
+            root_plan["norm"] = NoParallel(
+                local_output_grad_placements=(Replicate(),),
+            )
+        else:
+            root_plan["norm"] = SequenceParallel()
+
+    if hasattr(model, "lm_head"):
+        if isinstance(model.lm_head, nn.Identity):
+            root_plan["lm_head"] = NoParallel(
+                local_output_grad_placements=(Replicate(),),
+            )
+        else:
+            root_plan["lm_head"] = ColwiseParallel(
+                input_layouts=Shard(1),
+                output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
+                use_local_output=not enable_loss_parallel,
+            )
+    if root_plan:  # Only call if there's something to parallelize
+        parallelize_module(model, tp_mesh, root_plan)
+
+    # Apply tensor + sequence parallelism to every transformer block
+    for transformer_block in model.layers:
+        layer_plan = {
+            "input_layernorm": SequenceParallel(),
+            "self_attn": PrepareModuleInput(
+                input_kwarg_layouts={"hidden_states": Shard(1)},
+                desired_input_kwarg_layouts={"hidden_states": Replicate()},
+            ),
+            "post_attention_layernorm": SequenceParallel(),
+        }
+
+        if getattr(transformer_block.self_attn, "q_lora_rank", None) is None:
+            layer_plan.update(
+                {
+                    "self_attn.q_proj": ColwiseParallel(),
+                    "self_attn.k_proj": ColwiseParallel(),
+                    "self_attn.v_proj": ColwiseParallel(),
+                }
+            )
+        else:
+            layer_plan.update(
+                {
+                    "self_attn.q_a_proj": NoParallel(
+                        local_output_grad_placements=(Replicate(),),
+                    ),
+                    "self_attn.q_a_layernorm": NoParallel(
+                        local_output_grad_placements=(Replicate(),),
+                    ),
+                    "self_attn.q_b_proj": ColwiseParallel(),
+                    "self_attn.kv_a_proj_with_mqa": NoParallel(
+                        local_output_grad_placements=(Replicate(),),
+                    ),
+                    "self_attn.kv_a_layernorm": NoParallel(
+                        local_output_grad_placements=(Replicate(),),
+                    ),
+                    "self_attn.kv_b_proj": ColwiseParallel(),
+                }
+            )
+
+        # Handle different names for the output projection layer, e.g. o_proj vs dense
+        o_proj_name = (
+            "o_proj" if hasattr(transformer_block.self_attn, "o_proj") else "dense"
+        )
+        layer_plan[f"self_attn.{o_proj_name}"] = RowwiseParallel(
+            output_layouts=Shard(1)
+        )
+        # For model that uses RMSNorm on Q and K (i.e. Qwen3)
+        if hasattr(transformer_block.self_attn, "q_norm") and hasattr(
+            transformer_block.self_attn, "k_norm"
+        ):
+            layer_plan["self_attn.q_norm"] = SequenceParallel(
+                sequence_dim=2, use_local_output=True
+            )
+            layer_plan["self_attn.k_norm"] = SequenceParallel(
+                sequence_dim=2, use_local_output=True
+            )
+
+        if not transformer_block.moe_enabled:
+            mlp_plan = {
+                "mlp": PrepareModuleInput(
+                    input_layouts=(Shard(1),),
+                    desired_input_layouts=(Replicate(),),
+                ),
+            }
+            # Handle different names for MLP layers, e.g. gate_proj vs fc1
+            gate_proj_name = (
+                "gate_proj" if hasattr(transformer_block.mlp, "gate_proj") else "fc1"
+            )
+            mlp_plan[f"mlp.{gate_proj_name}"] = ColwiseParallel()
+
+            if hasattr(transformer_block.mlp, "up_proj"):
+                mlp_plan["mlp.up_proj"] = ColwiseParallel()
+
+            down_proj_name = (
+                "down_proj" if hasattr(transformer_block.mlp, "down_proj") else "fc2"
+            )
+            mlp_plan[f"mlp.{down_proj_name}"] = RowwiseParallel(output_layouts=Shard(1))
+            layer_plan.update(mlp_plan)
+
+        # Some models like Phi-2 don't have post_attention_layernorm
+        if not hasattr(transformer_block, "post_attention_layernorm"):
+            layer_plan.pop("post_attention_layernorm")
+
+        parallelize_module(
+            module=transformer_block,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )
+
+    rank_zero_info("Applied Tensor Parallelism to the model")
 
 
 def configure_tensor_parallel(
-    root_module: Module,
+    root_module: nn.Module,
     distributed_config: DistributedConfig,
     device_mesh: Any = None,
 ) -> None:
@@ -217,17 +381,7 @@ def configure_tensor_parallel(
         return
 
     base_model = _unwrap_base_model(root_module)
-    parallelize_plan = _build_parallelize_plan(base_model, distributed_config.tensor_parallel)
-    lm_head_plan = _build_lm_head_parallelize_plan(root_module, distributed_config.tensor_parallel)
-    if not parallelize_plan and not lm_head_plan:
-        rank_zero_info("Tensor parallel is enabled but no matching TP plan entries were found.")
+    if _apply_torchtitan_tensor_parallel(root_module, base_model, tp_mesh, distributed_config.tensor_parallel):
         return
 
-    if parallelize_plan:
-        parallelize_module(base_model, tp_mesh, parallelize_plan)
-    if lm_head_plan:
-        parallelize_module(root_module, tp_mesh, lm_head_plan)
-    rank_zero_info(
-        f"Applied tensor parallel plan with {len(parallelize_plan) + len(lm_head_plan)} entries "
-        f"to {root_module.__class__.__name__}."
-    )
+    rank_zero_info("Tensor parallel is enabled but the model layout is not supported by the TorchTitan-style TP plan.")

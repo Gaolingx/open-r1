@@ -203,7 +203,7 @@ class TensorParallelConfig:
     """Tensor parallel plan configuration for PyTorch DTensor parallel APIs."""
 
     enabled: bool = False
-    plan: Literal["auto", "none", "config", "default", "qwen_llama"] = "auto"
+    plan: Literal["auto", "none", "config"] = "auto"
     sequence_parallel: bool = False
     parallelize_mlp: bool = False
     parallelize_embedding: bool = False
