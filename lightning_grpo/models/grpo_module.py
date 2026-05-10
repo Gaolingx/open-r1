@@ -76,7 +76,7 @@ class GRPOLightningModule(L.LightningModule):
         """Apply tensor parallelism, then composable FSDP2 to the trainable policy model."""
 
         configure_tensor_parallel(self.policy, self.config.distributed, getattr(self, "device_mesh", None))
-        configure_fully_shard(self.policy, self.config.distributed, getattr(self, "device_mesh", None))
+        configure_fully_shard(self.policy, self.config.distributed, self.config.precision, getattr(self, "device_mesh", None))
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         """Run one online rollout and optimization step."""

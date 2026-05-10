@@ -38,7 +38,7 @@ class SFTLightningModule(L.LightningModule):
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
         configure_tensor_parallel(self.model, self.config.distributed, getattr(self, "device_mesh", None))
-        configure_fully_shard(self.model, self.config.distributed, getattr(self, "device_mesh", None))
+        configure_fully_shard(self.model, self.config.distributed, self.config.precision, getattr(self, "device_mesh", None))
 
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """Run one SFT optimization/evaluation step and log metrics."""

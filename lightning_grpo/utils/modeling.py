@@ -28,7 +28,7 @@ DTYPE_MAP = {
 def resolve_torch_dtype(precision_config: PrecisionConfig) -> torch.dtype:
     """Resolve the parameter dtype from configuration."""
 
-    return DTYPE_MAP[precision_config.parameter_dtype]
+    return DTYPE_MAP[precision_config.model_param_dtype]
 
 
 def load_tokenizer(model_config: ModelConfig) -> PreTrainedTokenizerBase:

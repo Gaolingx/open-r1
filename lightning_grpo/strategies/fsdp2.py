@@ -2,37 +2,16 @@
 
 from __future__ import annotations
 
-from fnmatch import fnmatch
-from importlib import import_module
 from typing import Any
 
-from torch.distributed._composable.fsdp.fully_shard import fully_shard
-from torch.nn import Module
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import DeviceMesh
+import torch
+import torch.nn as nn
 
-from lightning_grpo.utils.configs.base import DistributedConfig
-
-
-def _import_module_class(path: str) -> type[Module]:
-    """Import a torch module class from a fully-qualified dotted path."""
-
-    module_path, _, class_name = path.rpartition(".")
-    if not module_path or not class_name:
-        raise ValueError(
-            "FSDP policy class paths must be fully-qualified, for example "
-            "`transformers.models.llama.modeling_llama.LlamaDecoderLayer`."
-        )
-
-    module = import_module(module_path)
-    class_object = getattr(module, class_name)
-    if not isinstance(class_object, type) or not issubclass(class_object, Module):
-        raise TypeError(f"FSDP policy target must be a torch.nn.Module subclass: {path}")
-    return class_object
-
-
-def _resolve_policy_classes(class_paths: list[str]) -> tuple[type[Module], ...]:
-    """Resolve YAML-configured class paths into module classes."""
-
-    return tuple(_import_module_class(class_path) for class_path in class_paths)
+from lightning_grpo.utils.configs.base import DistributedConfig, PrecisionConfig
+from lightning_grpo.utils.modeling import resolve_torch_dtype
+from lightning_grpo.utils.fsdp_helper import get_fsdp_reshard_after_forward_policy
 
 
 def _resolve_data_parallel_mesh(device_mesh: Any) -> Any | None:
@@ -57,15 +36,10 @@ def _mesh_size(mesh: Any) -> int:
     return int(size) if size is not None else 1
 
 
-def _matches_module(name: str, module: Module, name_patterns: list[str], policy_classes: tuple[type[Module], ...]) -> bool:
-    """Check whether a module should be fully sharded before the root module."""
-
-    return any(fnmatch(name, pattern) for pattern in name_patterns) or bool(policy_classes and isinstance(module, policy_classes))
-
-
 def configure_fully_shard(
-    root_module: Module,
+    model: nn.Module,
     distributed_config: DistributedConfig,
+    precision_config: PrecisionConfig,
     device_mesh: Any = None,
 ) -> None:
     """Apply PyTorch composable FSDP2 ``fully_shard`` using config-only policies.
@@ -82,18 +56,120 @@ def configure_fully_shard(
     if _mesh_size(dp_mesh) <= 1:
         return
 
-    shard_kwargs = dict(distributed_config.fsdp_fully_shard_kwargs)
-    if dp_mesh is not None:
-        shard_kwargs.setdefault("mesh", dp_mesh)
+    _apply_fsdp(
+        model=model,
+        dp_mesh=dp_mesh,
+        param_dtype=resolve_torch_dtype(precision_config.fsdp_param_dtype),
+        reduce_dtype=resolve_torch_dtype(precision_config.fsdp_reduce_dtype),
+        pp_enabled=False,
+        shard_kwargs=dict(distributed_config.fsdp_fully_shard_kwargs),
+        cpu_offload=distributed_config.fsdp_cpu_offload,
+        reshard_after_forward_policy=distributed_config.fsdp_reshard_after_forward,
+    )
 
-    policy_classes = _resolve_policy_classes(distributed_config.fsdp_auto_wrap_policy_classes)
-    target_names = distributed_config.fsdp_fully_shard_module_names
 
-    for name, module in root_module.named_modules():
-        if not name:
-            continue
-        if _matches_module(name, module, target_names, policy_classes):
-            fully_shard(module, **shard_kwargs)
+def _apply_fsdp(
+    model: nn.Module,
+    dp_mesh: DeviceMesh,
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    pp_enabled: bool,
+    shard_kwargs: dict[str, Any],
+    cpu_offload: bool = False,
+    reshard_after_forward_policy: str = "default",
+) -> None:
+    """
+    Apply data parallelism (via FSDP2) to the model.
 
-    if distributed_config.fsdp_fully_shard_root:
-        fully_shard(root_module, **shard_kwargs)
+    Args:
+        model (nn.Module): The model to apply data parallelism to.
+        dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
+        param_dtype (torch.dtype): The data type to use for model parameters.
+        reduce_dtype (torch.dtype): The data type to use for reduction operations.
+        pp_enabled (bool): Whether pipeline parallelism is enabled.
+        cpu_offload (bool, optional): Whether to offload model parameters to CPU. Defaults to False.
+        reshard_after_forward_policy (str, optional): The policy to use for resharding after forward pass. Defaults to "default".
+            Other options: "never", "always".
+            - "default" applies default resharding behavior, implementing "smart defaults" for known optimal scenarios.
+            - "always" will enable `reshard_after_forward` for all forward passes.
+            - "never" will disable `reshard_after_forward` for all forward passes.
+
+    """
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        cast_forward_inputs=False,
+    )
+    fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy, **shard_kwargs}
+    if cpu_offload:
+        fsdp_config["offload_policy"] = CPUOffloadPolicy()
+
+    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
+        reshard_after_forward_policy, pp_enabled
+    )
+
+    if model.tok_embeddings is not None:
+        fully_shard(
+            model.tok_embeddings,
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    for transformer_block in model.layers:
+
+        fully_shard(
+            transformer_block,
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    # As an optimization, do not reshard_after_forward the last layers by default
+    # since FSDP would prefetch them immediately after the forward pass
+    if model.norm is not None and model.lm_head is not None:
+        fully_shard(
+            [model.norm, model.lm_head],
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward_policy == "always",
+        )
+
+    fully_shard(model, **fsdp_config)
+
+    # forward
+    transformer_blocks = list(model.layers.values())
+    next_transformer_blocks = transformer_blocks[1:] + [None]
+
+    if model.tok_embeddings is not None and model.layers is not None:
+        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
+
+    for transformer_block, next_transformer_block in zip(
+        transformer_blocks, next_transformer_blocks
+    ):
+        if next_transformer_block is not None:
+            transformer_block.set_modules_to_forward_prefetch(
+                [next_transformer_block]
+            )
+        elif model.norm is not None and model.lm_head is not None:
+            transformer_block.set_modules_to_forward_prefetch(
+                [model.norm, model.lm_head]
+            )
+
+    # backward
+    reversed_transformer_blocks = list(reversed(model.layers.values()))
+    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+
+    if (
+        model.norm is not None
+        and model.lm_head is not None
+        and model.layers is not None
+    ):
+        model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+
+    for transformer_block, prev_transformer_block in zip(
+        reversed_transformer_blocks, prev_transformer_blocks
+    ):
+        if prev_transformer_block is not None:
+            transformer_block.set_modules_to_backward_prefetch(
+                [prev_transformer_block]
+            )
+        elif model.tok_embeddings is not None:
+            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])

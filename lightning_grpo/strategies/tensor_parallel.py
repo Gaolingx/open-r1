@@ -114,6 +114,124 @@ def _detach_hf_embedding_after_tp(base_model: nn.Module, attached: bool) -> None
         delattr(base_model, "tok_embeddings")
 
 
+def _custom_plan_style(
+    style_name: str,
+    *,
+    module_path: str,
+    enable_loss_parallel: bool,
+) -> ParallelStyle | None:
+    """Convert a YAML custom plan style name into a PyTorch TP ``ParallelStyle``."""
+
+    style = style_name.lower().strip().replace("-", "_")
+    if style in {"none", "skip", "false"}:
+        return None
+    if style in {"no_parallel", "noparallel", "replicate", "replicated"}:
+        return NoParallel(local_output_grad_placements=(Replicate(),))
+    if style in {"sequence", "sequence_parallel"}:
+        return SequenceParallel()
+    if style in {"colwise", "colwise_parallel"}:
+        return ColwiseParallel()
+    if style in {"rowwise", "rowwise_parallel"}:
+        return RowwiseParallel(output_layouts=Shard(1))
+    if style in {"embedding", "embedding_rowwise", "rowwise_embedding"}:
+        return RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1))
+    if style in {"lm_head", "lm_head_colwise", "vocab_parallel", "colwise_lm_head"}:
+        return ColwiseParallel(
+            input_layouts=Shard(1),
+            output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
+            use_local_output=not enable_loss_parallel,
+        )
+    if style in {"prepare_attn", "prepare_attention", "prepare_self_attn"}:
+        return PrepareModuleInput(
+            input_kwarg_layouts={"hidden_states": Shard(1)},
+            desired_input_kwarg_layouts={"hidden_states": Replicate()},
+        )
+    if style in {"prepare_mlp", "prepare_input"}:
+        return PrepareModuleInput(
+            input_layouts=(Shard(1),),
+            desired_input_layouts=(Replicate(),),
+        )
+
+    raise ValueError(f"Unsupported tensor parallel custom style '{style_name}' for '{module_path}'.")
+
+
+def _split_custom_plan_overrides(plan_overrides: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Split custom override keys into root-module and per-layer plan dictionaries."""
+
+    root_plan_overrides: dict[str, str] = {}
+    layer_plan_overrides: dict[str, str] = {}
+    root_module_names = {"tok_embeddings", "embed_tokens", "norm", "lm_head"}
+    for raw_module_path, style_name in plan_overrides.items():
+        module_path = raw_module_path.strip()
+        if module_path.startswith(("root.", "model.")):
+            root_plan_overrides[module_path.split(".", 1)[1]] = style_name
+        elif module_path.startswith(("layer.", "layers.*.")):
+            layer_plan_overrides[module_path.split(".", 1)[1]] = style_name
+        elif module_path.startswith("layers."):
+            layer_plan_overrides[module_path.split(".", 2)[2]] = style_name
+        elif module_path.split(".", 1)[0] in root_module_names:
+            root_plan_overrides[module_path] = style_name
+        else:
+            layer_plan_overrides[module_path] = style_name
+    return root_plan_overrides, layer_plan_overrides
+
+
+def _build_custom_parallel_plan(
+    plan_overrides: dict[str, str],
+    *,
+    enable_loss_parallel: bool,
+) -> dict[str, ParallelStyle]:
+    """Build a ``parallelize_module`` plan from YAML path-to-style mappings."""
+
+    custom_plan: dict[str, ParallelStyle] = {}
+    for module_path, style_name in plan_overrides.items():
+        style = _custom_plan_style(
+            style_name,
+            module_path=module_path,
+            enable_loss_parallel=enable_loss_parallel,
+        )
+        if style is not None:
+            custom_plan[module_path] = style
+    return custom_plan
+
+
+def _apply_custom_non_moe_tp(
+    model: nn.Module,
+    tp_mesh: DeviceMesh,
+    tensor_parallel: TensorParallelConfig,
+    enable_loss_parallel: bool,
+) -> None:
+    """Apply user-authored root/layer path-to-style mappings from YAML."""
+
+    if not tensor_parallel.plan_overrides:
+        raise ValueError("tensor_parallel.plan='custom' requires non-empty plan_overrides.")
+
+    root_overrides, layer_overrides = _split_custom_plan_overrides(tensor_parallel.plan_overrides)
+    root_plan = _build_custom_parallel_plan(
+        root_overrides,
+        enable_loss_parallel=enable_loss_parallel,
+    )
+    if root_plan:
+        parallelize_module(model, tp_mesh, root_plan)
+
+    layer_plan = _build_custom_parallel_plan(
+        layer_overrides,
+        enable_loss_parallel=enable_loss_parallel,
+    )
+    if layer_plan:
+        for transformer_block in model.layers:
+            parallelize_module(
+                module=transformer_block,
+                device_mesh=tp_mesh,
+                parallelize_plan=layer_plan,
+            )
+
+    rank_zero_info(
+        f"Applied custom Tensor Parallelism plan with {len(root_plan)} root rules "
+        f"and {len(layer_plan)} per-layer rules"
+    )
+
+
 def _apply_torchtitan_tensor_parallel(
     root_module: nn.Module,
     base_model: nn.Module,
@@ -122,7 +240,7 @@ def _apply_torchtitan_tensor_parallel(
 ) -> bool:
     """Apply the TorchTitan-style non-MoE tensor parallel plan when possible."""
 
-    if tensor_parallel.plan in {"none", "config"}:
+    if tensor_parallel.plan == "none":
         return False
     if not _has_supported_torchtitan_layout(root_module, base_model):
         return False
@@ -130,11 +248,15 @@ def _apply_torchtitan_tensor_parallel(
     attached_embedding = _attach_hf_embedding_for_tp(base_model)
     attached_lm_head = _attach_wrapper_lm_head_for_tp(root_module, base_model)
     try:
-        apply_non_moe_tp(
-            base_model,
-            tp_mesh,
-            enable_loss_parallel=tensor_parallel.loss_parallel or tensor_parallel.vocab_parallel,
-        )
+        enable_loss_parallel = tensor_parallel.loss_parallel or tensor_parallel.vocab_parallel
+        if tensor_parallel.plan in {"auto", "default"}:
+            apply_non_moe_tp(
+                base_model,
+                tp_mesh,
+                enable_loss_parallel=enable_loss_parallel,
+            )
+        else:
+            _apply_custom_non_moe_tp(base_model, tp_mesh, tensor_parallel, enable_loss_parallel)
     finally:
         _detach_wrapper_lm_head_after_tp(base_model, attached_lm_head)
         _detach_hf_embedding_after_tp(base_model, attached_embedding)
@@ -331,27 +453,26 @@ def apply_non_moe_tp(
                 sequence_dim=2, use_local_output=True
             )
 
-        if not transformer_block.moe_enabled:
-            mlp_plan = {
-                "mlp": PrepareModuleInput(
-                    input_layouts=(Shard(1),),
-                    desired_input_layouts=(Replicate(),),
-                ),
-            }
-            # Handle different names for MLP layers, e.g. gate_proj vs fc1
-            gate_proj_name = (
-                "gate_proj" if hasattr(transformer_block.mlp, "gate_proj") else "fc1"
-            )
-            mlp_plan[f"mlp.{gate_proj_name}"] = ColwiseParallel()
+        mlp_plan = {
+            "mlp": PrepareModuleInput(
+                input_layouts=(Shard(1),),
+                desired_input_layouts=(Replicate(),),
+            ),
+        }
+        # Handle different names for MLP layers, e.g. gate_proj vs fc1
+        gate_proj_name = (
+            "gate_proj" if hasattr(transformer_block.mlp, "gate_proj") else "fc1"
+        )
+        mlp_plan[f"mlp.{gate_proj_name}"] = ColwiseParallel()
 
-            if hasattr(transformer_block.mlp, "up_proj"):
-                mlp_plan["mlp.up_proj"] = ColwiseParallel()
+        if hasattr(transformer_block.mlp, "up_proj"):
+            mlp_plan["mlp.up_proj"] = ColwiseParallel()
 
-            down_proj_name = (
-                "down_proj" if hasattr(transformer_block.mlp, "down_proj") else "fc2"
-            )
-            mlp_plan[f"mlp.{down_proj_name}"] = RowwiseParallel(output_layouts=Shard(1))
-            layer_plan.update(mlp_plan)
+        down_proj_name = (
+            "down_proj" if hasattr(transformer_block.mlp, "down_proj") else "fc2"
+        )
+        mlp_plan[f"mlp.{down_proj_name}"] = RowwiseParallel(output_layouts=Shard(1))
+        layer_plan.update(mlp_plan)
 
         # Some models like Phi-2 don't have post_attention_layernorm
         if not hasattr(transformer_block, "post_attention_layernorm"):

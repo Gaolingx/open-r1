@@ -14,8 +14,10 @@ from dacite import Config as DaciteConfig
 class PrecisionConfig:
     """Precision and numerics settings for Lightning training."""
 
-    parameter_dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
+    model_param_dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
     trainer_precision: Literal["bf16-mixed", "16-mixed", "16-true", "bf16-true", "32-true"] = "bf16-mixed"
+    fsdp_param_dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
+    fsdp_reduce_dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
     tf32: bool = True
 
 
@@ -203,14 +205,13 @@ class TensorParallelConfig:
     """Tensor parallel plan configuration for PyTorch DTensor parallel APIs."""
 
     enabled: bool = False
-    plan: Literal["auto", "none", "config"] = "auto"
+    plan: Literal["auto", "none", "default", "config"] = "auto"
     sequence_parallel: bool = False
     parallelize_mlp: bool = False
     parallelize_embedding: bool = False
     parallelize_lm_head: bool = False
     vocab_parallel: bool = False
     loss_parallel: bool = False
-    sequence_dim: int = 1
     plan_overrides: dict[str, str] = field(default_factory=dict)
 
 
@@ -227,9 +228,8 @@ class DistributedConfig:
     tensor_parallel_size: int = 1
     find_unused_parameters: bool = False
     gradient_as_bucket_view: bool = True
-    fsdp_auto_wrap_policy_classes: list[str] = field(default_factory=list)
-    fsdp_fully_shard_module_names: list[str] = field(default_factory=list)
-    fsdp_fully_shard_root: bool = True
+    fsdp_cpu_offload: bool = False
+    fsdp_reshard_after_forward: Literal["always", "never", "default"] = "default"
     fsdp_fully_shard_kwargs: dict[str, Any] = field(default_factory=dict)
     tensor_parallel: TensorParallelConfig = field(default_factory=TensorParallelConfig)
     model_parallel_specific_kwargs: dict[str, Any] = field(default_factory=dict)

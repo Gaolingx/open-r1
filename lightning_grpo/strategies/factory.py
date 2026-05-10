@@ -44,7 +44,7 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | ModelParall
 
 def trainer_strategy_kwargs(
     distributed_config: DistributedConfig,
-    precision_config: PrecisionConfig | None = None,
+    precision_config: PrecisionConfig,
 ) -> dict[str, Any]:
     """Build keyword arguments for [`lightning.pytorch.Trainer`](lightning_grpo/strategies/factory.py:126)."""
 
