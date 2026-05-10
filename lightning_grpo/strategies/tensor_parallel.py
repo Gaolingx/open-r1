@@ -1,4 +1,4 @@
-"""YAML-configurable tensor parallel plan helpers for Lightning ModelParallelStrategy."""
+"""Configurable tensor parallel plan helpers for Lightning ModelParallelStrategy."""
 
 from __future__ import annotations
 
@@ -248,15 +248,14 @@ def _apply_torchtitan_tensor_parallel(
     attached_embedding = _attach_hf_embedding_for_tp(base_model)
     attached_lm_head = _attach_wrapper_lm_head_for_tp(root_module, base_model)
     try:
-        enable_loss_parallel = tensor_parallel.loss_parallel or tensor_parallel.vocab_parallel
         if tensor_parallel.plan in {"auto", "default"}:
             apply_non_moe_tp(
                 base_model,
                 tp_mesh,
-                enable_loss_parallel=enable_loss_parallel,
+                enable_loss_parallel=tensor_parallel.loss_parallel,
             )
         else:
-            _apply_custom_non_moe_tp(base_model, tp_mesh, tensor_parallel, enable_loss_parallel)
+            _apply_custom_non_moe_tp(base_model, tp_mesh, tensor_parallel, tensor_parallel.loss_parallel)
     finally:
         _detach_wrapper_lm_head_after_tp(base_model, attached_lm_head)
         _detach_hf_embedding_after_tp(base_model, attached_embedding)
@@ -453,26 +452,27 @@ def apply_non_moe_tp(
                 sequence_dim=2, use_local_output=True
             )
 
-        mlp_plan = {
-            "mlp": PrepareModuleInput(
-                input_layouts=(Shard(1),),
-                desired_input_layouts=(Replicate(),),
-            ),
-        }
-        # Handle different names for MLP layers, e.g. gate_proj vs fc1
-        gate_proj_name = (
-            "gate_proj" if hasattr(transformer_block.mlp, "gate_proj") else "fc1"
-        )
-        mlp_plan[f"mlp.{gate_proj_name}"] = ColwiseParallel()
+        if not transformer_block.moe_enabled:
+            mlp_plan = {
+                "mlp": PrepareModuleInput(
+                    input_layouts=(Shard(1),),
+                    desired_input_layouts=(Replicate(),),
+                ),
+            }
+            # Handle different names for MLP layers, e.g. gate_proj vs fc1
+            gate_proj_name = (
+                "gate_proj" if hasattr(transformer_block.mlp, "gate_proj") else "fc1"
+            )
+            mlp_plan[f"mlp.{gate_proj_name}"] = ColwiseParallel()
 
-        if hasattr(transformer_block.mlp, "up_proj"):
-            mlp_plan["mlp.up_proj"] = ColwiseParallel()
+            if hasattr(transformer_block.mlp, "up_proj"):
+                mlp_plan["mlp.up_proj"] = ColwiseParallel()
 
-        down_proj_name = (
-            "down_proj" if hasattr(transformer_block.mlp, "down_proj") else "fc2"
-        )
-        mlp_plan[f"mlp.{down_proj_name}"] = RowwiseParallel(output_layouts=Shard(1))
-        layer_plan.update(mlp_plan)
+            down_proj_name = (
+                "down_proj" if hasattr(transformer_block.mlp, "down_proj") else "fc2"
+            )
+            mlp_plan[f"mlp.{down_proj_name}"] = RowwiseParallel(output_layouts=Shard(1))
+            layer_plan.update(mlp_plan)
 
         # Some models like Phi-2 don't have post_attention_layernorm
         if not hasattr(transformer_block, "post_attention_layernorm"):

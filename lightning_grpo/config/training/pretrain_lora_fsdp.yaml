@@ -3,7 +3,7 @@ seed: 42
 output_dir: outputs/lightning_pretrain_demo
 
 precision:
-  parameter_dtype: bf16
+  model_param_dtype: bf16
   trainer_precision: bf16-mixed
 
 model:

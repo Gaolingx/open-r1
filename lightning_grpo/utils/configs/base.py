@@ -206,11 +206,6 @@ class TensorParallelConfig:
 
     enabled: bool = False
     plan: Literal["auto", "none", "default", "config"] = "auto"
-    sequence_parallel: bool = False
-    parallelize_mlp: bool = False
-    parallelize_embedding: bool = False
-    parallelize_lm_head: bool = False
-    vocab_parallel: bool = False
     loss_parallel: bool = False
     plan_overrides: dict[str, str] = field(default_factory=dict)
 
