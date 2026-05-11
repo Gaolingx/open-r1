@@ -206,6 +206,7 @@ class TensorParallelConfig:
 
     enabled: bool = False
     plan: Literal["auto", "none", "default", "config"] = "auto"
+    sequence_parallel: bool = False
     loss_parallel: bool = False
     plan_overrides: dict[str, str] = field(default_factory=dict)
 
@@ -220,7 +221,7 @@ class DistributedConfig:
     accelerator: Literal["auto", "gpu", "cpu"] = "auto"
     sync_batchnorm: bool = False
     data_parallel_size: int | str = "auto"
-    tensor_parallel_size: int = 1
+    tensor_parallel_size: int | str = "auto"
     find_unused_parameters: bool = False
     gradient_as_bucket_view: bool = True
     fsdp_cpu_offload: bool = False

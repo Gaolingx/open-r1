@@ -119,8 +119,11 @@ def _custom_plan_style(
     *,
     module_path: str,
     enable_loss_parallel: bool,
+    enable_sp: bool,
 ) -> ParallelStyle | None:
     """Convert a YAML custom plan style name into a PyTorch TP ``ParallelStyle``."""
+    sp_layout = Shard(1) if enable_sp else Replicate()
+    norm_plan = SequenceParallel() if enable_sp else NoParallel()
 
     style = style_name.lower().strip().replace("-", "_")
     if style in {"none", "skip", "false"}:
@@ -128,27 +131,27 @@ def _custom_plan_style(
     if style in {"no_parallel", "noparallel", "replicate", "replicated"}:
         return NoParallel(local_output_grad_placements=(Replicate(),))
     if style in {"sequence", "sequence_parallel"}:
-        return SequenceParallel()
+        return norm_plan
     if style in {"colwise", "colwise_parallel"}:
         return ColwiseParallel()
     if style in {"rowwise", "rowwise_parallel"}:
-        return RowwiseParallel(output_layouts=Shard(1))
+        return RowwiseParallel(output_layouts=sp_layout)
     if style in {"embedding", "embedding_rowwise", "rowwise_embedding"}:
-        return RowwiseParallel(input_layouts=Replicate(), output_layouts=Shard(1))
+        return RowwiseParallel(input_layouts=Replicate(), output_layouts=sp_layout)
     if style in {"lm_head", "lm_head_colwise", "vocab_parallel", "colwise_lm_head"}:
         return ColwiseParallel(
-            input_layouts=Shard(1),
+            input_layouts=sp_layout,
             output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
             use_local_output=not enable_loss_parallel,
         )
     if style in {"prepare_attn", "prepare_attention", "prepare_self_attn"}:
         return PrepareModuleInput(
-            input_kwarg_layouts={"hidden_states": Shard(1)},
+            input_kwarg_layouts={"hidden_states": sp_layout},
             desired_input_kwarg_layouts={"hidden_states": Replicate()},
         )
     if style in {"prepare_mlp", "prepare_input"}:
         return PrepareModuleInput(
-            input_layouts=(Shard(1),),
+            input_layouts=(sp_layout,),
             desired_input_layouts=(Replicate(),),
         )
 
@@ -180,6 +183,7 @@ def _build_custom_parallel_plan(
     plan_overrides: dict[str, str],
     *,
     enable_loss_parallel: bool,
+    enable_sp: bool,
 ) -> dict[str, ParallelStyle]:
     """Build a ``parallelize_module`` plan from YAML path-to-style mappings."""
 
@@ -189,6 +193,7 @@ def _build_custom_parallel_plan(
             style_name,
             module_path=module_path,
             enable_loss_parallel=enable_loss_parallel,
+            enable_sp=enable_sp,
         )
         if style is not None:
             custom_plan[module_path] = style
@@ -210,6 +215,7 @@ def _apply_custom_non_moe_tp(
     root_plan = _build_custom_parallel_plan(
         root_overrides,
         enable_loss_parallel=enable_loss_parallel,
+        enable_sp=tensor_parallel.sequence_parallel,
     )
     if root_plan:
         parallelize_module(model, tp_mesh, root_plan)
@@ -217,6 +223,7 @@ def _apply_custom_non_moe_tp(
     layer_plan = _build_custom_parallel_plan(
         layer_overrides,
         enable_loss_parallel=enable_loss_parallel,
+        enable_sp=tensor_parallel.sequence_parallel,
     )
     if layer_plan:
         for transformer_block in model.layers:
@@ -253,6 +260,7 @@ def _apply_torchtitan_tensor_parallel(
                 base_model,
                 tp_mesh,
                 enable_loss_parallel=tensor_parallel.loss_parallel,
+                enable_sp=tensor_parallel.sequence_parallel,
             )
         else:
             _apply_custom_non_moe_tp(base_model, tp_mesh, tensor_parallel, tensor_parallel.loss_parallel)
@@ -352,12 +360,15 @@ def apply_non_moe_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh,
     enable_loss_parallel: bool,
+    enable_sp: bool,
 ):
     """Apply tensor parallelism."""
     # 1. Parallelize the embedding and shard its outputs (which are the first
     # transformer block's inputs)
     # 2. Parallelize the root norm layer over the sequence dim
     # 3. Parallelize the final linear output layer
+    sp_layout = Shard(1) if enable_sp else Replicate()
+    norm_plan = SequenceParallel() if enable_sp else NoParallel()
 
     # skipping nn.Identity modules (which are added by pipeline parallelism for unused modules)
     root_plan = {}
@@ -370,7 +381,7 @@ def apply_non_moe_tp(
         else:
             root_plan["tok_embeddings"] = RowwiseParallel(
                 input_layouts=Replicate(),
-                output_layouts=Shard(1),
+                output_layouts=sp_layout,
             )
 
     if hasattr(model, "norm"):
@@ -379,7 +390,7 @@ def apply_non_moe_tp(
                 local_output_grad_placements=(Replicate(),),
             )
         else:
-            root_plan["norm"] = SequenceParallel()
+            root_plan["norm"] = norm_plan
 
     if hasattr(model, "lm_head"):
         if isinstance(model.lm_head, nn.Identity):
@@ -388,7 +399,7 @@ def apply_non_moe_tp(
             )
         else:
             root_plan["lm_head"] = ColwiseParallel(
-                input_layouts=Shard(1),
+                input_layouts=sp_layout,
                 output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
                 use_local_output=not enable_loss_parallel,
             )
@@ -398,12 +409,12 @@ def apply_non_moe_tp(
     # Apply tensor + sequence parallelism to every transformer block
     for transformer_block in model.layers:
         layer_plan = {
-            "input_layernorm": SequenceParallel(),
+            "input_layernorm": norm_plan,
             "self_attn": PrepareModuleInput(
-                input_kwarg_layouts={"hidden_states": Shard(1)},
+                input_kwarg_layouts={"hidden_states": sp_layout},
                 desired_input_kwarg_layouts={"hidden_states": Replicate()},
             ),
-            "post_attention_layernorm": SequenceParallel(),
+            "post_attention_layernorm": norm_plan,
         }
 
         if getattr(transformer_block.self_attn, "q_lora_rank", None) is None:
@@ -439,7 +450,7 @@ def apply_non_moe_tp(
             "o_proj" if hasattr(transformer_block.self_attn, "o_proj") else "dense"
         )
         layer_plan[f"self_attn.{o_proj_name}"] = RowwiseParallel(
-            output_layouts=Shard(1)
+            output_layouts=sp_layout
         )
         # For model that uses RMSNorm on Q and K (i.e. Qwen3)
         if hasattr(transformer_block.self_attn, "q_norm") and hasattr(
@@ -455,7 +466,7 @@ def apply_non_moe_tp(
         if not transformer_block.moe_enabled:
             mlp_plan = {
                 "mlp": PrepareModuleInput(
-                    input_layouts=(Shard(1),),
+                    input_layouts=(sp_layout,),
                     desired_input_layouts=(Replicate(),),
                 ),
             }
@@ -471,7 +482,7 @@ def apply_non_moe_tp(
             down_proj_name = (
                 "down_proj" if hasattr(transformer_block.mlp, "down_proj") else "fc2"
             )
-            mlp_plan[f"mlp.{down_proj_name}"] = RowwiseParallel(output_layouts=Shard(1))
+            mlp_plan[f"mlp.{down_proj_name}"] = RowwiseParallel(output_layouts=sp_layout)
             layer_plan.update(mlp_plan)
 
         # Some models like Phi-2 don't have post_attention_layernorm
