@@ -14,33 +14,11 @@ from lightning_grpo.utils.modeling import resolve_torch_dtype
 from lightning_grpo.utils.fsdp_helper import get_fsdp_reshard_after_forward_policy
 
 
-def _resolve_data_parallel_mesh(device_mesh: Any) -> Any | None:
-    """Return the data-parallel mesh created by Lightning's ModelParallelStrategy."""
-
-    if device_mesh is None:
-        return None
-    try:
-        return device_mesh["data_parallel"]
-    except (KeyError, RuntimeError, TypeError):
-        return device_mesh
-
-
-def _mesh_size(mesh: Any) -> int:
-    """Best-effort mesh size lookup across PyTorch versions."""
-
-    if mesh is None:
-        return 1
-    size = getattr(mesh, "size", None)
-    if callable(size):
-        return int(size())
-    return int(size) if size is not None else 1
-
-
 def configure_fully_shard(
     model: nn.Module,
     distributed_config: DistributedConfig,
     precision_config: PrecisionConfig,
-    device_mesh: Any = None,
+    device_mesh: DeviceMesh,
 ) -> None:
     """Apply PyTorch composable FSDP2 ``fully_shard`` using config-only policies.
 
@@ -52,8 +30,8 @@ def configure_fully_shard(
     if distributed_config.strategy not in {"fsdp2", "model_parallel"}:
         return
 
-    dp_mesh = _resolve_data_parallel_mesh(device_mesh)
-    if _mesh_size(dp_mesh) <= 1:
+    dp_mesh = device_mesh["data_parallel"]
+    if dp_mesh.size() <= 1:
         return
 
     _apply_fsdp(

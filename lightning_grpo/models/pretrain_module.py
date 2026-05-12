@@ -37,8 +37,8 @@ class PretrainLightningModule(L.LightningModule):
     def configure_model(self) -> None:
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
-        configure_tensor_parallel(self.model, self.config.distributed, getattr(self, "device_mesh", None))
-        configure_fully_shard(self.model, self.config.distributed, self.config.precision, getattr(self, "device_mesh", None))
+        configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
+        configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
 
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """Run one pretraining optimization/evaluation step and log metrics."""

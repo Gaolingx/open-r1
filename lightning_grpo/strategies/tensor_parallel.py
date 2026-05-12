@@ -24,28 +24,6 @@ import torch.nn as nn
 from lightning_grpo.utils.configs.base import DistributedConfig, TensorParallelConfig
 
 
-def _resolve_tensor_parallel_mesh(device_mesh: Any) -> Any | None:
-    """Return the tensor-parallel mesh created by Lightning's ModelParallelStrategy."""
-
-    if device_mesh is None:
-        return None
-    try:
-        return device_mesh["tensor_parallel"]
-    except (KeyError, RuntimeError, TypeError):
-        return device_mesh
-
-
-def _mesh_size(mesh: Any) -> int:
-    """Best-effort mesh size lookup across PyTorch versions."""
-
-    if mesh is None:
-        return 1
-    size = getattr(mesh, "size", None)
-    if callable(size):
-        return int(size())
-    return int(size) if size is not None else 1
-
-
 def _unwrap_base_model(root_module: nn.Module) -> nn.Module:
     """Return the module that owns decoder layers for common Hugging Face CausalLM wrappers."""
 
@@ -501,15 +479,15 @@ def apply_non_moe_tp(
 def configure_tensor_parallel(
     root_module: nn.Module,
     distributed_config: DistributedConfig,
-    device_mesh: Any = None,
+    device_mesh: DeviceMesh,
 ) -> None:
     """Apply PyTorch tensor parallelism from YAML/model-config plans before FSDP2 wrapping."""
 
     if not _tp_enabled(distributed_config):
         return
 
-    tp_mesh = _resolve_tensor_parallel_mesh(device_mesh)
-    if _mesh_size(tp_mesh) <= 1:
+    tp_mesh = device_mesh["tensor_parallel"]
+    if tp_mesh.size() <= 1:
         return
 
     base_model = _unwrap_base_model(root_module)
