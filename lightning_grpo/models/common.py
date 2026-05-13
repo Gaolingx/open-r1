@@ -26,13 +26,24 @@ def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.
         except ImportError as error:
             raise ImportError("bitsandbytes is required for 8-bit optimizers.") from error
 
-        optimizer_class = bnb.optim.AdamW8bit if optimizer_type == "adamw8bit" else bnb.optim.Adam8bit
-        return optimizer_class(
+    if optimizer_type == "adamw8bit":
+        return bnb.optim.AdamW8bit(
             parameters,
             lr=optimizer_config.learning_rate,
             betas=optimizer_config.betas,
             eps=optimizer_config.eps,
             weight_decay=optimizer_config.weight_decay,
+            amsgrad=optimizer_config.amsgrad,
+        )
+
+    if optimizer_type == "adam8bit":
+        return bnb.optim.Adam8bit(
+            parameters,
+            lr=optimizer_config.learning_rate,
+            betas=optimizer_config.betas,
+            eps=optimizer_config.eps,
+            weight_decay=optimizer_config.weight_decay,
+            amsgrad=optimizer_config.amsgrad,
         )
 
     if optimizer_type == "adamw":
@@ -43,8 +54,6 @@ def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.
             eps=optimizer_config.eps,
             weight_decay=optimizer_config.weight_decay,
             amsgrad=optimizer_config.amsgrad,
-            foreach=optimizer_config.foreach,
-            maximize=optimizer_config.maximize,
         )
 
     if optimizer_type == "adam":
@@ -55,8 +64,6 @@ def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.
             eps=optimizer_config.eps,
             weight_decay=optimizer_config.weight_decay,
             amsgrad=optimizer_config.amsgrad,
-            foreach=optimizer_config.foreach,
-            maximize=optimizer_config.maximize,
         )
 
     if optimizer_type == "sgd":
@@ -64,38 +71,23 @@ def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.
             parameters,
             lr=optimizer_config.learning_rate,
             momentum=optimizer_config.momentum,
-            weight_decay=optimizer_config.weight_decay,
             dampening=optimizer_config.dampening,
+            weight_decay=optimizer_config.weight_decay,
             nesterov=optimizer_config.nesterov,
-            foreach=optimizer_config.foreach,
-            maximize=optimizer_config.maximize,
         )
 
-    if optimizer_type == "rmsprop":
-        return torch.optim.RMSprop(
+    if optimizer_type == "muon":
+        return torch.optim.Muon(
             parameters,
             lr=optimizer_config.learning_rate,
-            alpha=optimizer_config.alpha,
-            eps=optimizer_config.eps,
             weight_decay=optimizer_config.weight_decay,
             momentum=optimizer_config.momentum,
-            centered=optimizer_config.centered,
-            foreach=optimizer_config.foreach,
-            maximize=optimizer_config.maximize,
-        )
-
-    if optimizer_type == "adagrad":
-        return torch.optim.Adagrad(
-            parameters,
-            lr=optimizer_config.learning_rate,
+            nesterov=optimizer_config.nesterov,
             eps=optimizer_config.eps,
-            weight_decay=optimizer_config.weight_decay,
-            foreach=optimizer_config.foreach,
-            maximize=optimizer_config.maximize,
         )
 
     raise ValueError(
-        f"Unknown optimizer type: {optimizer_config.type}. Supported: adamw, adam, adamw8bit, adam8bit, sgd, rmsprop, adagrad."
+        f"Unknown optimizer type: {optimizer_config.type}. Supported: adamw, adam, adamw8bit, adam8bit, sgd, muon."
     )
 
 

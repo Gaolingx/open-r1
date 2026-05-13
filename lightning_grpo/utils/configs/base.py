@@ -111,8 +111,6 @@ class OptimizerSettings:
     dampening: float = 0.0
     nesterov: bool = False
     amsgrad: bool = False
-    foreach: Optional[bool] = None
-    maximize: bool = False
 
 
 @dataclass
