@@ -112,7 +112,7 @@ class GRPORewardManager:
                 **reward_kwargs,
             )
             reward_values = [value if value is not None else torch.nan for value in reward_values]
-            reward_tensor = torch.tensor(reward_values, device=self.device, dtype=torch.float32)
+            reward_tensor = torch.tensor(reward_values, device=torch.device(self.device), dtype=torch.float32)
             reward_matrix.append(reward_tensor)
 
         rewards_per_func = torch.stack(reward_matrix, dim=-1)

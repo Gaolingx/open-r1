@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import requests
 import torch
@@ -20,6 +20,24 @@ from lightning_grpo.utils.modeling import DTYPE_MAP
 
 
 logger = logging.getLogger(__name__)
+
+
+def _load_generation_config(sampling_config_path: Optional[str], fallback: GenerationConfig) -> GenerationConfig:
+    """Load rollout sampling config, falling back to the model generation config."""
+
+    if sampling_config_path:
+        return GenerationConfig.from_pretrained(generation_config_path=sampling_config_path)
+    return GenerationConfig.from_dict(fallback.to_dict())
+
+
+def _resolve_eos_token_ids(eos_token_id: Optional[int | Sequence[int]]) -> list[int]:
+    """Normalize single or multiple EOS token ids into a list."""
+
+    if eos_token_id is None:
+        return []
+    if isinstance(eos_token_id, int):
+        return [eos_token_id]
+    return [int(token_id) for token_id in eos_token_id]
 
 def compute_per_token_logps(
     model: torch.nn.Module,
@@ -94,11 +112,15 @@ class PolicyRolloutEngine(RolloutEngine):
         self,
         policy_model: torch.nn.Module,
         tokenizer: PreTrainedTokenizerBase,
+        sampling_config_path: Optional[str],
         generation_batch_size: int = 0,
+        output_router_logits: bool = False,
     ) -> None:
         self.policy_model = policy_model
         self.tokenizer = tokenizer
+        self.generation_config = _load_generation_config(sampling_config_path, policy_model.generation_config)
         self.generation_batch_size = max(0, int(generation_batch_size))
+        self.output_router_logits = output_router_logits
 
     def rollout(
         self,
@@ -140,7 +162,7 @@ class PolicyRolloutEngine(RolloutEngine):
             model_input_ids,
             completion_ids.shape[1],
             attention_mask=model_attention_mask,
-            temperature=self.policy_model.generation_config.temperature,
+            temperature=self.generation_config.temperature,
         )
         return RolloutResult(
             output_ids=model_input_ids,
@@ -162,7 +184,7 @@ class PolicyRolloutEngine(RolloutEngine):
 
         generation_config = {
             key: value
-            for key, value in self.policy_model.generation_config.to_dict().items()
+            for key, value in self.generation_config.to_dict().items()
             if key not in self._GENERATION_CONFIG_OVERRIDE_KEYS and value is not None
         }
         generation_config["num_return_sequences"] = num_generations
@@ -191,7 +213,7 @@ class PolicyRolloutEngine(RolloutEngine):
                 input_ids=prompt_ids[start:end],
                 attention_mask=attention_mask[start:end],
                 generation_config=self._build_generation_config(num_generations),
-                output_router_logits=False,
+                output_router_logits=self.output_router_logits,
             )
             generated_chunks.append(generated_chunk)
 
@@ -230,6 +252,12 @@ class RewardModelRolloutEngine(RolloutEngine):
             **model_kwargs,
         )
         self.model.eval()
+
+    def to(self, device: torch.device | str) -> "RewardModelRolloutEngine":
+        """Move the local reward model to the active Lightning device."""
+
+        self.model.to(device)
+        return self
 
     def rollout(
         self,
@@ -305,6 +333,7 @@ class SGLangRolloutEngine(RolloutEngine):
         max_retries: int,
         retry_backoff_seconds: float,
         retry_max_backoff_seconds: float,
+        export_dtype: torch.dtype,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.shared_ckpt_path = shared_ckpt_path
@@ -313,7 +342,8 @@ class SGLangRolloutEngine(RolloutEngine):
         self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self.retry_max_backoff_seconds = max(self.retry_backoff_seconds, float(retry_max_backoff_seconds))
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.generation_config = GenerationConfig.from_pretrained(generation_config_path=sampling_config_path)
+        self.generation_config = _load_generation_config(sampling_config_path, GenerationConfig())
+        self.export_dtype = export_dtype
         self.http = requests
 
     def _request_with_retry(self, endpoint: str, payload: dict[str, Any]) -> Any:
@@ -418,7 +448,10 @@ class SGLangRolloutEngine(RolloutEngine):
         unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
         target_path = Path(self.shared_ckpt_path).resolve()
         target_path.mkdir(parents=True, exist_ok=True)
-        state_dict = {k: v.detach().half().cpu() for k, v in unwrapped.state_dict().items()}
+        state_dict = {
+            k: v.detach().to(dtype=self.export_dtype, device="cpu") if v.is_floating_point() else v.detach().cpu()
+            for k, v in unwrapped.state_dict().items()
+        }
         if hasattr(unwrapped, "save_pretrained"):
             unwrapped.save_pretrained(str(target_path), state_dict=state_dict, safe_serialization=False)
         self.tokenizer.save_pretrained(str(target_path))
@@ -428,17 +461,19 @@ class SGLangRolloutEngine(RolloutEngine):
 def truncate_completions(
     completion_ids: torch.Tensor,
     pad_token_id: int,
-    eos_token_id: Optional[int],
+    eos_token_id: Optional[int | Sequence[int]],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]]]:
     """Mask tokens after EOS and extract valid completion token lists."""
 
-    if eos_token_id is None:
+    eos_token_ids = _resolve_eos_token_ids(eos_token_id)
+    if not eos_token_ids:
         completion_mask = torch.ones_like(completion_ids, dtype=torch.long)
         completion_id_lists = [row.tolist() for row in completion_ids]
         completion_truncated = torch.zeros(completion_ids.size(0), dtype=torch.bool, device=completion_ids.device)
         return completion_ids, completion_mask, completion_truncated, completion_id_lists
 
-    is_eos = completion_ids == eos_token_id
+    eos_tensor = torch.tensor(eos_token_ids, dtype=completion_ids.dtype, device=completion_ids.device)
+    is_eos = torch.isin(completion_ids, eos_tensor)
     eos_idx = torch.full((completion_ids.size(0),), completion_ids.size(1), dtype=torch.long, device=completion_ids.device)
     has_eos = is_eos.any(dim=1)
     eos_idx[has_eos] = is_eos.int().argmax(dim=1)[has_eos]
@@ -447,7 +482,7 @@ def truncate_completions(
     completion_ids = completion_ids.masked_fill(completion_mask == 0, pad_token_id)
     completion_id_lists = [ids[mask.bool()].tolist() for ids, mask in zip(completion_ids, completion_mask, strict=True)]
     completion_truncated = torch.tensor(
-        [len(ids) == 0 or ids[-1] != eos_token_id for ids in completion_id_lists],
+        [len(ids) == 0 or ids[-1] not in eos_token_ids for ids in completion_id_lists],
         device=completion_ids.device,
         dtype=torch.bool,
     )
@@ -477,7 +512,7 @@ def create_rollout_engine(
     engine_type: str,
     policy_model: torch.nn.Module,
     tokenizer: PreTrainedTokenizerBase,
-    sampling_config_path: str,
+    sampling_config_path: Optional[str] = None,
     generation_batch_size: int = 0,
     sglang_base_url: Optional[str] = None,
     sglang_model_path: Optional[str] = None,
@@ -487,6 +522,7 @@ def create_rollout_engine(
     retry_backoff_seconds: float = 2.0,
     retry_max_backoff_seconds: float = 30.0,
     reward_model_config: Optional[RewardModelConfig] = None,
+    export_dtype: torch.dtype = torch.bfloat16,
 ) -> RolloutEngine:
     """Build the configured rollout engine."""
 
@@ -494,6 +530,7 @@ def create_rollout_engine(
         return PolicyRolloutEngine(
             policy_model=policy_model,
             tokenizer=tokenizer,
+            sampling_config_path=sampling_config_path,
             generation_batch_size=generation_batch_size,
         )
     if engine_type == "sglang":
@@ -508,6 +545,7 @@ def create_rollout_engine(
             max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
             retry_max_backoff_seconds=retry_max_backoff_seconds,
+            export_dtype=export_dtype,
         )
     if engine_type == "reward_model":
         if reward_model_config is None:

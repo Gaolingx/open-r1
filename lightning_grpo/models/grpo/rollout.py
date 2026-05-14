@@ -8,6 +8,7 @@ import torch
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.models.rollout_engine import create_rollout_engine
+from lightning_grpo.utils.modeling import resolve_torch_dtype
 
 
 class GRPORolloutCoordinator:
@@ -31,6 +32,7 @@ class GRPORolloutCoordinator:
             retry_backoff_seconds=config.rollout.engine.retry_backoff_seconds,
             retry_max_backoff_seconds=config.rollout.engine.retry_max_backoff_seconds,
             reward_model_config=config.reward.rlhf.reward_model,
+            export_dtype=resolve_torch_dtype(config.precision),
         )
         self.reward_model_engine = None
         if config.reward.rlhf.reward_model.enabled:

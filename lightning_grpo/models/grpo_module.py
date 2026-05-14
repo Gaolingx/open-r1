@@ -37,7 +37,7 @@ class GRPOLightningModule(L.LightningModule):
         self.rollout_coordinator = GRPORolloutCoordinator(config, self.policy, self.tokenizer)
         self.rollout_engine = self.rollout_coordinator.rollout_engine
         self.reward_model_engine = self.rollout_coordinator.reward_model_engine
-        self.rollout_generation_config = self.policy.generation_config
+        self.rollout_generation_config = self.rollout_engine.generation_config
         self.reward_manager = GRPORewardManager(config, self.tokenizer, self.rollout_engine, self.reward_model_engine, self.device)
         self.register_buffer("reward_weights", self.reward_manager.reward_weight_tensor.clone(), persistent=False)
         self.metrics_aggregator = GRPOMetricsAggregator(self)
@@ -55,6 +55,10 @@ class GRPOLightningModule(L.LightningModule):
 
     def on_fit_start(self) -> None:
         """Log static parameter counts once training starts."""
+
+        self.reward_manager.device = self.device
+        if self.reward_model_engine is not None and hasattr(self.reward_model_engine, "to"):
+            self.reward_model_engine.to(self.device)
 
         if self.logger is None or not self.trainer.is_global_zero:
             return
