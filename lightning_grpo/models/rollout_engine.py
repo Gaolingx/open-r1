@@ -11,6 +11,8 @@ from typing import Any, Optional, Sequence
 
 import requests
 import torch
+import torch.distributed as dist
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
 
@@ -342,6 +344,8 @@ class SGLangRolloutEngine(RolloutEngine):
         self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self.retry_max_backoff_seconds = max(self.retry_backoff_seconds, float(retry_max_backoff_seconds))
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.generation_config = _load_generation_config(sampling_config_path, GenerationConfig())
         self.export_dtype = export_dtype
         self.http = requests
@@ -429,7 +433,14 @@ class SGLangRolloutEngine(RolloutEngine):
             self.tokenizer.pad_token_id,
             self.tokenizer.eos_token_id,
         )
-        per_token_logps = pad_float_sequences(logprobs, completion_ids.shape[1], device=prompt_ids.device)
+        # Align per-token logprobs with truncated completion_ids: truncate each
+        # sample's logprobs to its valid completion length (matching EOS truncation)
+        # before padding to the final tensor width. This ensures logprobs beyond
+        # EOS are zeroed and the tensor shape matches completion_ids exactly.
+        aligned_logprobs = [
+            lp[:len(ids)] for lp, ids in zip(logprobs, completion_id_lists)
+        ]
+        per_token_logps = pad_float_sequences(aligned_logprobs, completion_ids.shape[1], device=prompt_ids.device)
         completions_text = self.tokenizer.batch_decode(completion_id_lists, skip_special_tokens=True)
         output_ids = torch.cat([repeated_prompt_ids, completion_ids], dim=1)
         return RolloutResult(
@@ -445,17 +456,49 @@ class SGLangRolloutEngine(RolloutEngine):
         )
 
     def update_policy(self, model: torch.nn.Module) -> None:
+        """Export policy weights to disk and notify SGLang to reload.
+
+        In distributed training (FSDP2/DDP), only rank 0 performs the filesystem
+        write and the HTTP reload request. All ranks participate in state-dict
+        gathering (required by FSDP2) and synchronize via a barrier afterwards.
+        """
+
         unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
-        target_path = Path(self.shared_ckpt_path).resolve()
-        target_path.mkdir(parents=True, exist_ok=True)
-        state_dict = {
-            k: v.detach().to(dtype=self.export_dtype, device="cpu") if v.is_floating_point() else v.detach().cpu()
-            for k, v in unwrapped.state_dict().items()
-        }
-        if hasattr(unwrapped, "save_pretrained"):
-            unwrapped.save_pretrained(str(target_path), state_dict=state_dict, safe_serialization=False)
-        self.tokenizer.save_pretrained(str(target_path))
-        self._request_with_retry("update_weights_from_disk", {"model_path": str(target_path)})
+        is_distributed = dist.is_initialized()
+        is_rank_zero = (not is_distributed) or (dist.get_rank() == 0)
+
+        # Gather full state dict — all ranks must participate for FSDP2 sharded models.
+        # For non-FSDP models this is equivalent to a regular state_dict() call.
+        try:
+            state_dict = get_model_state_dict(
+                unwrapped,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
+        except (TypeError, RuntimeError):
+            # Fallback for models not wrapped with composable FSDP2 (e.g. single-GPU).
+            state_dict = {
+                k: v.detach().cpu() for k, v in unwrapped.state_dict().items()
+            }
+
+        if is_rank_zero:
+            # Cast to export dtype on rank 0 only to save memory on other ranks.
+            state_dict = {
+                k: v.to(dtype=self.export_dtype) if v.is_floating_point() else v
+                for k, v in state_dict.items()
+            }
+            target_path = Path(self.shared_ckpt_path).resolve()
+            target_path.mkdir(parents=True, exist_ok=True)
+            if hasattr(unwrapped, "save_pretrained"):
+                unwrapped.save_pretrained(str(target_path), state_dict=state_dict, safe_serialization=False)
+            else:
+                torch.save(state_dict, str(target_path / "pytorch_model.bin"))
+            self.tokenizer.save_pretrained(str(target_path))
+            self._request_with_retry("update_weights_from_disk", {"model_path": str(target_path)})
+
+        # Barrier ensures all ranks wait for the export + reload to complete
+        # before resuming training (prevents stale weight reads on next rollout).
+        if is_distributed:
+            dist.barrier()
 
 
 def truncate_completions(
