@@ -286,6 +286,7 @@ class PeriodicSampleGenerationCallback(Callback):
     def __init__(self, logging_config: LoggingConfig, model_config: ModelConfig) -> None:
         super().__init__()
         self.logging_config = logging_config
+        self.model_config = model_config
         self.tokenizer = load_tokenizer(model_config)
         self.tokenizer.padding_side = "left"
         self.rollout_engine: PolicyRolloutEngine | None = None
@@ -303,6 +304,7 @@ class PeriodicSampleGenerationCallback(Callback):
             self.rollout_engine = PolicyRolloutEngine(
                 policy_model=model,
                 tokenizer=self.tokenizer,
+                sampling_config_path=self.model_config.model_generation_config_path,
             )
         else:
             self.rollout_engine.update_policy(model)

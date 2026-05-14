@@ -28,7 +28,7 @@ def _load_generation_config(sampling_config_path: Optional[str], fallback: Gener
     """Load rollout sampling config, falling back to the model generation config."""
 
     if sampling_config_path:
-        return GenerationConfig.from_pretrained(generation_config_path=sampling_config_path)
+        return GenerationConfig.from_pretrained(pretrained_model_name=sampling_config_path)
     return GenerationConfig.from_dict(fallback.to_dict())
 
 
