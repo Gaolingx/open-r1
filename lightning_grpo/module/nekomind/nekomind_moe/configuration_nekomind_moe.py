@@ -17,8 +17,10 @@ from huggingface_hub.dataclasses import strict
 
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.modeling_rope_utils import RopeParameters
+from transformers.utils import auto_docstring
 
 
+@auto_docstring(checkpoint="nekocyrene/NekoMind1.5-Base")
 @strict
 class NekoMindMoeConfig(PreTrainedConfig):
     r"""
@@ -30,13 +32,13 @@ class NekoMindMoeConfig(PreTrainedConfig):
         If `mlp_only_layers` is empty, `decoder_sparse_step` is used to determine the sparsity.
 
     ```python
-    >>> from transformers import Qwen3MoeModel, Qwen3MoeConfig
+    >>> from transformers import NekoMindMoeModel, NekoMindMoeConfig
 
-    >>> # Initializing a Qwen3MoE style configuration
-    >>> configuration = Qwen3MoeConfig()
+    >>> # Initializing a NekoMindMoE style configuration
+    >>> configuration = NekoMindMoeConfig()
 
-    >>> # Initializing a model from the Qwen3-15B-A2B" style configuration
-    >>> model = Qwen3MoeModel(configuration)
+    >>> # Initializing a model from the NekoMind1.5-Base" style configuration
+    >>> model = NekoMindMoeModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config

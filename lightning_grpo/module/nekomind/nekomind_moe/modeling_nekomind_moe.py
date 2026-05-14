@@ -656,10 +656,10 @@ class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, Qwen3MoeForCausalLM
+        >>> from transformers import AutoTokenizer, NekoMindMoeForCausalLM
 
-        >>> model = Qwen3MoeForCausalLM.from_pretrained("Qwen/Qwen3-MoE-15B-A2B")
-        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-MoE-15B-A2B")
+        >>> model = NekoMindMoeForCausalLM.from_pretrained("nekocyrene/NekoMind1.5-Base")
+        >>> tokenizer = AutoTokenizer.from_pretrained("nekocyrene/NekoMind1.5-Base")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
