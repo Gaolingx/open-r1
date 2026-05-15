@@ -18,7 +18,7 @@ from lightning_grpo.models.grpo import (
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.configs.grpo import GRPOConfig
-from lightning_grpo.utils.modeling import count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer
+from lightning_grpo.utils.modeling import compile_model_if_configured, count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer
 
 
 class GRPOLightningModule(L.LightningModule):
@@ -81,6 +81,7 @@ class GRPOLightningModule(L.LightningModule):
 
         configure_tensor_parallel(self.policy, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.policy, self.config.distributed, self.config.precision, self.device_mesh)
+        self.policy = compile_model_if_configured(self.policy, self.config.model)
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         """Run one online rollout and optimization step."""

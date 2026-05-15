@@ -12,7 +12,7 @@ from lightning_grpo.utils.configs.pretrain import PretrainConfig
 from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats, compute_cross_entropy_loss
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
-from lightning_grpo.utils.modeling import count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
+from lightning_grpo.utils.modeling import compile_model_if_configured, count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
 class PretrainLightningModule(L.LightningModule):
@@ -39,6 +39,7 @@ class PretrainLightningModule(L.LightningModule):
 
         configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
+        self.model = compile_model_if_configured(self.model, self.config.model)
 
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """Run one pretraining optimization/evaluation step and log metrics."""

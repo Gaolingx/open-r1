@@ -22,6 +22,7 @@ DTYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
     "fp32": torch.float32,
+    "fp64": torch.float64,
 }
 
 
@@ -203,9 +204,15 @@ def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig)
     _freeze_embeddings_if_needed(model, model_config.freeze_embeddings)
     model = _apply_lora_if_needed(model, model_config)
 
+    return model
+
+
+def compile_model_if_configured(model: torch.nn.Module, model_config: ModelConfig) -> torch.nn.Module:
+    """Apply torch.compile after distributed wrapping is complete."""
+
     if model_config.compile_model and hasattr(torch, "compile"):
         model = torch.compile(model, **model_config.compile_specific_kwargs)
-
+        rank_zero_info("Applied torch.compile to the model")
     return model
 
 
