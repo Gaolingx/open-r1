@@ -33,7 +33,7 @@ class LoRAConfig:
     bias: Literal["none", "all", "lora_only"] = "none"
     target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
     modules_to_save: list[str] = field(default_factory=list)
-    lora_specific_kwargs: dict[str, Any] = field(default_factory=dict)
+    lora_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -55,9 +55,10 @@ class ModelConfig:
     pad_token: Optional[str] = None
     freeze_embeddings: bool = False
     gradient_checkpointing: bool = True
+    gradient_checkpointing_kwargs: dict[str, Any] = field(default_factory=dict)
     use_cache: bool = False
     compile_model: bool = False
-    compile_specific_kwargs: dict[str, Any] = field(default_factory=dict)
+    compile_kwargs: dict[str, Any] = field(default_factory=dict)
     save_pth_format: bool = True
     save_safetensors_format: bool = False
     lora: LoRAConfig = field(default_factory=LoRAConfig)
@@ -228,7 +229,7 @@ class DistributedConfig:
     fsdp_backward_prefetch: bool = True
     fsdp_fully_shard_kwargs: dict[str, Any] = field(default_factory=dict)
     tensor_parallel: TensorParallelConfig = field(default_factory=TensorParallelConfig)
-    model_parallel_specific_kwargs: dict[str, Any] = field(default_factory=dict)
+    model_parallel_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

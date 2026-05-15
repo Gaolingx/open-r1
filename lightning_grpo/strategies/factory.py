@@ -37,7 +37,7 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | ModelParall
         return ModelParallelStrategy(
             data_parallel_size=config.data_parallel_size,
             tensor_parallel_size=config.tensor_parallel_size,
-            **config.model_parallel_specific_kwargs,
+            **config.model_parallel_kwargs,
         )
     raise ValueError(f"Unknown distributed strategy: {config.strategy}")
 

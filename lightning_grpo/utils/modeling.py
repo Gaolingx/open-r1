@@ -99,7 +99,7 @@ def _apply_lora_if_needed(model: PreTrainedModel, model_config: ModelConfig) -> 
         target_modules=model_config.lora.target_modules,
         modules_to_save=model_config.lora.modules_to_save,
         task_type=TaskType.CAUSAL_LM,
-        **model_config.lora.lora_specific_kwargs,
+        **model_config.lora.lora_kwargs,
     )
     model = get_peft_model(model, lora_config)
 
@@ -199,7 +199,7 @@ def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig)
         model.config.use_cache = model_config.use_cache
 
     if model_config.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=model_config.gradient_checkpointing_kwargs)
 
     _freeze_embeddings_if_needed(model, model_config.freeze_embeddings)
     model = _apply_lora_if_needed(model, model_config)
@@ -211,7 +211,7 @@ def compile_model_if_configured(model: torch.nn.Module, model_config: ModelConfi
     """Apply torch.compile after distributed wrapping is complete."""
 
     if model_config.compile_model and hasattr(torch, "compile"):
-        model = torch.compile(model, **model_config.compile_specific_kwargs)
+        model = torch.compile(model, **model_config.compile_kwargs)
         rank_zero_info("Applied torch.compile to the model")
     return model
 
