@@ -301,3 +301,68 @@ class LigerGRPOLossComputer:
             metrics[f"reward/{name}"] = func_rewards.nanmean()
 
         return loss, metrics
+
+
+class LigerCELossComputer:
+    """Compute cross entropy loss using Liger Kernel's fused linear + CELoss kernel."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+    ) -> None:
+        if not is_liger_kernel_available():
+            raise ImportError(
+                "Liger Kernel is required for fused cross entropy loss. "
+                "Install it with: pip install liger-kernel"
+            )
+
+        self.model = model
+
+    def compute_loss(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+        ignore_index: int = -100,
+        label_smoothing: float = 0.0,
+    ) -> torch.Tensor:
+        """Compute CE loss using Liger Kernel's fused linear + cross-entropy.
+
+        Instead of materializing the full [batch*seq, vocab] logits tensor, this
+        kernel fuses the LM head projection with the cross-entropy computation in
+        a chunked manner, reducing peak VRAM by ~30-50% for large vocabularies.
+
+        Args:
+            model: The language model (must have a `lm_head` attribute).
+            hidden_states: Last hidden states from the model, shape [B, S, H].
+            labels: Target token IDs, shape [B, S]. Uses ignore_index for masked positions.
+            ignore_index: Label value to ignore in loss computation.
+            label_smoothing: Label smoothing factor.
+
+        Returns:
+            Scalar loss tensor.
+        """
+        from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+
+        # Shift for next-token prediction: hidden_states[:-1] predicts labels[1:]
+        shift_hidden = hidden_states[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        # Reshape to 2D for the fused kernel
+        batch_seq = shift_hidden.shape[0] * shift_hidden.shape[1]
+        hidden_dim = shift_hidden.shape[-1]
+        shift_hidden_2d = shift_hidden.reshape(batch_seq, hidden_dim)
+        shift_labels_1d = shift_labels.reshape(batch_seq)
+
+        # Get LM head weight (and optional bias)
+        unwrapped = self.model.module if hasattr(self.model, "module") else self.model
+        lm_head = unwrapped.lm_head
+        weight = lm_head.weight
+        bias = getattr(lm_head, "bias", None)
+
+        # Use Liger fused kernel
+        loss_fn = LigerFusedLinearCrossEntropyLoss(
+            ignore_index=ignore_index,
+            label_smoothing=label_smoothing,
+        )
+        loss = loss_fn(shift_hidden_2d, weight, shift_labels_1d, bias)
+        return loss

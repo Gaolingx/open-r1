@@ -216,3 +216,22 @@ def compute_cross_entropy_loss(
             ignore_index=ignore_index,
             label_smoothing=label_smoothing,
         )
+
+
+def compute_liger_cross_entropy_loss(
+    model: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Compute token-level next-token loss using Liger Kernel's fused kernel."""
+    from lightning_grpo.models.grpo.liger_loss import LigerCELossComputer
+
+    loss_computer = LigerCELossComputer(model)
+    return loss_computer.compute_loss(
+        hidden_states=hidden_states,
+        labels=labels,
+        ignore_index=ignore_index,
+        label_smoothing=label_smoothing,
+    )

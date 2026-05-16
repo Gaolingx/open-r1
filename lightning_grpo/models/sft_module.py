@@ -9,14 +9,14 @@ import torch
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.sft import SFTConfig
-from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats, compute_cross_entropy_loss
+from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats, compute_cross_entropy_loss, compute_liger_cross_entropy_loss
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import compile_model_if_configured, count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
 
 
 class SFTLightningModule(L.LightningModule):
-    """A reusable Lightning module for decoder-only SFT."""
+    """Lightning module for decoder-only causal LM SFT."""
 
     def __init__(self, config: SFTConfig) -> None:
         super().__init__()
@@ -41,12 +41,42 @@ class SFTLightningModule(L.LightningModule):
         configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
         self.model = compile_model_if_configured(self.model, self.config.model)
 
+    def _model_forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        exclude_labels: bool = True,
+        output_hidden_states: bool = False,
+    ) -> Any:
+        """Unified forward pass through the model.
+
+        Args:
+            batch: Input batch dictionary.
+            exclude_labels: If True, strip 'labels' from inputs before forwarding.
+            output_hidden_states: If True, request hidden states from the model.
+        """
+        inputs = {k: v for k, v in batch.items() if k != "labels"} if exclude_labels else batch
+        return self.model(**inputs, use_cache=False, output_hidden_states=output_hidden_states)
+
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
-        """Run one SFT optimization/evaluation step and log metrics."""
+        """Run one optimization/evaluation step and log metrics."""
 
         labels = batch["labels"]
-        if self.config.distributed.tensor_parallel.loss_parallel:
-            outputs = self(**{key: value for key, value in batch.items() if key != "labels"}, use_cache=False)
+        use_liger = self.config.use_liger_kernel
+
+        if use_liger:
+            # Liger path: forward without computing logits, use fused linear + CE kernel
+            outputs = self._model_forward(batch, output_hidden_states=True)
+            hidden_states = outputs.hidden_states[-1]
+            loss = compute_liger_cross_entropy_loss(
+                model=self.model,
+                hidden_states=hidden_states,
+                labels=labels,
+                ignore_index=self.config.data.ignore_index,
+                label_smoothing=self.config.label_smoothing,
+            )
+        elif self.config.distributed.tensor_parallel.loss_parallel:
+            outputs = self._model_forward(batch)
             loss = compute_cross_entropy_loss(
                 outputs.logits,
                 labels,
@@ -55,7 +85,7 @@ class SFTLightningModule(L.LightningModule):
                 loss_parallel_enabled=True,
             )
         else:
-            outputs = self(**{**batch, "use_cache": False})
+            outputs = self._model_forward(batch, exclude_labels=False)
             if hasattr(outputs, "loss") and outputs.loss is not None:
                 loss = outputs.loss
             else:
@@ -66,16 +96,19 @@ class SFTLightningModule(L.LightningModule):
                     label_smoothing=self.config.label_smoothing,
                 )
 
-        with torch.no_grad():
-            stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
-
         on_step = stage == "train"
         prog_bar = stage in {"train", "val"}
         self.log(f"{stage}/loss", loss, prog_bar=prog_bar, on_step=on_step, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/entropy", stats["entropy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+
+        if not use_liger:
+            # Full metrics only available when logits are materialized
+            with torch.no_grad():
+                stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
+            self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+            self.log(f"{stage}/entropy", stats["entropy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+            self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+            self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+
         log_moe_metrics(self, outputs, stage, on_step=on_step)
 
         return loss

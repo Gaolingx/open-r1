@@ -240,6 +240,7 @@ class TrainingBaseConfig:
     val_check_interval: int = 500
     task: Literal["sft", "grpo", "pretrain"] = "sft"
     output_dir: str = "outputs/default"
+    use_liger_kernel: bool = False
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)

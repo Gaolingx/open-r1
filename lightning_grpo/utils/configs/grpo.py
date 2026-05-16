@@ -185,4 +185,3 @@ class GRPOConfig(TrainingBaseConfig):
     data: ChatDataConfig = field(default_factory=ChatDataConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
-    use_liger_kernel: bool = False  # Convenience alias for rollout.liger_kernel.enabled
