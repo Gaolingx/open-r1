@@ -167,7 +167,12 @@ class GRPOLossComputer:
         else:
             per_token_kl = torch.zeros_like(per_token_logps)
 
-        loss_mask = completion_mask.to(per_token_logps.dtype)
+        # Apply tool_mask: exclude tool-injected tokens from loss (multi-turn training)
+        loss_mask = completion_mask
+        if "tool_mask" in rollout_batch:
+            loss_mask = completion_mask * rollout_batch["tool_mask"]
+        loss_mask = loss_mask.to(per_token_logps.dtype)
+
         per_token_loss = -(surrogate - self.module.config.rollout.kl_beta * per_token_kl)
         loss = masked_mean(per_token_loss, loss_mask)
 

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.models.rollout_engine import create_rollout_engine
-from lightning_grpo.utils.modeling import resolve_torch_dtype
 
 
 class GRPORolloutCoordinator:
@@ -18,21 +18,25 @@ class GRPORolloutCoordinator:
         self.config = config
         self.policy = policy
         self.tokenizer = tokenizer
+
+        # Resolve distributed info for vLLM engine
+        import torch.distributed as dist
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        global_rank = dist.get_rank() if dist.is_initialized() else 0
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
         self.rollout_engine = create_rollout_engine(
             engine_type=config.rollout.engine.engine_type,
             policy_model=policy,
             tokenizer=tokenizer,
             sampling_config_path=config.rollout.sampling_config_path,
             generation_batch_size=config.rollout.generation_batch_size,
-            sglang_base_url=config.rollout.engine.sglang_base_url,
-            sglang_model_path=config.rollout.engine.sglang_model_path,
-            sglang_shared_path=config.rollout.engine.sglang_shared_path,
-            request_timeout=config.rollout.engine.request_timeout,
-            max_retries=config.rollout.engine.max_retries,
-            retry_backoff_seconds=config.rollout.engine.retry_backoff_seconds,
-            retry_max_backoff_seconds=config.rollout.engine.retry_max_backoff_seconds,
             reward_model_config=config.reward.rlhf.reward_model,
-            export_dtype=resolve_torch_dtype(config.precision),
+            vllm_config=getattr(config.rollout.engine, "vllm", None),
+            model_name_or_path=getattr(config.model, "model_name_or_path", None),
+            world_size=world_size,
+            local_rank=local_rank,
+            global_rank=global_rank,
         )
         self.reward_model_engine = None
         if config.reward.rlhf.reward_model.enabled:

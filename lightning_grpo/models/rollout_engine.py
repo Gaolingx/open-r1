@@ -5,14 +5,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import logging
-from pathlib import Path
-import time
 from typing import Any, Optional, Sequence
 
-import requests
 import torch
-import torch.distributed as dist
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
 
@@ -319,188 +314,6 @@ class RewardModelRolloutEngine(RolloutEngine):
         return outputs
 
 
-class SGLangRolloutEngine(RolloutEngine):
-    """HTTP rollout backend backed by an SGLang server."""
-
-    _SAMPLING_CONFIG_EXCLUDE_KEYS = frozenset({"transformers_version", "bos_token_id", "pad_token_id", "eos_token_id"})
-
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        model_path: str,
-        shared_ckpt_path: str,
-        timeout: int,
-        sampling_config_path: str,
-        max_retries: int,
-        retry_backoff_seconds: float,
-        retry_max_backoff_seconds: float,
-        export_dtype: torch.dtype,
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.shared_ckpt_path = shared_ckpt_path
-        self.timeout = timeout
-        self.max_retries = max(0, int(max_retries))
-        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
-        self.retry_max_backoff_seconds = max(self.retry_backoff_seconds, float(retry_max_backoff_seconds))
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.generation_config = _load_generation_config(sampling_config_path, GenerationConfig())
-        self.export_dtype = export_dtype
-        self.http = requests
-
-    def _request_with_retry(self, endpoint: str, payload: dict[str, Any]) -> Any:
-        """Execute an HTTP request with bounded retries and backoff."""
-
-        last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = self.http.post(f"{self.base_url}/{endpoint.lstrip('/')}", json=payload, timeout=self.timeout)
-                response.raise_for_status()
-                return response.json()
-            except Exception as exc:  # pragma: no cover - network failure branch
-                last_error = exc
-                if attempt >= self.max_retries:
-                    break
-                delay = min(self.retry_backoff_seconds * (2 ** attempt), self.retry_max_backoff_seconds)
-                logger.warning(
-                    "SGLang request to %s failed on attempt %s/%s: %s; retrying in %.2fs",
-                    endpoint,
-                    attempt + 1,
-                    self.max_retries + 1,
-                    exc,
-                    delay,
-                )
-                time.sleep(delay)
-
-        raise RuntimeError(f"SGLang request to {endpoint} failed after {self.max_retries + 1} attempts") from last_error
-
-    def _build_sampling_params(self) -> dict[str, object]:
-        """Translate Transformers generation settings to SGLang sampling params."""
-
-        sampling_params = {
-            key: value
-            for key, value in self.generation_config.to_dict().items()
-            if key not in self._SAMPLING_CONFIG_EXCLUDE_KEYS and value is not None
-        }
-
-        eos_token_id = self.tokenizer.eos_token_id
-        if eos_token_id is not None:
-            sampling_params["stop_token_ids"] = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
-
-        return sampling_params
-
-    def rollout(
-        self,
-        *,
-        prompt_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        num_generations: int,
-    ) -> RolloutResult:
-        input_ids_list = [ids[mask.bool()].tolist() for ids, mask in zip(prompt_ids, attention_mask, strict=True)]
-        repeated_prompt_ids_list = [ids for ids in input_ids_list for _ in range(num_generations)]
-        payload = {
-            "input_ids": repeated_prompt_ids_list,
-            "sampling_params": self._build_sampling_params(),
-            "return_logprob": True,
-        }
-        results = self._request_with_retry("generate", payload)
-        if not isinstance(results, list):
-            results = [results]
-        if len(results) != len(repeated_prompt_ids_list):
-            raise RuntimeError(f"SGLang returned {len(results)} generations, expected {len(repeated_prompt_ids_list)}.")
-
-        completions, logprobs = [], []
-        for result in results:
-            meta = result.get("meta_info", {})
-            completion = meta.get("output_ids", result.get("output_ids", []))
-            raw_logprobs = meta.get("output_token_logprobs", [])
-            parsed_logprobs = []
-            for item in raw_logprobs:
-                if isinstance(item, (list, tuple)) and item:
-                    parsed_logprobs.append(float(item[0]))
-                elif isinstance(item, (int, float)):
-                    parsed_logprobs.append(float(item))
-            completions.append(completion)
-            logprobs.append(parsed_logprobs)
-
-        repeated_prompt_ids = pad_sequences(repeated_prompt_ids_list, pad_value=self.tokenizer.pad_token_id, device=prompt_ids.device)
-        repeated_prompt_mask = (repeated_prompt_ids != self.tokenizer.pad_token_id).long()
-        completion_ids = pad_sequences(completions, pad_value=self.tokenizer.pad_token_id, device=prompt_ids.device)
-        completion_ids, completion_mask, completion_truncated, completion_id_lists = truncate_completions(
-            completion_ids,
-            self.tokenizer.pad_token_id,
-            self.tokenizer.eos_token_id,
-        )
-        # Align per-token logprobs with truncated completion_ids: truncate each
-        # sample's logprobs to its valid completion length (matching EOS truncation)
-        # before padding to the final tensor width. This ensures logprobs beyond
-        # EOS are zeroed and the tensor shape matches completion_ids exactly.
-        aligned_logprobs = [
-            lp[:len(ids)] for lp, ids in zip(logprobs, completion_id_lists)
-        ]
-        per_token_logps = pad_float_sequences(aligned_logprobs, completion_ids.shape[1], device=prompt_ids.device)
-        completions_text = self.tokenizer.batch_decode(completion_id_lists, skip_special_tokens=True)
-        output_ids = torch.cat([repeated_prompt_ids, completion_ids], dim=1)
-        return RolloutResult(
-            output_ids=output_ids,
-            prompt_ids=repeated_prompt_ids,
-            prompt_mask=repeated_prompt_mask,
-            completion_ids=completion_ids,
-            completion_mask=completion_mask,
-            per_token_logps=per_token_logps,
-            completions_text=completions_text,
-            completion_id_lists=completion_id_lists,
-            completion_truncated=completion_truncated,
-        )
-
-    def update_policy(self, model: torch.nn.Module) -> None:
-        """Export policy weights to disk and notify SGLang to reload.
-
-        In distributed training (FSDP2/DDP), only rank 0 performs the filesystem
-        write and the HTTP reload request. All ranks participate in state-dict
-        gathering (required by FSDP2) and synchronize via a barrier afterwards.
-        """
-
-        unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
-        is_distributed = dist.is_initialized()
-        is_rank_zero = (not is_distributed) or (dist.get_rank() == 0)
-
-        # Gather full state dict — all ranks must participate for FSDP2 sharded models.
-        # For non-FSDP models this is equivalent to a regular state_dict() call.
-        try:
-            state_dict = get_model_state_dict(
-                unwrapped,
-                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            )
-        except (TypeError, RuntimeError):
-            # Fallback for models not wrapped with composable FSDP2 (e.g. single-GPU).
-            state_dict = {
-                k: v.detach().cpu() for k, v in unwrapped.state_dict().items()
-            }
-
-        if is_rank_zero:
-            # Cast to export dtype on rank 0 only to save memory on other ranks.
-            state_dict = {
-                k: v.to(dtype=self.export_dtype) if v.is_floating_point() else v
-                for k, v in state_dict.items()
-            }
-            target_path = Path(self.shared_ckpt_path).resolve()
-            target_path.mkdir(parents=True, exist_ok=True)
-            if hasattr(unwrapped, "save_pretrained"):
-                unwrapped.save_pretrained(str(target_path), state_dict=state_dict, safe_serialization=False)
-            else:
-                torch.save(state_dict, str(target_path / "pytorch_model.bin"))
-            self.tokenizer.save_pretrained(str(target_path))
-            self._request_with_retry("update_weights_from_disk", {"model_path": str(target_path)})
-
-        # Barrier ensures all ranks wait for the export + reload to complete
-        # before resuming training (prevents stale weight reads on next rollout).
-        if is_distributed:
-            dist.barrier()
-
-
 def truncate_completions(
     completion_ids: torch.Tensor,
     pad_token_id: int,
@@ -557,15 +370,13 @@ def create_rollout_engine(
     tokenizer: PreTrainedTokenizerBase,
     sampling_config_path: Optional[str] = None,
     generation_batch_size: int = 0,
-    sglang_base_url: Optional[str] = None,
-    sglang_model_path: Optional[str] = None,
-    sglang_shared_path: Optional[str] = None,
-    request_timeout: int = 120,
-    max_retries: int = 3,
-    retry_backoff_seconds: float = 2.0,
-    retry_max_backoff_seconds: float = 30.0,
     reward_model_config: Optional[RewardModelConfig] = None,
-    export_dtype: torch.dtype = torch.bfloat16,
+    vllm_config: Optional[Any] = None,
+    model_name_or_path: Optional[str] = None,
+    world_size: int = 1,
+    local_rank: int = 0,
+    global_rank: int = 0,
+    **kwargs: Any,
 ) -> RolloutEngine:
     """Build the configured rollout engine."""
 
@@ -576,19 +387,21 @@ def create_rollout_engine(
             sampling_config_path=sampling_config_path,
             generation_batch_size=generation_batch_size,
         )
-    if engine_type == "sglang":
-        if not sglang_model_path:
-            raise ValueError("rollout.engine.sglang_model_path must be set when using the sglang rollout engine")
-        return SGLangRolloutEngine(
-            base_url=sglang_base_url or "http://localhost:8996",
-            model_path=sglang_model_path,
-            shared_ckpt_path=sglang_shared_path or "./sglang_ckpt_grpo",
-            timeout=request_timeout,
+    if engine_type == "vllm":
+        from lightning_grpo.models.vllm_rollout_engine import VLLMRolloutEngine
+
+        if vllm_config is None:
+            raise ValueError("rollout.engine.vllm config must be set when using the vllm rollout engine")
+        if not model_name_or_path:
+            raise ValueError("model_name_or_path must be provided for the vllm rollout engine")
+        return VLLMRolloutEngine(
+            vllm_config=vllm_config,
+            model_name_or_path=model_name_or_path,
+            tokenizer=tokenizer,
             sampling_config_path=sampling_config_path,
-            max_retries=max_retries,
-            retry_backoff_seconds=retry_backoff_seconds,
-            retry_max_backoff_seconds=retry_max_backoff_seconds,
-            export_dtype=export_dtype,
+            world_size=world_size,
+            local_rank=local_rank,
+            global_rank=global_rank,
         )
     if engine_type == "reward_model":
         if reward_model_config is None:

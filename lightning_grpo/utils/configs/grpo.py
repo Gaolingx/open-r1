@@ -91,17 +91,48 @@ class RewardConfig:
 
 
 @dataclass
+class VLLMConfig:
+    """vLLM rollout backend configuration supporting server and colocate modes."""
+
+    mode: Literal["server", "colocate"] = "server"
+    # Server mode configuration
+    server_base_url: Optional[str] = None
+    server_host: str = "0.0.0.0"
+    server_port: int = 8000
+    server_timeout: float = 240.0
+    group_port: int = 51216
+    # Colocate mode configuration
+    tensor_parallel_size: int = 1
+    gpu_memory_utilization: float = 0.9
+    max_model_length: Optional[int] = None
+    max_num_seqs: Optional[int] = None
+    enable_sleep_mode: bool = False
+    model_impl: str = "auto"
+    # Generation overrides
+    repetition_penalty: float = 1.0
+    structured_outputs_regex: Optional[str] = None
+    logprobs: int = 0
+    generation_kwargs: dict | None = None
+
+
+@dataclass
+class ToolCallingConfig:
+    """Configuration for multi-turn tool calling during rollout."""
+
+    enabled: bool = False
+    max_iterations: int = 5
+    tools: list[str] = field(default_factory=list)
+    chat_template: Optional[str] = None
+    chat_template_kwargs: dict | None = None
+
+
+@dataclass
 class RolloutEngineConfig:
     """Pluggable rollout backend configuration."""
 
-    engine_type: Literal["policy", "sglang", "reward_model"] = "policy"
-    sglang_base_url: str = "http://localhost:8996"
-    sglang_model_path: Optional[str] = None
-    sglang_shared_path: str = "./sglang_ckpt_grpo"
-    request_timeout: int = 120
-    max_retries: int = 3
-    retry_backoff_seconds: float = 2.0
-    retry_max_backoff_seconds: float = 30.0
+    engine_type: Literal["policy", "vllm", "reward_model"] = "policy"
+    # vLLM backend configuration
+    vllm: VLLMConfig = field(default_factory=VLLMConfig)
 
 
 @dataclass
@@ -114,12 +145,22 @@ class DebugConfig:
 
 
 @dataclass
+class LigerKernelConfig:
+    """Configuration for Liger Kernel fused GRPO loss."""
+
+    enabled: bool = False
+    # When enabled, the loss is computed via a fused linear + GRPO kernel that
+    # avoids materializing the full logits tensor, significantly reducing VRAM.
+
+
+@dataclass
 class RolloutConfig:
     """Online rollout configuration for GRPO."""
 
     num_generations: int = 8
     num_generations_eval: int | None = None
     max_prompt_length: int = 2048
+    max_completion_length: int = 8192
     sampling_config_path: Optional[str] = None
     kl_beta: float = 0.04
     epsilon: float = 0.2
@@ -128,7 +169,10 @@ class RolloutConfig:
     advantage_epsilon: float = 1.0e-6
     use_reference_model: bool = True
     generation_batch_size: int = 0
+    temperature: float = 1.0
     engine: RolloutEngineConfig = field(default_factory=RolloutEngineConfig)
+    tool_calling: ToolCallingConfig = field(default_factory=ToolCallingConfig)
+    liger_kernel: LigerKernelConfig = field(default_factory=LigerKernelConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
 
 
@@ -141,3 +185,4 @@ class GRPOConfig(TrainingBaseConfig):
     data: ChatDataConfig = field(default_factory=ChatDataConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
+    use_liger_kernel: bool = False  # Convenience alias for rollout.liger_kernel.enabled
