@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import threading
 from collections.abc import Callable
 from typing import Any, Optional
@@ -110,6 +111,105 @@ class ToolCallExecutor:
 
         # Build tool schemas for chat template
         self.tool_schemas = self._build_tool_schemas(tools)
+
+    @staticmethod
+    def _normalize_tool_call(tool_call: Any) -> dict[str, Any] | None:
+        """Normalize a parsed tool-call payload to OpenAI-compatible shape."""
+        if isinstance(tool_call, str):
+            try:
+                tool_call = json.loads(tool_call)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(tool_call, dict):
+            return None
+
+        if "function" in tool_call:
+            function = tool_call.get("function") or {}
+            if isinstance(function, str):
+                try:
+                    function = json.loads(function)
+                except json.JSONDecodeError:
+                    return None
+            if not isinstance(function, dict):
+                return None
+            name = function.get("name") or tool_call.get("name")
+            arguments = function.get("arguments", tool_call.get("arguments", {}))
+        else:
+            name = tool_call.get("name")
+            arguments = tool_call.get("arguments", {})
+
+        if not name:
+            return None
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                pass
+
+        return {
+            "id": str(tool_call.get("id", "")),
+            "type": tool_call.get("type", "function"),
+            "function": {"name": str(name), "arguments": arguments},
+        }
+
+    def parse_assistant_message(self, text: str) -> dict[str, Any]:
+        """Parse generated assistant text and recover tool calls when present.
+
+        Supports common chat-template formats such as repeated
+        ``<tool_call>{...}</tool_call>`` blocks and raw JSON payloads with
+        either ``tool_calls`` or ``name``/``arguments`` fields.
+        """
+        content = text or ""
+        tool_calls: list[dict[str, Any]] = []
+
+        matches = list(re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", content, flags=re.DOTALL))
+        for match in matches:
+            parsed = self._normalize_tool_call(match.group(1).strip())
+            if parsed is not None:
+                tool_calls.append(parsed)
+        if matches:
+            content = re.sub(r"<tool_call>\s*.*?\s*</tool_call>", "", content, flags=re.DOTALL).strip()
+
+        if not tool_calls:
+            stripped = content.strip()
+            if stripped:
+                try:
+                    payload = json.loads(stripped)
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict):
+                    raw_calls = payload.get("tool_calls")
+                    if raw_calls is None and ("name" in payload or "function" in payload):
+                        raw_calls = [payload]
+                    if isinstance(raw_calls, dict):
+                        raw_calls = [raw_calls]
+                    if isinstance(raw_calls, list):
+                        for raw_call in raw_calls:
+                            parsed = self._normalize_tool_call(raw_call)
+                            if parsed is not None:
+                                tool_calls.append(parsed)
+                        if tool_calls:
+                            content = str(payload.get("content", ""))
+
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return message
+
+    def extract_tool_calls(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return structured tool calls, parsing message content lazily if needed."""
+        calls = message.get("tool_calls") or []
+        if calls:
+            normalized = [call for call in (self._normalize_tool_call(call) for call in calls) if call is not None]
+            message["tool_calls"] = normalized
+            return normalized
+
+        parsed = self.parse_assistant_message(str(message.get("content", "")))
+        parsed_calls = parsed.get("tool_calls") or []
+        if parsed_calls:
+            message["content"] = parsed.get("content", "")
+            message["tool_calls"] = parsed_calls
+        return parsed_calls
 
     @staticmethod
     def _build_tool_schemas(tools: list[Callable]) -> list[dict[str, Any]]:
@@ -282,7 +382,7 @@ class ToolCallExecutor:
         tool_calls_per_sample = []
         for completion in completions:
             last_msg = completion[-1] if completion else {}
-            calls = last_msg.get("tool_calls", [])
+            calls = self.extract_tool_calls(last_msg) if isinstance(last_msg, dict) else []
             tool_calls_per_sample.append(calls)
 
         idxs_with_tool = [i for i, calls in enumerate(tool_calls_per_sample) if calls]
@@ -381,17 +481,14 @@ class ToolCallExecutor:
                 # Parse new completion for further tool calls
                 if new_comp:
                     new_text = self.tokenizer.decode(new_comp, skip_special_tokens=True)
-                    # Try to parse as structured message
-                    new_msg = {"role": "assistant", "content": new_text}
-                    # Check for tool calls in the new completion
-                    # This is model-specific; we rely on the tokenizer's chat template parsing
+                    new_msg = self.parse_assistant_message(new_text)
                     completions[idx].append(new_msg)
 
             # Detect new tool calls
             tool_calls_per_sample = []
             for completion in completions:
                 last_msg = completion[-1] if completion else {}
-                calls = last_msg.get("tool_calls", [])
+                calls = self.extract_tool_calls(last_msg) if isinstance(last_msg, dict) else []
                 tool_calls_per_sample.append(calls)
 
             idxs_with_tool = [i for i in valid_idxs if tool_calls_per_sample[i]]
