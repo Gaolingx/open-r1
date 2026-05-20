@@ -53,6 +53,7 @@ class GRPOLightningModule(L.LightningModule):
                 self.reward_manager,
                 self.metrics_aggregator,
                 rollout_temperature=self.rollout_generation_config.temperature,
+                loss_parallel_enabled=config.distributed.tensor_parallel.loss_parallel,
             )
             rank_zero_info("Using Liger Kernel fused GRPO loss for memory-efficient training")
         else:

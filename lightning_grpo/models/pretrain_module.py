@@ -74,6 +74,7 @@ class PretrainLightningModule(L.LightningModule):
                 labels=labels,
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
+                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
             )
         elif self.config.distributed.tensor_parallel.loss_parallel:
             outputs = self._model_forward(batch)

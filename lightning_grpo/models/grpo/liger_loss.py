@@ -14,11 +14,51 @@ import logging
 from typing import Any, Optional
 
 import torch
+from torch.distributed.tensor import DTensor, Replicate
 
-from lightning_grpo.models.common import masked_mean
 from lightning_grpo.utils.modeling import collect_moe_metrics
 
 logger = logging.getLogger(__name__)
+
+
+def _materialize_liger_lm_head_parameter(
+    tensor: torch.Tensor | None,
+    *,
+    parameter_name: str,
+    loss_parallel_enabled: bool,
+) -> torch.Tensor | None:
+    """Return a regular Tensor for Liger fused kernels, gathering TP shards when needed."""
+
+    if tensor is None:
+        return None
+    if not isinstance(tensor, DTensor):
+        return tensor
+    if loss_parallel_enabled:
+        raise ValueError(
+            "Liger fused loss is incompatible with tensor_parallel.loss_parallel=True. "
+            "Disable either Liger Kernel fused loss or tensor-parallel loss parallelism."
+        )
+    return tensor.redistribute(placements=[Replicate()]).to_local()
+
+
+def _materialize_liger_lm_head(
+    lm_head: torch.nn.Module,
+    *,
+    loss_parallel_enabled: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Gather DTensor lm_head parameters for Liger, or reject loss-parallel TP."""
+
+    weight = _materialize_liger_lm_head_parameter(
+        lm_head.weight,
+        parameter_name="lm_head.weight",
+        loss_parallel_enabled=loss_parallel_enabled,
+    )
+    bias = _materialize_liger_lm_head_parameter(
+        getattr(lm_head, "bias", None),
+        parameter_name="lm_head.bias",
+        loss_parallel_enabled=loss_parallel_enabled,
+    )
+    return weight, bias
 
 
 def is_liger_kernel_available() -> bool:
@@ -47,6 +87,7 @@ class LigerGRPOLossComputer:
         metrics_aggregator: Any,
         *,
         rollout_temperature: float,
+        loss_parallel_enabled: bool = False,
     ) -> None:
         if not is_liger_kernel_available():
             raise ImportError(
@@ -60,6 +101,7 @@ class LigerGRPOLossComputer:
         self.reward_manager = reward_manager
         self.metrics_aggregator = metrics_aggregator
         self.rollout_temperature = rollout_temperature
+        self.loss_parallel_enabled = loss_parallel_enabled
 
         config = module.config
         self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
@@ -207,13 +249,17 @@ class LigerGRPOLossComputer:
             loss_mask = completion_mask * rollout_batch["tool_mask"]
 
         # Compute fused loss via Liger Kernel
+        lm_head_weight, lm_head_bias = _materialize_liger_lm_head(
+            unwrapped.lm_head,
+            loss_parallel_enabled=self.loss_parallel_enabled,
+        )
         loss, liger_metrics = self.liger_grpo_loss(
             _input=last_hidden_state,
-            lin_weight=unwrapped.lm_head.weight,
+            lin_weight=lm_head_weight,
             selected_token_ids=completion_ids,
             attention_mask=loss_mask,
             advantages=advantages,
-            bias=getattr(unwrapped.lm_head, "bias", None),
+            bias=lm_head_bias,
             old_per_token_logps=old_per_token_logps,
             ref_per_token_logps=ref_per_token_logps,
         )
@@ -261,6 +307,8 @@ class LigerCELossComputer:
     def __init__(
         self,
         model: torch.nn.Module,
+        *,
+        loss_parallel_enabled: bool = False,
     ) -> None:
         if not is_liger_kernel_available():
             raise ImportError(
@@ -269,6 +317,7 @@ class LigerCELossComputer:
             )
 
         self.model = model
+        self.loss_parallel_enabled = loss_parallel_enabled
 
     def compute_loss(
         self,
@@ -308,8 +357,10 @@ class LigerCELossComputer:
         # Get LM head weight (and optional bias)
         unwrapped = self.model.module if hasattr(self.model, "module") else self.model
         lm_head = unwrapped.lm_head
-        weight = lm_head.weight
-        bias = getattr(lm_head, "bias", None)
+        weight, bias = _materialize_liger_lm_head(
+            lm_head,
+            loss_parallel_enabled=self.loss_parallel_enabled,
+        )
 
         # Use Liger fused kernel
         loss_fn = LigerFusedLinearCrossEntropyLoss(
