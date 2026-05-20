@@ -45,7 +45,7 @@ class GRPOLightningModule(L.LightningModule):
         self.metrics_aggregator = GRPOMetricsAggregator(self)
 
         # Select loss computer: Liger Kernel fused loss or standard loss
-        use_liger = config.use_liger_kernel or config.rollout.liger_kernel.enabled
+        use_liger = config.use_liger_kernel
         if use_liger:
             from lightning_grpo.models.grpo.liger_loss import LigerGRPOLossComputer
             self.loss_computer = LigerGRPOLossComputer(

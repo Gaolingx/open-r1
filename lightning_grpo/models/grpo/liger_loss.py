@@ -16,8 +16,6 @@ from typing import Any, Optional
 import torch
 from torch.distributed.tensor import DTensor, Replicate
 
-from lightning_grpo.utils.modeling import collect_moe_metrics
-
 logger = logging.getLogger(__name__)
 
 
@@ -120,21 +118,20 @@ class LigerGRPOLossComputer:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         logits_to_keep: int,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Forward pass to get last hidden state and MoE metrics without computing logits."""
+    ) -> torch.Tensor:
+        """Forward pass to get last hidden state without computing logits."""
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
             output_hidden_states=True,
         )
-        moe_metrics = collect_moe_metrics(outputs)
         # Get the last hidden state and slice to keep only completion tokens
         last_hidden_state = outputs.hidden_states[-1]
         # We need logits_to_keep + 1 positions because we predict next token
         # Slice: keep positions that correspond to completion token predictions
         last_hidden_state = last_hidden_state[:, -(logits_to_keep + 1):-1, :]
-        return last_hidden_state, moe_metrics
+        return last_hidden_state
 
     def compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
         """Compute group-relative advantages."""
@@ -204,7 +201,7 @@ class LigerGRPOLossComputer:
         unwrapped = policy.module if hasattr(policy, "module") else policy
 
         # Get last hidden state (without computing logits)
-        last_hidden_state, moe_metrics = self._get_last_hidden_state(
+        last_hidden_state = self._get_last_hidden_state(
             policy, model_input_ids, model_attention_mask, logits_to_keep
         )
 
@@ -264,11 +261,19 @@ class LigerGRPOLossComputer:
             ref_per_token_logps=ref_per_token_logps,
         )
 
-        # Build metrics dict compatible with the standard metrics aggregator
         with torch.no_grad():
-            mean_kl = liger_metrics[0] if self.module.config.rollout.use_reference_model else torch.tensor(0.0)
+            mean_kl = liger_metrics[0] if self.module.config.rollout.use_reference_model else completion_ids.new_tensor(0.0, dtype=torch.float32)
             clip_ratio = liger_metrics[-1]
 
+            loss_mask = loss_mask.to(last_hidden_state.dtype)
+            global_loss_mask = self.metrics_aggregator.gather_tensor(loss_mask.detach())
+            mean_kl = mean_kl.detach().to(device=global_loss_mask.device, dtype=global_loss_mask.dtype).mean()
+            global_per_token_kl = torch.zeros_like(global_loss_mask) + mean_kl
+            global_entropy = torch.zeros_like(global_loss_mask)
+            global_is_low_clipped = torch.zeros_like(global_loss_mask)
+            global_is_high_clipped = torch.zeros_like(global_loss_mask)
+            global_is_region_clipped = self.metrics_aggregator.gather_tensor(clip_ratio.detach()).mean()
+            global_is_cispo_clipped = torch.zeros_like(global_loss_mask)
             completion_lengths = completion_mask.sum(dim=1).float()
             global_completion_lengths = self.metrics_aggregator.gather_tensor(completion_lengths.detach())
             completion_truncated = rollout_batch.get(
@@ -277,26 +282,22 @@ class LigerGRPOLossComputer:
             )
             global_completion_truncated = self.metrics_aggregator.gather_tensor(completion_truncated.to(torch.float32))
 
-        metrics = {
-            "kl": self.metrics_aggregator.gather_tensor(mean_kl.detach()).mean() if mean_kl is not None else torch.tensor(0.0),
-            "clip_ratio": self.metrics_aggregator.gather_tensor(clip_ratio.detach()).mean(),
-            "reward": global_rewards.mean(),
-            "reward_std": global_rewards.std(),
-            "advantage_mean": global_advantages.mean(),
-            "advantage_std": global_advantages.std(),
-            "completion_length": global_completion_lengths.mean(),
-            "completion_length_min": global_completion_lengths.min(),
-            "completion_length_max": global_completion_lengths.max(),
-            "completion_clipped_ratio": global_completion_truncated.mean(),
-        }
-
-        # Add per-function reward metrics
-        reward_names = self.module.config.reward.active.reward_funcs
-        for i, name in enumerate(reward_names):
-            func_rewards = global_rewards_per_func[:, i]
-            metrics[f"reward/{name}"] = func_rewards.nanmean()
-
-        metrics.update(moe_metrics)
+        metrics = self.metrics_aggregator.build_training_metrics(
+            global_rewards_per_func=global_rewards_per_func,
+            reward_weights=self.module.reward_weights,
+            num_generations=num_generations,
+            global_per_token_kl=global_per_token_kl,
+            global_loss_mask=global_loss_mask,
+            global_entropy=global_entropy,
+            global_completion_lengths=global_completion_lengths,
+            global_completion_truncated=global_completion_truncated,
+            global_is_low_clipped=global_is_low_clipped,
+            global_is_high_clipped=global_is_high_clipped,
+            global_is_region_clipped=global_is_region_clipped,
+            global_is_cispo_clipped=global_is_cispo_clipped,
+            global_advantages=global_advantages,
+            reward_names=self.module.config.reward.active.reward_funcs,
+        )
 
         return loss, metrics
 

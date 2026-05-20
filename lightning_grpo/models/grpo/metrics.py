@@ -42,7 +42,6 @@ class GRPOMetricsAggregator:
         global_is_region_clipped: torch.Tensor,
         global_is_cispo_clipped: torch.Tensor,
         global_advantages: torch.Tensor,
-        moe_metrics: dict[str, torch.Tensor],
         reward_names: list[str],
     ) -> dict[str, torch.Tensor]:
         global_rewards = (global_rewards_per_func * reward_weights.to(global_rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
@@ -72,7 +71,6 @@ class GRPOMetricsAggregator:
             "clip_ratio_region": masked_mean(global_is_region_clipped, global_loss_mask),
             "cispo_clip_ratio": masked_mean(global_is_cispo_clipped, global_loss_mask),
         }
-        metrics.update(moe_metrics)
         for index, reward_name in enumerate(reward_names):
             metrics[f"reward/{reward_name}"] = global_rewards_per_func[:, index].mean()
             metrics[f"reward_std/{reward_name}"] = global_rewards_per_func[:, index].std(unbiased=False)

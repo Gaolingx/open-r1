@@ -145,15 +145,6 @@ class DebugConfig:
 
 
 @dataclass
-class LigerKernelConfig:
-    """Configuration for Liger Kernel fused GRPO loss."""
-
-    enabled: bool = False
-    # When enabled, the loss is computed via a fused linear + GRPO kernel that
-    # avoids materializing the full logits tensor, significantly reducing VRAM.
-
-
-@dataclass
 class RolloutConfig:
     """Online rollout configuration for GRPO."""
 
@@ -172,7 +163,6 @@ class RolloutConfig:
     temperature: float = 1.0
     engine: RolloutEngineConfig = field(default_factory=RolloutEngineConfig)
     tool_calling: ToolCallingConfig = field(default_factory=ToolCallingConfig)
-    liger_kernel: LigerKernelConfig = field(default_factory=LigerKernelConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
 
 

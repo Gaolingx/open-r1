@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 from lightning_grpo.models.common import entropy_from_logits, masked_mean, materialize_vocab_parallel_logits
 from lightning_grpo.models.rollout_engine import compute_per_token_logps
-from lightning_grpo.utils.modeling import collect_moe_metrics
 
 
 class GRPOLossComputer:
@@ -110,7 +109,6 @@ class GRPOLossComputer:
         logits = materialize_vocab_parallel_logits(outputs.logits)[:, :-1, :]
         logits = logits[:, -logits_to_keep:, :] / self.rollout_temperature
         per_token_logps = self.selective_log_softmax(logits, completion_ids)
-        moe_metrics = collect_moe_metrics(outputs)
 
         with torch.no_grad():
             if self.module.reference_model is not None:
@@ -203,7 +201,6 @@ class GRPOLossComputer:
             global_is_region_clipped=global_is_region_clipped,
             global_is_cispo_clipped=global_is_cispo_clipped,
             global_advantages=global_advantages,
-            moe_metrics=moe_metrics,
             reward_names=self.module.config.reward.active.reward_funcs,
         )
         return loss, metrics
