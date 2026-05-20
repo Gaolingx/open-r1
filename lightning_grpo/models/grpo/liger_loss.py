@@ -16,6 +16,7 @@ from typing import Any, Optional
 import torch
 
 from lightning_grpo.models.common import masked_mean
+from lightning_grpo.utils.modeling import collect_moe_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -53,37 +54,12 @@ class LigerGRPOLossComputer:
                 "Install it with: pip install liger-kernel"
             )
 
-        # Validate: Liger Kernel is incompatible with tensor_parallel loss_parallel mode.
-        # When loss_parallel=True, lm_head outputs are vocab-sharded DTensors and loss
-        # is computed in parallel across TP ranks. Liger needs the full lm_head weight
-        # to do its own fused linear projection — these two approaches conflict.
-        tp_config = getattr(module.config.distributed, "tensor_parallel", None)
-        if tp_config is not None and getattr(tp_config, "loss_parallel", False):
-            raise ValueError(
-                "Liger Kernel fused GRPO loss is incompatible with "
-                "`distributed.tensor_parallel.loss_parallel=True`. "
-                "When loss_parallel is enabled, the lm_head output is a vocab-sharded "
-                "DTensor and loss is computed in parallel across TP ranks. Liger's fused "
-                "kernel requires the full (unsharded) lm_head weight.\n\n"
-                "Options:\n"
-                "  1. Disable loss_parallel: set `distributed.tensor_parallel.loss_parallel: false`\n"
-                "     (Liger will handle the lm_head projection internally)\n"
-                "  2. Disable Liger: set `use_liger_kernel: false` and use the standard loss\n"
-                "     (which supports loss_parallel via DTensor's loss_parallel() context)"
-            )
-
         from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
 
         self.module = module
         self.reward_manager = reward_manager
         self.metrics_aggregator = metrics_aggregator
         self.rollout_temperature = rollout_temperature
-
-        # Track whether TP is active (lm_head.weight may be a DTensor even without loss_parallel)
-        self._tp_enabled = (
-            tp_config is not None
-            and getattr(tp_config, "enabled", False)
-        )
 
         config = module.config
         self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
@@ -102,20 +78,21 @@ class LigerGRPOLossComputer:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         logits_to_keep: int,
-    ) -> torch.Tensor:
-        """Forward pass to get last hidden state without computing logits."""
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Forward pass to get last hidden state and MoE metrics without computing logits."""
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
             output_hidden_states=True,
         )
+        moe_metrics = collect_moe_metrics(outputs)
         # Get the last hidden state and slice to keep only completion tokens
         last_hidden_state = outputs.hidden_states[-1]
         # We need logits_to_keep + 1 positions because we predict next token
         # Slice: keep positions that correspond to completion token predictions
         last_hidden_state = last_hidden_state[:, -(logits_to_keep + 1):-1, :]
-        return last_hidden_state
+        return last_hidden_state, moe_metrics
 
     def compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
         """Compute group-relative advantages."""
@@ -184,35 +161,8 @@ class LigerGRPOLossComputer:
         policy = self.module.policy
         unwrapped = policy.module if hasattr(policy, "module") else policy
 
-        # Get lm_head weight — if TP is active (but loss_parallel is disabled),
-        # lm_head.weight may be a DTensor (ColwiseParallel shards along vocab dim).
-        # Liger needs the full weight, so we materialize it.
-        lm_head_weight = unwrapped.lm_head.weight
-        if self._tp_enabled:
-            try:
-                from torch.distributed._tensor import DTensor
-                from torch.distributed._tensor.placement_types import Replicate as DTReplicate
-                if isinstance(lm_head_weight, DTensor):
-                    lm_head_weight = lm_head_weight.redistribute(
-                        placements=[DTReplicate()]
-                    ).to_local()
-            except ImportError:
-                pass
-
-        lm_head_bias = getattr(unwrapped.lm_head, "bias", None)
-        if lm_head_bias is not None and self._tp_enabled:
-            try:
-                from torch.distributed._tensor import DTensor
-                from torch.distributed._tensor.placement_types import Replicate as DTReplicate
-                if isinstance(lm_head_bias, DTensor):
-                    lm_head_bias = lm_head_bias.redistribute(
-                        placements=[DTReplicate()]
-                    ).to_local()
-            except ImportError:
-                pass
-
         # Get last hidden state (without computing logits)
-        last_hidden_state = self._get_last_hidden_state(
+        last_hidden_state, moe_metrics = self._get_last_hidden_state(
             policy, model_input_ids, model_attention_mask, logits_to_keep
         )
 
@@ -259,11 +209,11 @@ class LigerGRPOLossComputer:
         # Compute fused loss via Liger Kernel
         loss, liger_metrics = self.liger_grpo_loss(
             _input=last_hidden_state,
-            lin_weight=lm_head_weight,
+            lin_weight=unwrapped.lm_head.weight,
             selected_token_ids=completion_ids,
             attention_mask=loss_mask,
             advantages=advantages,
-            bias=lm_head_bias,
+            bias=getattr(unwrapped.lm_head, "bias", None),
             old_per_token_logps=old_per_token_logps,
             ref_per_token_logps=ref_per_token_logps,
         )
@@ -299,6 +249,8 @@ class LigerGRPOLossComputer:
         for i, name in enumerate(reward_names):
             func_rewards = global_rewards_per_func[:, i]
             metrics[f"reward/{name}"] = func_rewards.nanmean()
+
+        metrics.update(moe_metrics)
 
         return loss, metrics
 
