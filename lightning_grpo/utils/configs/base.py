@@ -65,17 +65,6 @@ class ModelConfig:
 
 
 @dataclass
-class DatasetSource:
-    """One dataset source inside a mixture."""
-
-    path: str
-    config_name: Optional[str] = None
-    split: str = "train"
-    weight: float = 1.0
-    columns: list[str] = field(default_factory=list)
-
-
-@dataclass
 class DataConfig:
     """Dataset loading and preprocessing configuration shared by all tasks."""
 
@@ -94,7 +83,6 @@ class DataConfig:
     preprocessing_keep_in_memory: bool = False
     train_files: list[str] = field(default_factory=list)
     val_files: list[str] = field(default_factory=list)
-    dataset_mixture: list[DatasetSource] = field(default_factory=list)
 
 
 @dataclass

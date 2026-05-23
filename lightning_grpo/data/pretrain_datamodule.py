@@ -84,23 +84,14 @@ class PretrainDataModule(BaseLMDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         """Load and tokenize the pretraining dataset."""
 
-        if (
-                not self.config.data.train_files
-                and not self.config.data.dataset_name
-                and not self.config.data.dataset_mixture
-        ):
-            raise ValueError(
-                "One of data.train_files, data.dataset_name, or data.dataset_mixture must be configured for pretraining."
-            )
-        if stage in (None, "fit"):
-            dataset_dict = self.load_dataset_dict()
-            train_dataset = dataset_dict[self.config.data.train_split]
-            self.train_dataset = self._tokenize_dataset(train_dataset)
+        dataset_dict = self.load_dataset_dict()
+        train_dataset = dataset_dict[self.config.data.train_split]
+        self.train_dataset = self._tokenize_dataset(train_dataset)
 
-            self.val_dataset = None
-            val_split_name = self.resolve_val_split_name(dataset_dict)
-            if val_split_name is not None:
-                self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name])
+        self.val_dataset = None
+        val_split_name = self.resolve_val_split_name(dataset_dict)
+        if val_split_name is not None:
+            self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name])
 
     def train_dataloader(self):
         """Build the training dataloader."""
