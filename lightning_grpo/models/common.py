@@ -78,8 +78,8 @@ def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.
 
     if optimizer_type == "muon":
         all_params = list(parameters)
-        muon_params = [p for p in all_params if p.ndim >= 2]
-        adamw_params = [p for p in all_params if p.ndim < 2]
+        muon_params = [p for p in all_params if p.ndim == 2]
+        adamw_params = [p for p in all_params if p.ndim != 2]
 
         muon_optimizer = torch.optim.Muon(
             muon_params,
@@ -87,14 +87,15 @@ def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.
             weight_decay=optimizer_config.weight_decay,
             momentum=optimizer_config.momentum,
             nesterov=optimizer_config.nesterov,
+            adjust_lr_fn=optimizer_config.adjust_lr_fn,
         )
 
         adamw_optimizer = torch.optim.AdamW(
             adamw_params,
-            lr=optimizer_config.learning_rate,
-            betas=optimizer_config.betas,
-            eps=optimizer_config.eps,
-            weight_decay=optimizer_config.weight_decay,
+            lr=optimizer_config.muon_adamw_lr,
+            betas=optimizer_config.muon_adamw_betas,
+            eps=optimizer_config.muon_adamw_eps,
+            weight_decay=optimizer_config.muon_adamw_wd,
             amsgrad=optimizer_config.amsgrad,
         )
 

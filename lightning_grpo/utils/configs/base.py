@@ -92,12 +92,13 @@ class OptimizerSettings:
 
     type: Literal["adamw", "adam", "adamw8bit", "adam8bit", "sgd", "muon"] = "adamw"
     learning_rate: float = 2.0e-5
-    weight_decay: float = 0.01
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1.0e-8
+    weight_decay: float = 0.01
     amsgrad: bool = False
     momentum: float = 0.95
     dampening: float = 0.0
+    adjust_lr_fn: Optional[Literal["original", "match_rms_adamw"]] = None
     nesterov: bool = True
     muon_adamw_lr: float = 2.0e-5
     muon_adamw_betas: tuple[float, float] = (0.9, 0.95)
