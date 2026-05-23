@@ -288,13 +288,17 @@ def _load_local_datasets(file_patterns: list[str], cache_dir: str) -> Dataset:
     return concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
 
 
+def resolve_shuffle_state(data_config: DataConfig) -> bool:
+    """Resolve DataLoader shuffle state from data configuration."""
+
+    return bool(data_config.shuffle and not data_config.streaming)
+
+
 def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
     """Load a dataset or dataset mixture from configuration."""
 
-    def _shuffle_dataset(dataset: Dataset) -> Dataset:
-        shuffle_kwargs = {"seed": data_config.split_seed}
-        if data_config.streaming:
-            shuffle_kwargs["buffer_size"] = data_config.shuffle_buffer_size
+    def _shuffle_streaming_dataset(dataset: Dataset) -> Dataset:
+        shuffle_kwargs = {"seed": data_config.split_seed, "buffer_size": data_config.shuffle_buffer_size}
         return dataset.shuffle(**shuffle_kwargs)
 
     if data_config.train_files:
@@ -310,8 +314,8 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
             data_config.dataset_config,
             cache_dir=data_config.cache_dir,
         )
-        if data_config.train_split in dataset_dict:
-            dataset_dict[data_config.train_split] = _shuffle_dataset(dataset_dict[data_config.train_split])
+        if data_config.train_split in dataset_dict and data_config.streaming and data_config.shuffle:
+            dataset_dict[data_config.train_split] = _shuffle_streaming_dataset(dataset_dict[data_config.train_split])
     else:
         raise ValueError("One of data.train_files or data.dataset_name must be configured.")
 

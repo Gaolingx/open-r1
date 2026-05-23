@@ -77,6 +77,7 @@ class DataConfig:
     max_seq_length: int = 4096
     num_workers: int = 4
     preprocessing_batch_size: int = 256
+    shuffle: bool = True
     shuffle_buffer_size: int = 10000
     streaming: bool = False
     preprocessing_use_cache: bool = True

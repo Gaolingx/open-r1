@@ -8,7 +8,7 @@ import torch
 from datasets import Dataset
 
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
-from lightning_grpo.data.base import BaseLMDataModule
+from lightning_grpo.data.base import BaseLMDataModule, resolve_shuffle_state
 from lightning_grpo.utils.modeling import load_tokenizer
 
 
@@ -102,7 +102,7 @@ class PretrainDataModule(BaseLMDataModule):
             self.train_dataset,
             batch_size=self.config.optimization.train_micro_batch_size,
             collate_fn=self.collator,
-            shuffle=not self.config.data.streaming,
+            shuffle=resolve_shuffle_state(self.data_config),
             drop_last=True,
         )
 

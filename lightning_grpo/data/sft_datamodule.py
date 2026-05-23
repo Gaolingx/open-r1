@@ -15,6 +15,7 @@ from lightning_grpo.data.base import (
     ChatTemplateProcessor,
     ChatTemplateDataModule,
     preprocess_chat_messages,
+    resolve_shuffle_state,
 )
 from lightning_grpo.utils.modeling import load_tokenizer
 
@@ -354,7 +355,7 @@ class SFTDataModule(ChatTemplateDataModule):
             self.train_dataset,
             batch_size=self.optimization_config.train_micro_batch_size,
             collate_fn=self.collator,
-            shuffle=not self.data_config.streaming,
+            shuffle=resolve_shuffle_state(self.data_config),
             drop_last=True,
         )
 
