@@ -101,17 +101,19 @@ class DataConfig:
 class OptimizerSettings:
     """Nested optimizer settings."""
 
-    type: Literal["adamw", "adam", "adamw8bit", "adam8bit", "sgd", "rmsprop", "adagrad"] = "adamw"
+    type: Literal["adamw", "adam", "adamw8bit", "adam8bit", "sgd", "muon"] = "adamw"
     learning_rate: float = 2.0e-5
     weight_decay: float = 0.01
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1.0e-8
-    momentum: float = 0.9
-    alpha: float = 0.99
-    centered: bool = False
-    dampening: float = 0.0
-    nesterov: bool = False
     amsgrad: bool = False
+    momentum: float = 0.95
+    dampening: float = 0.0
+    nesterov: bool = True
+    muon_adamw_lr: float = 2.0e-5
+    muon_adamw_betas: tuple[float, float] = (0.9, 0.95)
+    muon_adamw_eps: float = 1.0e-8
+    muon_adamw_wd: float = 0.01
 
 
 @dataclass

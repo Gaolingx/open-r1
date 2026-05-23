@@ -77,13 +77,24 @@ def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.
         )
 
     if optimizer_type == "muon":
+        # Muon only supports 2D params; use AdamW for biases, embeddings,
+        # and other non-2D parameters.
+        all_params = list(parameters)
+        muon_params = [p for p in all_params if p.ndim >= 2]
+        adamw_params = [p for p in all_params if p.ndim < 2]
+
         return torch.optim.Muon(
-            parameters,
+            muon_params,
             lr=optimizer_config.learning_rate,
             weight_decay=optimizer_config.weight_decay,
             momentum=optimizer_config.momentum,
             nesterov=optimizer_config.nesterov,
             eps=optimizer_config.eps,
+            adamw_params=adamw_params,
+            adamw_lr=optimizer_config.muon_adamw_lr,
+            adamw_betas=optimizer_config.muon_adamw_betas,
+            adamw_eps=optimizer_config.muon_adamw_eps,
+            adamw_wd=optimizer_config.muon_adamw_wd,
         )
 
     raise ValueError(
