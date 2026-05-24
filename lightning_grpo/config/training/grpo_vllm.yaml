@@ -98,10 +98,6 @@ rollout:
       - my_project.tools.calculator
       - my_project.tools.web_search
 
-  # Liger Kernel fused loss (also enabled via top-level use_liger_kernel)
-  liger_kernel:
-    enabled: true
-
   debug:
     enabled: true
     every_n_steps: 100

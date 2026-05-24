@@ -368,5 +368,5 @@ class LigerCELossComputer:
             ignore_index=ignore_index,
             label_smoothing=label_smoothing,
         )
-        loss = loss_fn(shift_hidden_2d, weight, shift_labels_1d, bias)
+        loss = loss_fn(weight, shift_hidden_2d, shift_labels_1d, bias)
         return loss
