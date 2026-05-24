@@ -73,7 +73,7 @@ class SFTDataModule(ChatTemplateDataModule):
         optimization_config: OptimizationConfig,
         system_prompt: Optional[str] = None,
     ) -> None:
-        super().__init__(data_config=data_config, model_config=model_config, system_prompt=system_prompt)
+        super().__init__(data_config=data_config, system_prompt=system_prompt)
         self.optimization_config = optimization_config
         self.tokenizer = load_tokenizer(model_config)
         self.chat_processor = ChatTemplateProcessor(self.tokenizer)

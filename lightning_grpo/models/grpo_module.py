@@ -8,7 +8,7 @@ import lightning as L
 import torch
 from lightning.pytorch.utilities import rank_zero_info
 
-from lightning_grpo.models.common import build_optimizers_and_schedulers
+from lightning_grpo.models.common import build_optimizer, build_scheduler
 from lightning_grpo.models.grpo import (
     GRPOLossComputer,
     GRPOMetricsAggregator,
@@ -211,7 +211,7 @@ class GRPOLightningModule(L.LightningModule):
         rollout_batch["completion_id_lists"] = completion_id_lists
         rollout_batch["completions"] = tool_result["completions"]
         rollout_batch["completions_text"] = [
-            self.tokenizer.decode(ids, skip_special_tokens=True) for ids in completion_id_lists
+            self.tokenizer.decode(ids, skip_special_tokens=False) for ids in completion_id_lists
         ]
 
         logprobs = tool_result.get("logprobs")
@@ -302,10 +302,12 @@ class GRPOLightningModule(L.LightningModule):
         self.metrics_aggregator.log_metrics("val", loss, metrics, on_step=False, on_epoch=True)
         return loss
 
-    def configure_optimizers(self) -> Any:
+    def configure_optimizers(self) -> dict[str, Any]:
         """Create optimizer and scheduler for Lightning."""
 
-        return build_optimizers_and_schedulers(self.policy.parameters(), self.config.optimization, self.trainer.estimated_stepping_batches)
+        optimizer = build_optimizer(self.parameters(), self.config.optimization)
+        scheduler = build_scheduler(optimizer, self.config.optimization, self.trainer.estimated_stepping_batches)
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def on_train_batch_end(self, outputs: Any, batch: dict[str, Any], batch_idx: int) -> None:
         """Sync rollout backend after optimizer updates."""

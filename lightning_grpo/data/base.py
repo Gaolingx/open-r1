@@ -6,17 +6,23 @@ from collections.abc import Mapping
 from dataclasses import asdict
 import json
 import random
-import glob
-from pathlib import Path
 from typing import Any, Callable, Optional
 
-from datasets import Features, Value, Dataset, DatasetDict, concatenate_datasets, load_dataset
-from datasets.exceptions import DatasetGenerationError
+from datasets import (
+    Dataset,
+    DatasetDict,
+    IterableDataset,
+    IterableDatasetDict,
+    concatenate_datasets,
+    interleave_datasets,
+    load_dataset,
+)
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader
 
 from lightning_grpo.data.converter import DatasetFormat, convert_sft_sample
-from lightning_grpo.utils.configs.base import DataConfig, ModelConfig
+from lightning_grpo.utils.data.utils import DatasetConfig, DatasetMixtureConfig
+from lightning_grpo.utils.configs.base import DataConfig
 
 
 class ConversationTemplate:
@@ -218,75 +224,6 @@ class ChatTemplateProcessor:
 
 DEFAULT_VAL_SPLIT_NAME = "test"
 
-LOCAL_CHAT_DATASET_FEATURES = Features({
-    "conversations": [{
-        "role": Value("string"),
-        "content": Value("string"),
-        "reasoning_content": Value("string"),
-        "tools": Value("string"),
-        "tool_calls": Value("string"),
-    }],
-})
-
-
-def _detect_and_load_dataset(file_path: str, cache_dir: str) -> Dataset:
-    """Load a dataset file with automatic format detection."""
-
-    path = Path(file_path)
-    suffix = path.suffix.lower()
-
-    format_map = {
-        '.parquet': 'parquet',
-        '.json': 'json',
-        '.jsonl': 'json',
-    }
-
-    if suffix not in format_map:
-        raise ValueError(f"Unsupported file format: {suffix}. Supported: {list(format_map.keys())}")
-
-    load_kwargs = {
-        "path": format_map[suffix],
-        "data_files": str(path),
-        "split": "train",
-        "cache_dir": cache_dir,
-    }
-
-    try:
-        return load_dataset(**load_kwargs)
-    except DatasetGenerationError:
-        if suffix not in {'.json', '.jsonl'}:
-            raise
-        return load_dataset(
-            **load_kwargs,
-            features=LOCAL_CHAT_DATASET_FEATURES,
-        )
-
-
-def _load_local_datasets(file_patterns: list[str], cache_dir: str) -> Dataset:
-    """Load multiple local datasets with format auto-detection and wildcard support."""
-
-    datasets = []
-
-    for pattern in file_patterns:
-        matched_files = glob.glob(pattern)
-
-        if not matched_files:
-            matched_files = [pattern]
-
-        for file_path in matched_files:
-            try:
-                dataset = _detect_and_load_dataset(file_path, cache_dir)
-                datasets.append(dataset)
-                print(f"Loaded: {file_path} ({len(dataset)} samples)")
-            except Exception as e:
-                print(f"Error loading {file_path}: {e}")
-                raise
-
-    if not datasets:
-        raise ValueError(f"No valid datasets found for patterns: {file_patterns}")
-
-    return concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
-
 
 def resolve_shuffle_state(data_config: DataConfig) -> bool:
     """Resolve DataLoader shuffle state from data configuration."""
@@ -294,30 +231,120 @@ def resolve_shuffle_state(data_config: DataConfig) -> bool:
     return bool(data_config.shuffle and not data_config.streaming)
 
 
-def load_dataset_from_config(data_config: DataConfig) -> DatasetDict:
+def load_dataset_from_config(data_config: DataConfig) -> DatasetDict | IterableDatasetDict:
     """Load a dataset or dataset mixture from configuration."""
 
-    def _shuffle_streaming_dataset(dataset: Dataset) -> Dataset:
-        shuffle_kwargs = {"seed": data_config.split_seed, "buffer_size": data_config.shuffle_buffer_size}
-        return dataset.shuffle(**shuffle_kwargs)
+    streaming = data_config.streaming
 
-    if data_config.train_files:
-        dataset_dict = DatasetDict({
-            data_config.train_split: _load_local_datasets(data_config.train_files, data_config.cache_dir)
-        })
-        if data_config.val_files:
-            val_split_name = data_config.val_split or DEFAULT_VAL_SPLIT_NAME
-            dataset_dict[val_split_name] = _load_local_datasets(data_config.val_files, data_config.cache_dir)
-    elif data_config.dataset_name:
-        dataset_dict = load_dataset(
-            data_config.dataset_name,
-            data_config.dataset_config,
-            cache_dir=data_config.cache_dir,
+    def _shuffle_streaming_dataset(dataset: IterableDataset) -> IterableDataset:
+        """Apply buffer-based shuffle to a streaming dataset."""
+        return dataset.shuffle(seed=data_config.split_seed, buffer_size=data_config.shuffle_buffer_size)
+
+    def _load_single_dataset(dataset_config: DatasetConfig) -> DatasetDict | IterableDatasetDict:
+        """Load one dataset from a nested dataset configuration."""
+        kwargs: dict[str, Any] = {
+            "cache_dir": data_config.cache_dir,
+            "streaming": streaming,
+        }
+        if dataset_config.data_files is not None:
+            kwargs["data_files"] = dataset_config.data_files
+        return load_dataset(dataset_config.id, dataset_config.config, **kwargs)
+
+    def _coerce_dataset_config(raw_config: DatasetConfig | Mapping[str, Any]) -> DatasetConfig:
+        """Normalize a nested dataset entry into DatasetConfig."""
+
+        if isinstance(raw_config, DatasetConfig):
+            return raw_config
+        if not isinstance(raw_config, Mapping):
+            raise TypeError(f"dataset_mixture.datasets entries must be mappings, got {type(raw_config).__name__}.")
+        return DatasetConfig(
+            id=raw_config.get("id"),
+            config=raw_config.get("config"),
+            split=raw_config.get("split", data_config.train_split),
+            data_files=raw_config.get("data_files"),
+            columns=raw_config.get("columns"),
+            weight=raw_config.get("weight"),
         )
-        if data_config.train_split in dataset_dict and data_config.streaming and data_config.shuffle:
-            dataset_dict[data_config.train_split] = _shuffle_streaming_dataset(dataset_dict[data_config.train_split])
+
+    def _coerce_dataset_mixture(raw_mixture: DatasetMixtureConfig | Mapping[str, Any]) -> DatasetMixtureConfig:
+        """Normalize dataset mixture configuration from YAML/dacite/dataclass values."""
+
+        if isinstance(raw_mixture, DatasetMixtureConfig):
+            raw_datasets = raw_mixture.datasets
+            return DatasetMixtureConfig(
+                datasets=[_coerce_dataset_config(dataset) for dataset in raw_datasets],
+                seed=raw_mixture.seed,
+                test_split_size=raw_mixture.test_split_size,
+            )
+        if not isinstance(raw_mixture, Mapping):
+            raise TypeError(f"data.dataset_mixture must be a mapping, got {type(raw_mixture).__name__}.")
+        raw_datasets = raw_mixture.get("datasets")
+        if not isinstance(raw_datasets, list) or not raw_datasets:
+            raise ValueError("data.dataset_mixture.datasets must be a non-empty list.")
+        return DatasetMixtureConfig(
+            datasets=[_coerce_dataset_config(dataset) for dataset in raw_datasets],
+            seed=raw_mixture.get("seed", data_config.split_seed),
+            test_split_size=raw_mixture.get("test_split_size"),
+        )
+
+    if data_config.dataset_mixture is not None:
+        dataset_mixture = _coerce_dataset_mixture(data_config.dataset_mixture)
+        all_splits: dict[str, list[Dataset | IterableDataset]] = {}
+        for dataset_config in dataset_mixture.datasets:
+            ds = _load_single_dataset(dataset_config)
+            if dataset_config.split not in ds:
+                raise ValueError(
+                    f"Split '{dataset_config.split}' not found in dataset '{dataset_config.id}'. "
+                    f"Available splits: {list(ds.keys())}"
+                )
+            split_dataset = ds[dataset_config.split]
+            if dataset_config.columns is not None:
+                split_dataset = split_dataset.select_columns(dataset_config.columns)
+            if dataset_config.weight is not None and not streaming:
+                split_dataset = split_dataset.shuffle(seed=dataset_mixture.seed).select(
+                    range(int(len(split_dataset) * dataset_config.weight))
+                )
+            all_splits.setdefault(dataset_config.split, []).append(split_dataset)
+
+        if streaming:
+            dataset_dict = IterableDatasetDict({
+                split: interleave_datasets(datasets)
+                for split, datasets in all_splits.items()
+            })
+        else:
+            dataset_dict = DatasetDict({
+                split: concatenate_datasets(datasets)
+                for split, datasets in all_splits.items()
+            })
+            for split in dataset_dict:
+                dataset_dict[split] = dataset_dict[split].shuffle(seed=dataset_mixture.seed)
+
+        if dataset_mixture.test_split_size is not None:
+            if streaming:
+                raise ValueError("data.dataset_mixture.test_split_size is not supported with streaming datasets.")
+            if data_config.train_split not in dataset_dict:
+                raise ValueError(
+                    f"Cannot create a test split because train split '{data_config.train_split}' is missing."
+                )
+            dataset_dict = dataset_dict[data_config.train_split].train_test_split(
+                test_size=dataset_mixture.test_split_size,
+                seed=dataset_mixture.seed,
+            )
+    elif data_config.dataset_name:
+        dataset_dict = _load_single_dataset(
+            DatasetConfig(
+                id=data_config.dataset_name,
+                config=data_config.dataset_config,
+                data_files=data_config.data_files,
+            )
+        )
     else:
-        raise ValueError("One of data.train_files or data.dataset_name must be configured.")
+        raise ValueError("Either data.dataset_name or data.dataset_mixture must be configured.")
+
+    if data_config.train_split in dataset_dict and streaming and data_config.shuffle:
+        dataset_dict[data_config.train_split] = _shuffle_streaming_dataset(
+            dataset_dict[data_config.train_split]
+        )
 
     return dataset_dict
 
@@ -362,15 +389,15 @@ class BaseDataModule(LightningDataModule):
     def __init__(self, data_config: DataConfig) -> None:
         super().__init__()
         self.data_config = data_config
-        self.train_dataset: Optional[Dataset] = None
-        self.val_dataset: Optional[Dataset] = None
+        self.train_dataset: Optional[Dataset | IterableDataset] = None
+        self.val_dataset: Optional[Dataset | IterableDataset] = None
 
-    def load_dataset_dict(self) -> DatasetDict:
+    def load_dataset_dict(self) -> DatasetDict | IterableDatasetDict:
         """Load the configured dataset dictionary."""
 
         return load_dataset_from_config(self.data_config)
 
-    def resolve_val_split_name(self, dataset_dict: DatasetDict) -> Optional[str]:
+    def resolve_val_split_name(self, dataset_dict: DatasetDict | IterableDatasetDict) -> Optional[str]:
         """Resolve the validation split name for the current dataset dictionary."""
 
         if self.data_config.val_split and self.data_config.val_split in dataset_dict:
@@ -382,18 +409,28 @@ class BaseDataModule(LightningDataModule):
 
     def map_dataset(
         self,
-        dataset: Dataset,
+        dataset: Dataset | IterableDataset,
         preprocess_fn: Callable[[dict[str, list[Any]]], dict[str, list[Any]]],
         desc: str,
         **kwargs: Any,
-    ) -> Dataset:
+    ) -> Dataset | IterableDataset:
         """Apply a shared batched dataset preprocessing transform."""
+
+        if isinstance(dataset, IterableDataset):
+            remove_columns = list(dataset.column_names) if dataset.column_names else None
+            return dataset.map(
+                preprocess_fn,
+                batched=True,
+                batch_size=self.data_config.preprocessing_batch_size,
+                remove_columns=remove_columns,
+                **kwargs,
+            )
 
         return dataset.map(
             preprocess_fn,
             batched=True,
             batch_size=self.data_config.preprocessing_batch_size,
-            num_proc=None if self.data_config.streaming else self.data_config.num_workers,
+            num_proc=self.data_config.num_workers,
             remove_columns=list(dataset.column_names),
             load_from_cache_file=self.data_config.preprocessing_use_cache,
             keep_in_memory=self.data_config.preprocessing_keep_in_memory,
@@ -403,7 +440,7 @@ class BaseDataModule(LightningDataModule):
 
     def _build_dataloader(
         self,
-        dataset: Dataset,
+        dataset: Dataset | IterableDataset,
         batch_size: int,
         collate_fn: Callable[[list[dict[str, Any]]], Any],
         *,
@@ -412,35 +449,28 @@ class BaseDataModule(LightningDataModule):
     ) -> DataLoader:
         """Build a dataloader with shared worker and memory settings."""
 
+        is_iterable = isinstance(dataset, IterableDataset)
+        num_workers = 0 if is_iterable else self.data_config.num_workers
         return DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=self.data_config.num_workers,
+            shuffle=False if is_iterable else shuffle,
+            num_workers=num_workers,
             collate_fn=collate_fn,
             pin_memory=True,
             drop_last=drop_last,
         )
 
 
-class BaseLMDataModule(BaseDataModule):
-    """Common utilities for language-model training pipelines."""
-
-    def __init__(self, data_config: DataConfig, model_config: ModelConfig) -> None:
-        super().__init__(data_config)
-        self.model_config = model_config
-
-
-class ChatTemplateDataModule(BaseLMDataModule):
+class ChatTemplateDataModule(BaseDataModule):
     """Base class for chat-style pipelines backed by `ConversationTemplate`."""
 
     def __init__(
         self,
         data_config: DataConfig,
-        model_config: ModelConfig,
         system_prompt: Optional[str] = None,
     ) -> None:
-        super().__init__(data_config, model_config)
+        super().__init__(data_config=data_config)
         self.system_prompt = system_prompt
 
     def build_conversation_template(self) -> ConversationTemplate:

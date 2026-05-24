@@ -14,7 +14,7 @@ from transformers.optimization import get_scheduler
 from lightning_grpo.utils.configs.base import OptimizationConfig
 
 
-def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.optim.Optimizer | list[torch.optim.Optimizer]:
+def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.optim.Optimizer:
     """Create the optimizer from configuration."""
 
     optimizer_config = optimization.optimizer
@@ -76,33 +76,8 @@ def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.
             nesterov=optimizer_config.nesterov,
         )
 
-    if optimizer_type == "muon":
-        all_params = list(parameters)
-        muon_params = [p for p in all_params if p.ndim == 2]
-        adamw_params = [p for p in all_params if p.ndim != 2]
-
-        muon_optimizer = torch.optim.Muon(
-            muon_params,
-            lr=optimizer_config.learning_rate,
-            weight_decay=optimizer_config.weight_decay,
-            momentum=optimizer_config.momentum,
-            nesterov=optimizer_config.nesterov,
-            adjust_lr_fn=optimizer_config.adjust_lr_fn,
-        )
-
-        adamw_optimizer = torch.optim.AdamW(
-            adamw_params,
-            lr=optimizer_config.muon_adamw_lr,
-            betas=optimizer_config.muon_adamw_betas,
-            eps=optimizer_config.muon_adamw_eps,
-            weight_decay=optimizer_config.muon_adamw_wd,
-            amsgrad=optimizer_config.amsgrad,
-        )
-
-        return [muon_optimizer, adamw_optimizer]
-
     raise ValueError(
-        f"Unknown optimizer type: {optimizer_config.type}. Supported: adamw, adam, adamw8bit, adam8bit, sgd, muon."
+        f"Unknown optimizer type: {optimizer_config.type}. Supported: adamw, adam, adamw8bit, adam8bit, sgd."
     )
 
 
@@ -136,21 +111,6 @@ def build_scheduler(
         "frequency": 1,
         "name": "lr",
     }
-
-
-def build_optimizers_and_schedulers(
-    parameters: Any,
-    optimization: OptimizationConfig,
-    estimated_stepping_batches: int,
-) -> Any:
-    """Build optimizer(s) and scheduler(s), handling multi-optimizer cases (e.g. Muon + AdamW)."""
-
-    optimizers = build_optimizer(parameters, optimization)
-    if isinstance(optimizers, list):
-        schedulers = [build_scheduler(opt, optimization, estimated_stepping_batches) for opt in optimizers]
-        return optimizers, schedulers
-    scheduler = build_scheduler(optimizers, optimization, estimated_stepping_batches)
-    return {"optimizer": optimizers, "lr_scheduler": scheduler}
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

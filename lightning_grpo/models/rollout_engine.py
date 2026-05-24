@@ -151,7 +151,7 @@ class PolicyRolloutEngine(RolloutEngine):
             self.tokenizer.pad_token_id,
             self.tokenizer.eos_token_id,
         )
-        completions_text = self.tokenizer.batch_decode(completion_id_lists, skip_special_tokens=True)
+        completions_text = self.tokenizer.batch_decode(completion_id_lists, skip_special_tokens=False)
         model_input_ids = torch.cat([repeated_prompt_ids, completion_ids], dim=1)
         model_attention_mask = torch.cat([repeated_prompt_mask, completion_mask], dim=1)
         per_token_logps = compute_per_token_logps(

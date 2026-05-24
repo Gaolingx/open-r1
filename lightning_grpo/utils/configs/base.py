@@ -9,6 +9,9 @@ from typing import Any, Literal, Optional
 import dacite
 from dacite import Config as DaciteConfig
 
+from lightning_grpo.utils.data.utils import DataFiles
+from lightning_grpo.utils.data.utils import DatasetMixtureConfig
+
 
 @dataclass
 class PrecisionConfig:
@@ -71,6 +74,8 @@ class DataConfig:
     cache_dir: str = "./.cache/huggingface"
     dataset_name: Optional[str] = None
     dataset_config: Optional[str] = None
+    data_files: Optional[DataFiles] = None
+    dataset_mixture: Optional[DatasetMixtureConfig] = None
     train_split: str = "train"
     val_split: Optional[str] = None
     split_seed: int = 42
@@ -82,15 +87,13 @@ class DataConfig:
     streaming: bool = False
     preprocessing_use_cache: bool = True
     preprocessing_keep_in_memory: bool = False
-    train_files: list[str] = field(default_factory=list)
-    val_files: list[str] = field(default_factory=list)
 
 
 @dataclass
 class OptimizerSettings:
     """Nested optimizer settings."""
 
-    type: Literal["adamw", "adam", "adamw8bit", "adam8bit", "sgd", "muon"] = "adamw"
+    type: Literal["adamw", "adam", "adamw8bit", "adam8bit", "sgd"] = "adamw"
     learning_rate: float = 2.0e-5
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1.0e-8
@@ -98,12 +101,7 @@ class OptimizerSettings:
     amsgrad: bool = False
     momentum: float = 0.95
     dampening: float = 0.0
-    adjust_lr_fn: Optional[Literal["original", "match_rms_adamw"]] = None
     nesterov: bool = True
-    muon_adamw_lr: float = 2.0e-5
-    muon_adamw_betas: tuple[float, float] = (0.9, 0.95)
-    muon_adamw_eps: float = 1.0e-8
-    muon_adamw_wd: float = 0.01
 
 
 @dataclass

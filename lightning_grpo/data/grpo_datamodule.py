@@ -68,7 +68,7 @@ class GRPODataModule(ChatTemplateDataModule):
         rollout_config: RolloutConfig,
         system_prompt: Optional[str] = None,
     ) -> None:
-        super().__init__(data_config=data_config, model_config=model_config, system_prompt=system_prompt)
+        super().__init__(data_config=data_config, system_prompt=system_prompt)
         self.optimization_config = optimization_config
         self.rollout_config = rollout_config
         self.tokenizer = load_tokenizer(model_config)
@@ -92,6 +92,14 @@ class GRPODataModule(ChatTemplateDataModule):
     def _prepare_prompt_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
         """Build prompt text plus reward metadata for online optimization."""
 
+        response_column = getattr(self.data_config, "response_column", "solution")
+
+        def resolve_solution(sample: dict[str, Any]) -> Any:
+            for key in (response_column, "solution", "answer", "response", "output"):
+                if key in sample and sample[key] is not None:
+                    return sample[key]
+            return None
+
         def preprocess_batch(batch: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
             prompt_texts: list[str] = []
             metadata: list[str] = []
@@ -105,11 +113,15 @@ class GRPODataModule(ChatTemplateDataModule):
                         tools=tools,
                     )
                 )
-                metadata.append(json.dumps({
+                reward_metadata = {
                     key: value
                     for key, value in sample.items()
                     if key != getattr(self.data_config, "messages_column", "messages")
-                }, ensure_ascii=False))
+                }
+                solution = resolve_solution(sample)
+                if solution is not None:
+                    reward_metadata.setdefault("solution", solution)
+                metadata.append(json.dumps(reward_metadata, ensure_ascii=False))
             return {"prompt_text": prompt_texts, "metadata": metadata, "sample_id": indices}
 
         return self.map_dataset(

@@ -107,7 +107,7 @@ class GRPORolloutCoordinator:
                     generation_config=self.policy.generation_config,
                 )
                 completion = generated[:, tokenized["input_ids"].shape[1]:]
-                text = self.tokenizer.batch_decode(completion, skip_special_tokens=True)[0]
+                text = self.tokenizer.batch_decode(completion, skip_special_tokens=False)[0]
                 rank_zero_info(f"[GRPO DEBUG][{index}] question: {question}")
                 rank_zero_info(f"[GRPO DEBUG][{index}] completion: {text}")
         finally:

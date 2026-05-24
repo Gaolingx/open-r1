@@ -8,7 +8,7 @@ import torch
 from datasets import Dataset
 
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
-from lightning_grpo.data.base import BaseLMDataModule, resolve_shuffle_state
+from lightning_grpo.data.base import BaseDataModule, resolve_shuffle_state
 from lightning_grpo.utils.modeling import load_tokenizer
 
 
@@ -33,11 +33,11 @@ class PretrainBatchCollator:
         }
 
 
-class PretrainDataModule(BaseLMDataModule):
+class PretrainDataModule(BaseDataModule):
     """Lightning data module for causal LM pretraining."""
 
     def __init__(self, config: PretrainConfig) -> None:
-        super().__init__(data_config=config.data, model_config=config.model)
+        super().__init__(data_config=config.data)
         self.config = config
         self.tokenizer = load_tokenizer(config.model)
         self.collator = PretrainBatchCollator(self.tokenizer.pad_token_id, ignore_index=config.data.ignore_index)

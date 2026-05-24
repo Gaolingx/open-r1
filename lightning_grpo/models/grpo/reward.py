@@ -98,6 +98,12 @@ class GRPORewardManager:
         for key in reward_kwargs:
             reward_kwargs[key] = [sample.get(key) for sample in metadata]
 
+        if "solution" not in reward_kwargs:
+            for alias in ("answer", "response", "output", "gold_answer", "gold_solution"):
+                if alias in reward_kwargs:
+                    reward_kwargs["solution"] = reward_kwargs[alias]
+                    break
+
         reward_matrix: list[torch.Tensor] = []
         reward_model_texts = [
             self.format_reward_model_text(prompt, completion[0]["content"])

@@ -9,7 +9,7 @@ import torch
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
-from lightning_grpo.models.common import build_optimizers_and_schedulers, masked_token_stats, compute_cross_entropy_loss, compute_liger_cross_entropy_loss
+from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats, compute_cross_entropy_loss, compute_liger_cross_entropy_loss
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import compile_model_if_configured, count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
@@ -138,10 +138,12 @@ class PretrainLightningModule(L.LightningModule):
 
         return self._shared_step(batch, "val")
 
-    def configure_optimizers(self) -> Any:
+    def configure_optimizers(self) -> dict[str, Any]:
         """Create optimizer and scheduler for Lightning."""
 
-        return build_optimizers_and_schedulers(self.parameters(), self.config.optimization, self.trainer.estimated_stepping_batches)
+        optimizer = build_optimizer(self.parameters(), self.config.optimization)
+        scheduler = build_scheduler(optimizer, self.config.optimization, self.trainer.estimated_stepping_batches)
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def on_train_end(self) -> None:
         """Export a Hugging Face-compatible model directory after training."""
