@@ -9,8 +9,7 @@ from typing import Any, Literal, Optional
 import dacite
 from dacite import Config as DaciteConfig
 
-from lightning_grpo.utils.data.utils import DataFiles
-from lightning_grpo.utils.data.utils import DatasetMixtureConfig
+DataFiles = str | list[str] | dict[str, str | list[str]]
 
 
 @dataclass
@@ -68,6 +67,18 @@ class ModelConfig:
 
 
 @dataclass
+class DatasetConfig:
+    """Configuration for a dataset."""
+
+    id: str
+    config: Optional[str] = None
+    split: str = "train"
+    data_files: Optional[DataFiles] = None
+    columns: Optional[list[str]] = None
+    weight: Optional[float] = None
+
+
+@dataclass
 class DataConfig:
     """Dataset loading and preprocessing configuration shared by all tasks."""
 
@@ -75,7 +86,7 @@ class DataConfig:
     dataset_name: Optional[str] = None
     dataset_config: Optional[str] = None
     data_files: Optional[DataFiles] = None
-    dataset_mixture: Optional[DatasetMixtureConfig] = None
+    dataset_list: Optional[list[DatasetConfig]] = None
     train_split: str = "train"
     val_split: Optional[str] = None
     split_seed: int = 42

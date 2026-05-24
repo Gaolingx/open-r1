@@ -21,8 +21,7 @@ from lightning import LightningDataModule
 from torch.utils.data import DataLoader
 
 from lightning_grpo.data.converter import DatasetFormat, convert_sft_sample
-from lightning_grpo.utils.data.utils import DatasetConfig, DatasetMixtureConfig
-from lightning_grpo.utils.configs.base import DataConfig
+from lightning_grpo.utils.configs.base import DataConfig, DatasetConfig
 
 
 class ConversationTemplate:
@@ -234,8 +233,6 @@ def resolve_shuffle_state(data_config: DataConfig) -> bool:
 def load_dataset_from_config(data_config: DataConfig) -> DatasetDict | IterableDatasetDict:
     """Load a dataset or dataset mixture from configuration."""
 
-    streaming = data_config.streaming
-
     def _shuffle_streaming_dataset(dataset: IterableDataset) -> IterableDataset:
         """Apply buffer-based shuffle to a streaming dataset."""
         return dataset.shuffle(seed=data_config.split_seed, buffer_size=data_config.shuffle_buffer_size)
@@ -244,92 +241,93 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict | IterableD
         """Load one dataset from a nested dataset configuration."""
         kwargs: dict[str, Any] = {
             "cache_dir": data_config.cache_dir,
-            "streaming": streaming,
+            "streaming": data_config.streaming,
         }
         if dataset_config.data_files is not None:
             kwargs["data_files"] = dataset_config.data_files
+        if dataset_config.columns is not None:
+            kwargs["columns"] = dataset_config.columns
         return load_dataset(dataset_config.id, dataset_config.config, **kwargs)
 
-    def _coerce_dataset_config(raw_config: DatasetConfig | Mapping[str, Any]) -> DatasetConfig:
-        """Normalize a nested dataset entry into DatasetConfig."""
+    if data_config.dataset_list is not None:
+        datasets_train: list[Dataset | IterableDataset] = []
+        datasets_val: list[Dataset | IterableDataset] = []
+        weights: list[float] = []
 
-        if isinstance(raw_config, DatasetConfig):
-            return raw_config
-        if not isinstance(raw_config, Mapping):
-            raise TypeError(f"dataset_mixture.datasets entries must be mappings, got {type(raw_config).__name__}.")
-        return DatasetConfig(
-            id=raw_config.get("id"),
-            config=raw_config.get("config"),
-            split=raw_config.get("split", data_config.train_split),
-            data_files=raw_config.get("data_files"),
-            columns=raw_config.get("columns"),
-            weight=raw_config.get("weight"),
-        )
+        train_split = data_config.train_split
+        val_split = data_config.val_split
 
-    def _coerce_dataset_mixture(raw_mixture: DatasetMixtureConfig | Mapping[str, Any]) -> DatasetMixtureConfig:
-        """Normalize dataset mixture configuration from YAML/dacite/dataclass values."""
+        for dataset_config in data_config.dataset_list:
+            ds_dict = _load_single_dataset(dataset_config)
 
-        if isinstance(raw_mixture, DatasetMixtureConfig):
-            raw_datasets = raw_mixture.datasets
-            return DatasetMixtureConfig(
-                datasets=[_coerce_dataset_config(dataset) for dataset in raw_datasets],
-                seed=raw_mixture.seed,
-                test_split_size=raw_mixture.test_split_size,
-            )
-        if not isinstance(raw_mixture, Mapping):
-            raise TypeError(f"data.dataset_mixture must be a mapping, got {type(raw_mixture).__name__}.")
-        raw_datasets = raw_mixture.get("datasets")
-        if not isinstance(raw_datasets, list) or not raw_datasets:
-            raise ValueError("data.dataset_mixture.datasets must be a non-empty list.")
-        return DatasetMixtureConfig(
-            datasets=[_coerce_dataset_config(dataset) for dataset in raw_datasets],
-            seed=raw_mixture.get("seed", data_config.split_seed),
-            test_split_size=raw_mixture.get("test_split_size"),
-        )
+            has_train = train_split in ds_dict
+            has_val = val_split in ds_dict if val_split else False
 
-    if data_config.dataset_mixture is not None:
-        dataset_mixture = _coerce_dataset_mixture(data_config.dataset_mixture)
-        all_splits: dict[str, list[Dataset | IterableDataset]] = {}
-        for dataset_config in dataset_mixture.datasets:
-            ds = _load_single_dataset(dataset_config)
-            if dataset_config.split not in ds:
-                raise ValueError(
-                    f"Split '{dataset_config.split}' not found in dataset '{dataset_config.id}'. "
-                    f"Available splits: {list(ds.keys())}"
-                )
-            split_dataset = ds[dataset_config.split]
-            if dataset_config.columns is not None:
-                split_dataset = split_dataset.select_columns(dataset_config.columns)
-            if dataset_config.weight is not None and not streaming:
-                split_dataset = split_dataset.shuffle(seed=dataset_mixture.seed).select(
-                    range(int(len(split_dataset) * dataset_config.weight))
-                )
-            all_splits.setdefault(dataset_config.split, []).append(split_dataset)
+            def _select_columns(ds: Dataset | IterableDataset) -> Dataset | IterableDataset:
+                """Apply column selection if configured."""
+                if dataset_config.columns and hasattr(ds, "column_names") and ds.column_names:
+                    existing_cols = set(ds.column_names)
+                    target_cols = [c for c in dataset_config.columns if c in existing_cols]
+                    if target_cols and set(target_cols) != existing_cols:
+                        return ds.select_columns(target_cols)
+                return ds
 
-        if streaming:
-            dataset_dict = IterableDatasetDict({
-                split: interleave_datasets(datasets)
-                for split, datasets in all_splits.items()
-            })
+            if has_train:
+                datasets_train.append(_select_columns(ds_dict[train_split]))
+                weights.append(dataset_config.weight if dataset_config.weight is not None else 1.0)
+
+            if has_val:
+                datasets_val.append(_select_columns(ds_dict[val_split]))
+
+            # If neither train nor val split matched, fall back to the configured split or first available
+            if not has_train and not has_val:
+                split_name = dataset_config.split or train_split
+                if split_name in ds_dict:
+                    ds = ds_dict[split_name]
+                else:
+                    available = list(ds_dict.keys())
+                    ds = ds_dict[available[0]]
+                datasets_train.append(_select_columns(ds))
+                weights.append(dataset_config.weight if dataset_config.weight is not None else 1.0)
+
+        # Combine training datasets
+        all_default_weights = all(w == 1.0 for w in weights)
+
+        if len(datasets_train) == 0:
+            combined_train = None
+        elif len(datasets_train) == 1:
+            combined_train = datasets_train[0]
+        elif all_default_weights:
+            combined_train = concatenate_datasets(datasets_train)
         else:
-            dataset_dict = DatasetDict({
-                split: concatenate_datasets(datasets)
-                for split, datasets in all_splits.items()
-            })
-            for split in dataset_dict:
-                dataset_dict[split] = dataset_dict[split].shuffle(seed=dataset_mixture.seed)
-
-        if dataset_mixture.test_split_size is not None:
-            if streaming:
-                raise ValueError("data.dataset_mixture.test_split_size is not supported with streaming datasets.")
-            if data_config.train_split not in dataset_dict:
-                raise ValueError(
-                    f"Cannot create a test split because train split '{data_config.train_split}' is missing."
-                )
-            dataset_dict = dataset_dict[data_config.train_split].train_test_split(
-                test_size=dataset_mixture.test_split_size,
-                seed=dataset_mixture.seed,
+            total_weight = sum(weights)
+            probabilities = [w / total_weight for w in weights]
+            combined_train = interleave_datasets(
+                datasets_train,
+                probabilities=probabilities,
+                seed=data_config.split_seed,
+                stopping_strategy="all_exhausted",
             )
+
+        # Combine validation datasets
+        combined_val = None
+        if datasets_val:
+            combined_val = datasets_val[0] if len(datasets_val) == 1 else concatenate_datasets(datasets_val)
+
+        # Build the final dataset dict
+        splits: dict[str, Dataset | IterableDataset] = {}
+        if combined_train is not None:
+            if data_config.streaming and all_default_weights and data_config.shuffle:
+                combined_train = _shuffle_streaming_dataset(combined_train)
+            splits[train_split] = combined_train
+        if combined_val is not None and val_split:
+            splits[val_split] = combined_val
+
+        if data_config.streaming:
+            dataset_dict = IterableDatasetDict(splits)
+        else:
+            dataset_dict = DatasetDict(splits)
+
     elif data_config.dataset_name:
         dataset_dict = _load_single_dataset(
             DatasetConfig(
@@ -338,13 +336,12 @@ def load_dataset_from_config(data_config: DataConfig) -> DatasetDict | IterableD
                 data_files=data_config.data_files,
             )
         )
+        if data_config.train_split in dataset_dict and data_config.streaming and data_config.shuffle:
+            dataset_dict[data_config.train_split] = _shuffle_streaming_dataset(
+                dataset_dict[data_config.train_split]
+            )
     else:
-        raise ValueError("Either data.dataset_name or data.dataset_mixture must be configured.")
-
-    if data_config.train_split in dataset_dict and streaming and data_config.shuffle:
-        dataset_dict[data_config.train_split] = _shuffle_streaming_dataset(
-            dataset_dict[data_config.train_split]
-        )
+        raise ValueError("Either data.dataset_name or data.dataset_list must be configured.")
 
     return dataset_dict
 
