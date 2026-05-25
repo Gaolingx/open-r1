@@ -11,7 +11,7 @@ Reference: https://github.com/linkedin/Liger-Kernel
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor, Replicate
@@ -104,41 +104,23 @@ class LigerGRPOLossComputer:
         self.loss_parallel_enabled = loss_parallel_enabled
 
         config = module.config
+        loss_type = "bnpo" if config.rollout.loss_type == "grpo" else config.rollout.loss_type
+        epsilon_high = config.rollout.epsilon_high if config.rollout.loss_type == "cispo" else config.rollout.epsilon
         self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
             beta=config.rollout.kl_beta,
             epsilon_low=config.rollout.epsilon,
-            epsilon_high=config.rollout.epsilon_high,
+            epsilon_high=epsilon_high,
             temperature=rollout_temperature,
             use_ref_model=config.rollout.use_reference_model,
-            loss_type=config.rollout.loss_type,
+            loss_type=loss_type,
             max_completion_length=config.rollout.max_completion_length,
         )
 
-    def _get_last_hidden_state(
-        self,
-        model: torch.nn.Module,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        logits_to_keep: int,
-    ) -> torch.Tensor:
-        """Forward pass to get last hidden state without computing logits."""
-        outputs = get_transformer_backbone_model(model)(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-        )
-        last_hidden_state = outputs.last_hidden_state
-        last_hidden_state = last_hidden_state[:, :-1, :]
-        last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]
-        return last_hidden_state
-
     def compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
-        """Compute group-relative advantages."""
         grouped_rewards = rewards.view(-1, num_generations)
         grouped_mean = grouped_rewards.mean(dim=1, keepdim=True)
         grouped_std = grouped_rewards.std(dim=1, keepdim=True)
-        eps = self.module.config.rollout.advantage_epsilon
-        grouped_advantages = (grouped_rewards - grouped_mean) / (grouped_std + eps)
+        grouped_advantages = (grouped_rewards - grouped_mean) / (grouped_std + self.module.config.rollout.advantage_epsilon)
         return grouped_advantages.reshape(-1)
 
     def normalize_grouped_advantages(
@@ -150,17 +132,19 @@ class LigerGRPOLossComputer:
         global_sample_ids: torch.Tensor,
         num_generations: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Normalize rewards by prompt groups gathered across all ranks."""
+        """Normalize rewards by globally gathered prompt groups, matching the standard GRPO loss."""
+
         if global_rewards.numel() % num_generations != 0:
             raise ValueError(
-                f"Global rollout batch ({global_rewards.numel()}) must be divisible by "
-                f"num_generations ({num_generations})."
+                f"Global rollout batch ({global_rewards.numel()}) must be divisible by num_generations "
+                f"({num_generations}) so prompt groups can be normalized correctly."
             )
 
         grouped_sample_ids = global_sample_ids.view(-1, num_generations)
         if not torch.all(grouped_sample_ids == grouped_sample_ids[:, :1]):
             raise RuntimeError(
-                "Distributed GRPO prompt groups are not contiguous after gather."
+                "Distributed GRPO prompt groups are not contiguous after gather. "
+                "Each prompt must contribute exactly num_generations completions before advantage normalization."
             )
 
         global_advantages = self.compute_advantages(global_rewards, num_generations)
@@ -169,7 +153,33 @@ class LigerGRPOLossComputer:
         start = process_index * local_batch_size
         end = start + local_batch_size
         local_advantages = global_advantages[start:end]
+        expected_sample_ids = global_sample_ids[start:end].to(local_sample_ids.device)
+        if local_advantages.numel() != local_batch_size or not torch.equal(expected_sample_ids, local_sample_ids):
+            raise RuntimeError(
+                "Failed to recover this rank's advantages from the gathered reward tensor. "
+                "Ensure every rank receives the same local rollout batch size."
+            )
         return local_advantages, global_advantages
+
+    def _get_last_hidden_state(
+        self,
+        model: torch.nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+        output_router_logits: bool = True,
+    ) -> tuple[torch.Tensor, Any]:
+        """Forward pass to get last hidden state without computing logits."""
+        outputs = get_transformer_backbone_model(model)(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_router_logits=output_router_logits,
+        )
+        last_hidden_state = outputs.last_hidden_state
+        last_hidden_state = last_hidden_state[:, :-1, :]
+        last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]
+        return last_hidden_state, outputs
 
     def compute_loss(
         self,
@@ -182,40 +192,44 @@ class LigerGRPOLossComputer:
         The fused kernel combines the LM head projection and loss computation
         in a single pass, avoiding full logits materialization.
         """
-        from lightning_grpo.models.rollout_engine import compute_per_token_logps
-
         prompt_ids = rollout_batch["prompt_ids"]
         prompt_mask = rollout_batch["prompt_mask"]
         completion_ids = rollout_batch["completion_ids"]
         completion_mask = rollout_batch["completion_mask"]
         old_per_token_logps = rollout_batch["old_per_token_logps"]
+        completion_truncated = rollout_batch["completion_truncated"]
         sample_ids = rollout_batch["sample_ids"]
 
         model_input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.shape[1]
 
-        # Get the unwrapped model for accessing lm_head
-        policy = self.module.policy
-
-        # Get last hidden state (without computing logits)
-        last_hidden_state = self._get_last_hidden_state(
-            policy, model_input_ids, model_attention_mask, logits_to_keep
+        last_hidden_state, moe_metrics = self._get_last_hidden_state(
+            self.module.policy,
+            input_ids=model_input_ids,
+            attention_mask=model_attention_mask,
+            logits_to_keep=logits_to_keep,
         )
+        last_hidden_state = last_hidden_state.contiguous()
 
-        # Compute reference log-probs if needed
-        ref_per_token_logps: Optional[torch.Tensor] = None
+        ref_per_token_logps = None
+        ref_hidden_state = None
+        ref_weight = None
+        ref_bias = None
         if self.module.reference_model is not None:
             with torch.no_grad():
-                ref_per_token_logps = compute_per_token_logps(
+                ref_hidden_state, _ = self._get_last_hidden_state(
                     self.module.reference_model,
-                    model_input_ids,
-                    logits_to_keep,
+                    input_ids=model_input_ids,
                     attention_mask=model_attention_mask,
-                    temperature=self.rollout_temperature,
+                    logits_to_keep=logits_to_keep,
                 )
+            ref_hidden_state = ref_hidden_state.contiguous()
+            ref_weight, ref_bias = _materialize_liger_lm_head(
+                get_lm_head_model(self.module.reference_model),
+                loss_parallel_enabled=self.loss_parallel_enabled,
+            )
 
-        # Compute rewards and advantages
         rewards, rewards_per_func = self.reward_manager.compute_rewards(
             prompts=rollout_batch["prompts"],
             completions=rollout_batch["completions"],
@@ -225,10 +239,7 @@ class LigerGRPOLossComputer:
         global_rewards_per_func = self.metrics_aggregator.gather_tensor(rewards_per_func.detach())
         global_sample_ids = self.metrics_aggregator.gather_tensor(sample_ids.detach())
         num_generations = self.module.rollout_coordinator.resolve_num_generations(training)
-        global_rewards = (
-            global_rewards_per_func * self.module.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)
-        ).nansum(dim=-1)
-
+        global_rewards = (global_rewards_per_func * self.module.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
         local_advantages, global_advantages = self.normalize_grouped_advantages(
             local_rewards=rewards.detach(),
             global_rewards=global_rewards,
@@ -238,46 +249,48 @@ class LigerGRPOLossComputer:
         )
         advantages = local_advantages.to(last_hidden_state.device)
 
-        # Apply tool_mask if present (multi-turn training)
         loss_mask = completion_mask
         if "tool_mask" in rollout_batch:
             loss_mask = completion_mask * rollout_batch["tool_mask"]
+        loss_mask = loss_mask.to(last_hidden_state.dtype).contiguous()
 
-        # Compute fused loss via Liger Kernel
-        lm_head_weight, lm_head_bias = _materialize_liger_lm_head(
-            get_lm_head_model(policy),
+        weight, bias = _materialize_liger_lm_head(
+            get_lm_head_model(self.module.policy),
             loss_parallel_enabled=self.loss_parallel_enabled,
         )
         loss, liger_metrics = self.liger_grpo_loss(
-            _input=last_hidden_state,
-            lin_weight=lm_head_weight,
-            selected_token_ids=completion_ids,
-            attention_mask=loss_mask,
-            advantages=advantages,
-            bias=lm_head_bias,
-            old_per_token_logps=old_per_token_logps,
-            ref_per_token_logps=ref_per_token_logps,
+            last_hidden_state,
+            weight,
+            completion_ids.contiguous(),
+            loss_mask,
+            advantages,
+            bias,
+            ref_per_token_logps,
+            old_per_token_logps.contiguous(),
+            ref_hidden_state,
+            ref_weight,
+            ref_bias,
         )
 
         with torch.no_grad():
-            mean_kl = liger_metrics[0] if self.module.config.rollout.use_reference_model else completion_ids.new_tensor(0.0, dtype=torch.float32)
+            mean_kl = liger_metrics[0] if self.module.config.rollout.kl_beta != 0.0 else completion_ids.new_tensor(0.0, dtype=torch.float32)
             clip_ratio = liger_metrics[-1]
 
-            loss_mask = loss_mask.to(last_hidden_state.dtype)
             global_loss_mask = self.metrics_aggregator.gather_tensor(loss_mask.detach())
             mean_kl = mean_kl.detach().to(device=global_loss_mask.device, dtype=global_loss_mask.dtype).mean()
             global_per_token_kl = torch.zeros_like(global_loss_mask) + mean_kl
             global_entropy = torch.zeros_like(global_loss_mask)
             global_is_low_clipped = torch.zeros_like(global_loss_mask)
             global_is_high_clipped = torch.zeros_like(global_loss_mask)
-            global_is_region_clipped = self.metrics_aggregator.gather_tensor(clip_ratio.detach()).mean()
-            global_is_cispo_clipped = torch.zeros_like(global_loss_mask)
+            global_clip_ratio = self.metrics_aggregator.gather_tensor(clip_ratio.detach()).mean()
+            global_is_region_clipped = torch.zeros_like(global_loss_mask) + global_clip_ratio
+            global_is_cispo_clipped = (
+                torch.zeros_like(global_loss_mask) + global_clip_ratio
+                if self.module.config.rollout.loss_type == "cispo"
+                else torch.zeros_like(global_loss_mask)
+            )
             completion_lengths = completion_mask.sum(dim=1).float()
             global_completion_lengths = self.metrics_aggregator.gather_tensor(completion_lengths.detach())
-            completion_truncated = rollout_batch.get(
-                "completion_truncated",
-                torch.zeros(completion_ids.size(0), dtype=torch.bool, device=completion_ids.device),
-            )
             global_completion_truncated = self.metrics_aggregator.gather_tensor(completion_truncated.to(torch.float32))
 
         metrics = self.metrics_aggregator.build_training_metrics(
@@ -295,6 +308,7 @@ class LigerGRPOLossComputer:
             global_is_cispo_clipped=global_is_cispo_clipped,
             global_advantages=global_advantages,
             reward_names=self.module.config.reward.active.reward_funcs,
+            moe_outputs=moe_metrics,
         )
 
         return loss, metrics
@@ -324,17 +338,19 @@ class LigerCELossComputer:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         logits_to_keep: int,
-    ) -> torch.Tensor:
+        output_router_logits: bool = True,
+    ) -> tuple[torch.Tensor, Any]:
         """Forward pass to get last hidden state without computing logits."""
         outputs = get_transformer_backbone_model(model)(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
+            output_router_logits=output_router_logits,
         )
         last_hidden_state = outputs.last_hidden_state
         last_hidden_state = last_hidden_state[:, :-1, :]
         last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]
-        return last_hidden_state
+        return last_hidden_state, outputs
 
     def compute_loss(
         self,
@@ -342,7 +358,7 @@ class LigerCELossComputer:
         labels: torch.Tensor,
         ignore_index: int = -100,
         label_smoothing: float = 0.0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Any]:
         """Compute CE loss using Liger Kernel's fused linear + cross-entropy.
 
         Instead of materializing the full [batch*seq, vocab] logits tensor, this
@@ -356,7 +372,7 @@ class LigerCELossComputer:
             label_smoothing: Label smoothing factor.
 
         Returns:
-            Scalar loss tensor.
+            Tuple of scalar loss tensor and MoE metrics.
         """
         from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
@@ -365,12 +381,13 @@ class LigerCELossComputer:
         logits_to_keep = labels.shape[1] - 1
 
         # Shift for next-token prediction: hidden_states[:-1] predicts labels[1:]
-        shift_hidden = self._get_last_hidden_state(
+        shift_hidden, moe_metrics = self._get_last_hidden_state(
             self.model,
             input_ids=input_ids,
             attention_mask=attention_mask,
             logits_to_keep=logits_to_keep,
-        ).contiguous()
+        )
+        shift_hidden = shift_hidden.contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
         # Reshape to 2D for the fused kernel
@@ -391,4 +408,4 @@ class LigerCELossComputer:
             label_smoothing=label_smoothing,
         )
         loss = loss_fn(weight, shift_hidden_2d, shift_labels_1d, bias)
-        return loss
+        return loss, moe_metrics

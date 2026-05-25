@@ -92,7 +92,12 @@ class GRPOLossComputer:
             )
         return local_advantages, global_advantages
 
-    def compute_loss(self, rollout_batch: dict[str, torch.Tensor | list[Any]], *, training: bool) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def compute_loss(
+        self,
+        rollout_batch: dict[str, torch.Tensor | list[Any]],
+        *,
+        training: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         prompt_ids = rollout_batch["prompt_ids"]
         prompt_mask = rollout_batch["prompt_mask"]
         completion_ids = rollout_batch["completion_ids"]
@@ -105,7 +110,11 @@ class GRPOLossComputer:
         model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.shape[1]
 
-        outputs = self.module.policy(input_ids=model_input_ids, attention_mask=model_attention_mask, use_cache=False)
+        outputs = self.module.policy(
+            input_ids=model_input_ids,
+            attention_mask=model_attention_mask,
+            use_cache=False,
+        )
         logits = materialize_vocab_parallel_logits(outputs.logits)[:, :-1, :]
         logits = logits[:, -logits_to_keep:, :] / self.rollout_temperature
         per_token_logps = self.selective_log_softmax(logits, completion_ids)
@@ -202,5 +211,6 @@ class GRPOLossComputer:
             global_is_cispo_clipped=global_is_cispo_clipped,
             global_advantages=global_advantages,
             reward_names=self.module.config.reward.active.reward_funcs,
+            moe_outputs=outputs,
         )
         return loss, metrics

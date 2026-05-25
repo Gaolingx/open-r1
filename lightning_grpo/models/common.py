@@ -394,7 +394,7 @@ def compute_liger_cross_entropy_loss(
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
     loss_parallel_enabled: bool = False,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Any]:
     """Compute token-level next-token loss using Liger Kernel's fused kernel."""
     from lightning_grpo.models.grpo.liger_loss import LigerCELossComputer
 

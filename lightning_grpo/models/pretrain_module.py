@@ -77,13 +77,14 @@ class PretrainLightningModule(L.LightningModule):
         outputs = None
 
         if use_liger:
-            loss = compute_liger_cross_entropy_loss(
+            loss, outputs = compute_liger_cross_entropy_loss(
                 model=self.model,
                 batch=batch,
                 labels=labels,
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
                 loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
+                output_router_logits=True,
             )
         elif self.config.distributed.tensor_parallel.loss_parallel:
             outputs = self._model_forward(batch)
@@ -110,18 +111,19 @@ class PretrainLightningModule(L.LightningModule):
         prog_bar = stage in {"train", "val"}
         self.log(f"{stage}/loss", loss, prog_bar=prog_bar, on_step=on_step, on_epoch=True, sync_dist=True)
 
-        if not use_liger:
-            with torch.no_grad():
-                stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
-            self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-            self.log(f"{stage}/entropy", stats["entropy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-            self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-            self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+        if outputs is not None:
+            if not use_liger:
+                with torch.no_grad():
+                    stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
+                self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+                self.log(f"{stage}/entropy", stats["entropy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+                self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+                self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
 
-        log_moe_metrics(self, outputs, stage, on_step=on_step)
+            log_moe_metrics(self, outputs, stage, on_step=on_step)
 
         return loss
-    
+
     def on_fit_start(self) -> None:
         """Log static parameter counts once training starts."""
 
