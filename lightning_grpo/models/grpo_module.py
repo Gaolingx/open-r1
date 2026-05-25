@@ -211,7 +211,7 @@ class GRPOLightningModule(L.LightningModule):
         rollout_batch["completion_id_lists"] = completion_id_lists
         rollout_batch["completions"] = tool_result["completions"]
         rollout_batch["completions_text"] = [
-            self.tokenizer.decode(ids, skip_special_tokens=False) for ids in completion_id_lists
+            self.tokenizer.decode(ids, skip_special_tokens=True) for ids in completion_id_lists
         ]
 
         logprobs = tool_result.get("logprobs")
