@@ -11,9 +11,8 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
 
-from lightning_grpo.models.common import materialize_vocab_parallel_logits
+from lightning_grpo.models.common import materialize_vocab_parallel_logits, DTYPE_MAP
 from lightning_grpo.utils.configs.grpo import RewardModelConfig
-from lightning_grpo.utils.modeling import DTYPE_MAP
 
 
 logger = logging.getLogger(__name__)

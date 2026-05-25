@@ -17,7 +17,7 @@ from lightning_grpo.data.base import (
     preprocess_chat_messages,
     resolve_shuffle_state,
 )
-from lightning_grpo.utils.modeling import load_tokenizer
+from lightning_grpo.models.common import load_tokenizer
 
 
 class SkipSFTSampleError(ValueError):

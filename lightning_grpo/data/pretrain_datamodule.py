@@ -9,7 +9,7 @@ from datasets import Dataset
 
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
 from lightning_grpo.data.base import BaseDataModule, resolve_shuffle_state
-from lightning_grpo.utils.modeling import load_tokenizer
+from lightning_grpo.models.common import load_tokenizer
 
 
 class PretrainBatchCollator:

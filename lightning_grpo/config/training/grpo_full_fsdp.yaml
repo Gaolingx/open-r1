@@ -7,7 +7,7 @@ precision:
   trainer_precision: bf16-mixed
 
 model:
-  model_name_or_path: Qwen/Qwen3.5-0.8B
+  model_name_or_path: Qwen/Qwen3-1.7B
   attn_implementation: sdpa
   gradient_checkpointing: true
   use_cache: false
@@ -15,13 +15,14 @@ model:
 data:
   dataset_name: open-r1/OpenR1-Math-220k
   train_split: train
+  val_split: test
   prompt_column: problem
   response_column: solution
   max_seq_length: 2048
   num_workers: 4
   preprocessing_batch_size: 128
-  preprocessing_use_cache: false
-  preprocessing_keep_in_memory: true
+  preprocessing_use_cache: true
+  preprocessing_keep_in_memory: false
 
 optimization:
   optimizer:
@@ -32,7 +33,7 @@ optimization:
     type: cosine
     warmup_steps: 50
   max_epochs: 1
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
   gradient_clip_val: 1.0
   train_micro_batch_size: 1
   eval_micro_batch_size: 1
@@ -69,7 +70,6 @@ reward:
 rollout:
   num_generations: 4
   max_prompt_length: 1024
-  generation_config_path: lightning_grpo/config/generation/generation_config.json
   kl_beta: 0.04
   loss_type: grpo
   epsilon: 0.2
@@ -83,7 +83,7 @@ rollout:
     every_n_steps: 50
     questions:
       - If x + 4 = 10, what is x?
-    generation_config_path: lightning_grpo/config/generation/generation_config.json
+    sampling_config_path: Qwen/Qwen3-1.7B
 
 logging:
   project: open-r1-lightning

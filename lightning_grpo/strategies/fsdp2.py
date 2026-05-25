@@ -9,8 +9,8 @@ from torch.distributed.device_mesh import DeviceMesh
 import torch
 import torch.nn as nn
 
+from lightning_grpo.models.common import get_transformer_backbone_model, resolve_torch_dtype
 from lightning_grpo.utils.configs.base import DistributedConfig, PrecisionConfig
-from lightning_grpo.utils.modeling import resolve_torch_dtype
 from lightning_grpo.utils.fsdp_helper import get_fsdp_reshard_after_forward_policy
 
 
@@ -34,8 +34,10 @@ def configure_fully_shard(
     if dp_mesh.size() <= 1:
         return
 
+    base_model = get_transformer_backbone_model(model)
+
     _apply_fsdp(
-        model=model,
+        model=base_model,
         dp_mesh=dp_mesh,
         param_dtype=resolve_torch_dtype(precision_config.fsdp_param_dtype),
         reduce_dtype=resolve_torch_dtype(precision_config.fsdp_reduce_dtype),

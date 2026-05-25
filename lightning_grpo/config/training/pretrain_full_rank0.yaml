@@ -49,7 +49,7 @@ logging:
   run_name: pretrain-demo
   enable_csv: true
   enable_wandb: false
-  log_every_n_steps: 100
+  log_every_n_steps: 10
 
 checkpoint:
   dirpath: outputs/lightning_pretrain_demo/checkpoints

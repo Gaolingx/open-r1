@@ -115,5 +115,5 @@ class GRPORolloutCoordinator:
             self.policy.train()
 
     def sync_policy(self, policy: torch.nn.Module) -> None:
-        if self.config.rollout.engine.engine_type in ("policy", "sglang"):
+        if self.config.rollout.engine.engine_type in ("policy", "sglang", "vllm"):
             self.rollout_engine.update_policy(policy)

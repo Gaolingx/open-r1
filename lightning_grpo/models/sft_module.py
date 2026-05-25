@@ -1,4 +1,4 @@
-"""Lightning module for supervised fine-tuning."""
+"""Lightning module for causal language model supervised fine-tuning."""
 
 from __future__ import annotations
 
@@ -9,10 +9,21 @@ import torch
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.sft import SFTConfig
-from lightning_grpo.models.common import build_optimizer, build_scheduler, masked_token_stats, compute_cross_entropy_loss, compute_liger_cross_entropy_loss
+from lightning_grpo.models.common import (
+    compile_model_if_configured,
+    count_trainable_parameters,
+    build_optimizer,
+    build_scheduler,
+    masked_token_stats,
+    compute_cross_entropy_loss,
+    compute_liger_cross_entropy_loss,
+    export_configured_model,
+    load_tokenizer,
+)
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
-from lightning_grpo.utils.modeling import compile_model_if_configured, count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer, log_moe_metrics
+from lightning_grpo.utils.modeling import load_causal_lm
+from lightning_grpo.utils.metrics import log_moe_metrics
 
 
 class SFTLightningModule(L.LightningModule):
@@ -63,14 +74,12 @@ class SFTLightningModule(L.LightningModule):
 
         labels = batch["labels"]
         use_liger = self.config.use_liger_kernel
+        outputs = None
 
         if use_liger:
-            # Liger path: forward without computing logits, use fused linear + CE kernel
-            outputs = self._model_forward(batch, output_hidden_states=True)
-            hidden_states = outputs.hidden_states[-1]
             loss = compute_liger_cross_entropy_loss(
                 model=self.model,
-                hidden_states=hidden_states,
+                batch=batch,
                 labels=labels,
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
@@ -102,7 +111,6 @@ class SFTLightningModule(L.LightningModule):
         self.log(f"{stage}/loss", loss, prog_bar=prog_bar, on_step=on_step, on_epoch=True, sync_dist=True)
 
         if not use_liger:
-            # Full metrics only available when logits are materialized
             with torch.no_grad():
                 stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
             self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)

@@ -8,7 +8,14 @@ import lightning as L
 import torch
 from lightning.pytorch.utilities import rank_zero_info
 
-from lightning_grpo.models.common import build_optimizer, build_scheduler
+from lightning_grpo.models.common import (
+    compile_model_if_configured,
+    count_trainable_parameters,
+    build_optimizer,
+    build_scheduler,
+    export_configured_model,
+    load_tokenizer,
+)
 from lightning_grpo.models.grpo import (
     GRPOLossComputer,
     GRPOMetricsAggregator,
@@ -16,11 +23,11 @@ from lightning_grpo.models.grpo import (
     GRPORolloutCoordinator,
     ToolCallExecutor,
 )
+from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.models.rollout_engine import compute_per_token_logps, pad_float_sequences, pad_sequences, truncate_completions
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
-from lightning_grpo.utils.configs.grpo import GRPOConfig
-from lightning_grpo.utils.modeling import compile_model_if_configured, count_trainable_parameters, export_configured_model, load_causal_lm, load_tokenizer
+from lightning_grpo.utils.modeling import load_causal_lm
 
 
 class GRPOLightningModule(L.LightningModule):

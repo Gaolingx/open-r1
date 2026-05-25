@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from lightning_grpo.models.common import masked_mean
-from lightning_grpo.utils.modeling import log_moe_metrics
+from lightning_grpo.utils.metrics import log_moe_metrics
 
 
 class GRPOMetricsAggregator:

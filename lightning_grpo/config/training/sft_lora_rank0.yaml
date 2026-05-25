@@ -7,16 +7,16 @@ precision:
   trainer_precision: bf16-mixed
 
 model:
-  model_name_or_path: Qwen/Qwen3.5-0.8B
+  model_name_or_path: Qwen/Qwen3-1.7B
   attn_implementation: sdpa
   gradient_checkpointing: true
   use_cache: false
   lora:
     enabled: true
-    r: 16
-    alpha: 32
+    r: 64
+    alpha: 128
     dropout: 0.05
-    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 data:
   dataset_name: open-r1/Mixture-of-Thoughts
@@ -28,23 +28,26 @@ data:
   max_seq_length: 2048
   num_workers: 4
   preprocessing_batch_size: 128
-  preprocessing_use_cache: false
-  preprocessing_keep_in_memory: true
-  completion_only_loss: true
-  assistant_only_loss: false
+  preprocessing_use_cache: true
+  preprocessing_keep_in_memory: false
+  completion_only_loss: false
+  assistant_only_loss: true
 
 optimization:
   optimizer:
     type: adamw
     learning_rate: 2.0e-5
+    betas: [0.9, 0.95]
     weight_decay: 0.01
   scheduler:
-    type: cosine
+    type: cosine_with_min_lr
     warmup_steps: 100
+    scheduler_specific_kwargs:
+      min_lr_rate: 0.01
   max_epochs: 1
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   gradient_clip_val: 1.0
-  train_micro_batch_size: 1
+  train_micro_batch_size: 8
   eval_micro_batch_size: 1
 
 logging:

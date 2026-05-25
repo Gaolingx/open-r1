@@ -15,33 +15,26 @@ training primitives.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
-from collections.abc import Callable
-from contextlib import nullcontext
 from typing import Any, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoTokenizer, GenerationConfig, PreTrainedTokenizerBase
+from transformers import GenerationConfig, PreTrainedTokenizerBase
 
-from lightning_grpo.models.common import materialize_vocab_parallel_logits
 from lightning_grpo.models.rollout_engine import (
     RolloutEngine,
     RolloutResult,
     _load_generation_config,
-    _resolve_eos_token_ids,
-    compute_per_token_logps,
     pad_float_sequences,
     pad_sequences,
     truncate_completions,
 )
 from lightning_grpo.utils.configs.grpo import VLLMConfig
-from lightning_grpo.utils.modeling import DTYPE_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -141,9 +134,6 @@ class VLLMRolloutEngine(RolloutEngine):
         self.generation_config = _load_generation_config(
             sampling_config_path, GenerationConfig()
         )
-
-        # Override temperature from vllm config if set
-        self._temperature = vllm_config.repetition_penalty  # stored for sampling params
 
         # Initialize vLLM backend
         self._vllm_client = None  # For server mode
@@ -318,21 +308,20 @@ class VLLMRolloutEngine(RolloutEngine):
 
         # Main process generates
         if self.is_main_process:
-            # Deduplicate: take unique prompts and generate num_generations each
-            unique_prompts = all_input_ids[::num_generations] if num_generations > 1 else all_input_ids
-
+            # all_input_ids contains unique prompts from all ranks;
+            # generate num_generations completions per prompt via n parameter
             sampling_params = self._build_sampling_params(num_generations)
 
             # Use vLLM client to generate
             output = self._vllm_client.generate(
-                prompts=unique_prompts,
+                prompts=all_input_ids,
                 sampling_params=sampling_params,
             )
 
             all_completion_ids = output["completion_ids"]
             all_logprobs = output.get("logprobs")
-            # Duplicate prompt_ids for num_generations
-            all_prompt_ids_out = [ids for ids in all_input_ids for _ in range(num_generations)] if num_generations > 1 else all_input_ids
+            # Expand prompt_ids to match num_generations completions per prompt
+            all_prompt_ids_out = [ids for ids in all_input_ids for _ in range(num_generations)]
 
             payload = (all_prompt_ids_out, all_completion_ids, all_logprobs)
         else:
@@ -374,13 +363,13 @@ class VLLMRolloutEngine(RolloutEngine):
             except (NotImplementedError, AttributeError):
                 pass
 
-        # Prepare prompts - repeat for num_generations
+        # Prepare prompts - repeat each prompt num_generations times for colocate mode
         input_ids_list = [
             ids[mask.bool()].tolist()
             for ids, mask in zip(prompt_ids, attention_mask, strict=True)
         ]
-        # In colocate mode, each prompt is already repeated num_generations times by the dataloader
-        prompts = input_ids_list
+        # Repeat each prompt num_generations times since colocate uses n=1
+        prompts = [ids for ids in input_ids_list for _ in range(num_generations)]
 
         # For TP > 1, gather prompts within TP group
         if tp_size > 1 and self._tp_group is not None:

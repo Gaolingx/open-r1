@@ -21,22 +21,8 @@ from torch.distributed.tensor.parallel import (
 import torch
 import torch.nn as nn
 
+from lightning_grpo.models.common import get_transformer_backbone_model
 from lightning_grpo.utils.configs.base import DistributedConfig, TensorParallelConfig
-
-
-def _unwrap_base_model(root_module: nn.Module) -> nn.Module:
-    """Return the module that owns decoder layers for common Hugging Face CausalLM wrappers."""
-
-    base_model_prefix = getattr(root_module, "base_model_prefix", None)
-    if isinstance(base_model_prefix, str) and hasattr(root_module, base_model_prefix):
-        candidate = getattr(root_module, base_model_prefix)
-        if isinstance(candidate, nn.Module):
-            return candidate
-    for attribute in ("model", "transformer"):
-        candidate = getattr(root_module, attribute, None)
-        if isinstance(candidate, nn.Module) and hasattr(candidate, "layers"):
-            return candidate
-    return root_module
 
 
 def _tp_enabled(distributed_config: DistributedConfig) -> bool:
@@ -490,7 +476,7 @@ def configure_tensor_parallel(
     if tp_mesh.size() <= 1:
         return
 
-    base_model = _unwrap_base_model(root_module)
+    base_model = get_transformer_backbone_model(root_module)
     if _apply_torchtitan_tensor_parallel(root_module, base_model, tp_mesh, distributed_config.tensor_parallel):
         return
 

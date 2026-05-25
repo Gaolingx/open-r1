@@ -16,8 +16,9 @@ from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 from transformers.optimization import get_scheduler
 
 from lightning_grpo.models.rollout_engine import PolicyRolloutEngine
+from lightning_grpo.models.common import save_pth_weights, load_tokenizer
 from lightning_grpo.utils.configs.base import LoggingConfig, ModelConfig, TrainingBaseConfig
-from lightning_grpo.utils.modeling import save_pth_weights, load_tokenizer, resolve_export_model
+from lightning_grpo.utils.modeling import resolve_export_model
 from lightning_grpo.utils.config import save_json_config
 
 

@@ -16,6 +16,8 @@ from typing import Any, Optional
 import torch
 from torch.distributed.tensor import DTensor, Replicate
 
+from lightning_grpo.models.common import get_lm_head_model, get_transformer_backbone_model
+
 logger = logging.getLogger(__name__)
 
 
@@ -120,17 +122,14 @@ class LigerGRPOLossComputer:
         logits_to_keep: int,
     ) -> torch.Tensor:
         """Forward pass to get last hidden state without computing logits."""
-        outputs = model(
+        outputs = get_transformer_backbone_model(model)(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
-            output_hidden_states=True,
         )
-        # Get the last hidden state and slice to keep only completion tokens
-        last_hidden_state = outputs.hidden_states[-1]
-        # We need logits_to_keep + 1 positions because we predict next token
-        # Slice: keep positions that correspond to completion token predictions
-        last_hidden_state = last_hidden_state[:, -(logits_to_keep + 1):-1, :]
+        last_hidden_state = outputs.last_hidden_state
+        last_hidden_state = last_hidden_state[:, :-1, :]
+        last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]
         return last_hidden_state
 
     def compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
@@ -198,7 +197,6 @@ class LigerGRPOLossComputer:
 
         # Get the unwrapped model for accessing lm_head
         policy = self.module.policy
-        unwrapped = policy.module if hasattr(policy, "module") else policy
 
         # Get last hidden state (without computing logits)
         last_hidden_state = self._get_last_hidden_state(
@@ -247,7 +245,7 @@ class LigerGRPOLossComputer:
 
         # Compute fused loss via Liger Kernel
         lm_head_weight, lm_head_bias = _materialize_liger_lm_head(
-            unwrapped.lm_head,
+            get_lm_head_model(policy),
             loss_parallel_enabled=self.loss_parallel_enabled,
         )
         loss, liger_metrics = self.liger_grpo_loss(
@@ -320,9 +318,27 @@ class LigerCELossComputer:
         self.model = model
         self.loss_parallel_enabled = loss_parallel_enabled
 
+    def _get_last_hidden_state(
+        self,
+        model: torch.nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+    ) -> torch.Tensor:
+        """Forward pass to get last hidden state without computing logits."""
+        outputs = get_transformer_backbone_model(model)(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        last_hidden_state = outputs.last_hidden_state
+        last_hidden_state = last_hidden_state[:, :-1, :]
+        last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]
+        return last_hidden_state
+
     def compute_loss(
         self,
-        hidden_states: torch.Tensor,
+        batch: dict[str, torch.Tensor],
         labels: torch.Tensor,
         ignore_index: int = -100,
         label_smoothing: float = 0.0,
@@ -334,8 +350,7 @@ class LigerCELossComputer:
         a chunked manner, reducing peak VRAM by ~30-50% for large vocabularies.
 
         Args:
-            model: The language model (must have a `lm_head` attribute).
-            hidden_states: Last hidden states from the model, shape [B, S, H].
+            batch: Input batch containing `input_ids` and `attention_mask`.
             labels: Target token IDs, shape [B, S]. Uses ignore_index for masked positions.
             ignore_index: Label value to ignore in loss computation.
             label_smoothing: Label smoothing factor.
@@ -345,8 +360,17 @@ class LigerCELossComputer:
         """
         from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask", torch.ones_like(input_ids))
+        logits_to_keep = labels.shape[1] - 1
+
         # Shift for next-token prediction: hidden_states[:-1] predicts labels[1:]
-        shift_hidden = hidden_states[..., :-1, :].contiguous()
+        shift_hidden = self._get_last_hidden_state(
+            self.model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            logits_to_keep=logits_to_keep,
+        ).contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
         # Reshape to 2D for the fused kernel
@@ -356,10 +380,8 @@ class LigerCELossComputer:
         shift_labels_1d = shift_labels.reshape(batch_seq)
 
         # Get LM head weight (and optional bias)
-        unwrapped = self.model.module if hasattr(self.model, "module") else self.model
-        lm_head = unwrapped.lm_head
         weight, bias = _materialize_liger_lm_head(
-            lm_head,
+            get_lm_head_model(self.model),
             loss_parallel_enabled=self.loss_parallel_enabled,
         )
 
