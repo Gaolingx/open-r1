@@ -116,11 +116,13 @@ class LigerDPOLossComputer:
         self.ref_model = ref_model
         self.nll_coeff = nll_coeff
         self.loss_parallel_enabled = loss_parallel_enabled
+        self.aux_loss_computer = MoEAuxLossComputer(model)
         self.loss_fn = LigerFusedLinearDPOLoss(
             beta=beta,
             loss_type=loss_type,
             ignore_index=ignore_index,
             compiled=compiled,
+            compute_nll_loss=True,
         )
 
     def compute_loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -134,6 +136,7 @@ class LigerDPOLossComputer:
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
+            output_router_logits=True,
         )
         hidden_states = outputs.last_hidden_state[:, :-1].contiguous()
 
@@ -171,8 +174,16 @@ class LigerDPOLossComputer:
         ) = metrics
 
         # Apply NLL regularization to prevent logps collapse
-        if self.nll_coeff > 0.0 and nll_loss is not None:
-            loss = loss + self.nll_coeff * nll_loss
+        if nll_loss is not None:
+            loss = (loss - nll_loss) + self.nll_coeff * nll_loss
+
+        # Compute MoE auxiliary loss from router logits
+        attention_mask = batch.get("attention_mask")
+        moe_metrics = collect_moe_metrics(outputs)
+        aux_loss, aux_metrics = self.aux_loss_computer.compute(outputs, attention_mask)
+        if aux_loss is not None:
+            loss = loss + aux_loss.to(loss.device)
+        moe_metrics.update(aux_metrics)
 
         return loss, {
             "chosen_logps": chosen_logps,
@@ -183,6 +194,7 @@ class LigerDPOLossComputer:
             "chosen_rewards": chosen_rewards,
             "rejected_rewards": rejected_rewards,
             "_policy_outputs": outputs,
+            **moe_metrics,
         }
 
 class LigerCELossComputer:

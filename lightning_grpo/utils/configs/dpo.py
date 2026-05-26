@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from lightning_grpo.utils.configs.base import DataConfig
-from lightning_grpo.utils.configs.base import TrainingBaseConfig
+from lightning_grpo.utils.configs.base import TrainingBaseConfig, ModelConfig
 from lightning_grpo.utils.configs.sft import ChatDataConfig
 
 
@@ -48,8 +47,8 @@ class DPOConfig(TrainingBaseConfig):
     """Coefficient for the NLL regularization term on chosen completions. Prevents logps collapse."""
 
     # Reference model
-    ref_model_name_or_path: Optional[str] = None
-    """Path to a separate reference model. If None, uses a frozen copy of the policy model."""
+    ref_model: Optional[ModelConfig] = None
+    """Configuration for a separate reference model. If None, uses a frozen copy of the policy model."""
 
     precompute_ref_log_probs: bool = False
     """Whether to precompute reference log-probs before training to save memory."""

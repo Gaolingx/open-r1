@@ -66,22 +66,16 @@ class DPOLightningModule(L.LightningModule):
 
     def _build_ref_model(self) -> torch.nn.Module:
         """Create a frozen reference model for DPO log-probability computation."""
-
-        if self.config.ref_model_name_or_path:
-            ref_model = load_causal_lm(
-                self.config.model.__class__(
-                    model_name_or_path=self.config.ref_model_name_or_path,
-                    **{k: v for k, v in self.config.model.__dict__.items() if k != "model_name_or_path"},
-                ),
-                self.config.precision,
-            )
+        if self.config.ref_model:
+            reference_model = load_causal_lm(self.config.ref_model, self.config.precision)
         else:
-            ref_model = copy.deepcopy(self.model)
+            reference_model = copy.deepcopy(self.model)
 
         # Freeze all reference model parameters
-        ref_model.requires_grad_(False)
-        ref_model.eval()
-        return ref_model
+        reference_model.requires_grad_(False)
+        reference_model.eval()
+
+        return reference_model
 
     def forward(self, **batch: torch.Tensor) -> Any:
         """Forward tokens through the wrapped language model."""
@@ -145,9 +139,7 @@ class DPOLightningModule(L.LightningModule):
             self.log(f"{stage}/logps/rejected", metrics["rejected_logps"].mean(), on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/nll_loss", metrics["nll_loss"], on_step=on_step, on_epoch=True, sync_dist=True)
 
-        policy_outputs = metrics.get("_policy_outputs")
-        if policy_outputs is not None:
-            log_moe_metrics(self, policy_outputs, stage, on_step=on_step)
+        log_moe_metrics(self, metrics, stage, on_step=on_step)
 
         return loss
 
