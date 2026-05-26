@@ -14,12 +14,10 @@ from lightning_grpo.models.common import (
     count_trainable_parameters,
     build_optimizer,
     build_scheduler,
-    masked_token_stats,
-    compute_cross_entropy_loss,
-    compute_liger_cross_entropy_loss,
     export_configured_model,
     load_tokenizer,
 )
+from lightning_grpo.models.grpo.loss import masked_token_stats, compute_cross_entropy_loss, compute_liger_cross_entropy_loss
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm

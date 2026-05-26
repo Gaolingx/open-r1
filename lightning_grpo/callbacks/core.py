@@ -10,6 +10,7 @@ from typing import Any
 
 import lightning as L
 import torch
+from transformers import PreTrainedTokenizerBase
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
@@ -17,7 +18,7 @@ from transformers.optimization import get_scheduler
 
 from lightning_grpo.models.common import save_pth_weights, load_tokenizer
 from lightning_grpo.utils.configs.base import LoggingConfig, ModelConfig, TrainingBaseConfig
-from lightning_grpo.utils.modeling import resolve_export_model
+from lightning_grpo.utils.modeling import resolve_export_model, _load_generation_config
 from lightning_grpo.utils.config import save_json_config
 
 
@@ -324,6 +325,17 @@ class PeriodicSampleGenerationCallback(Callback):
             elif isinstance(logger, WandbLogger):
                 self._write_wandb_samples(logger, rows, step)
 
+    @staticmethod
+    def _decode_completions(
+        tokenizer: PreTrainedTokenizerBase,
+        generated_ids: torch.Tensor,
+        prompt_length: int,
+    ) -> list[str]:
+        """Decode only newly generated tokens from Hugging Face generation output."""
+
+        completion_ids = generated_ids[:, prompt_length:]
+        return tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+
     @rank_zero_only
     def on_train_batch_end(
         self,
@@ -350,6 +362,7 @@ class PeriodicSampleGenerationCallback(Callback):
         attention_mask = tokenized["attention_mask"].to(device)
 
         model = resolve_export_model(pl_module)
+        generation_config = _load_generation_config(self.model_config.model_generation_config_path, model.generation_config)
         was_training = bool(model.training) if model is not None else bool(pl_module.training)
         if model is not None:
             model.eval()
@@ -358,10 +371,10 @@ class PeriodicSampleGenerationCallback(Callback):
 
         try:
             with torch.inference_mode():
-                rollout = model.generate(
-                    prompt_ids=prompt_ids,
+                generated_ids = model.generate(
+                    input_ids=prompt_ids,
                     attention_mask=attention_mask,
-                    generation_config=self.model_config.model_generation_config_path,
+                    generation_config=generation_config,
                     output_router_logits=False,
                 )
         finally:
@@ -371,6 +384,8 @@ class PeriodicSampleGenerationCallback(Callback):
                 else:
                     pl_module.train()
 
+        completions = self._decode_completions(self.tokenizer, generated_ids, prompt_ids.shape[1])
+
         rows = [
             {
                 "step": step,
@@ -378,7 +393,7 @@ class PeriodicSampleGenerationCallback(Callback):
                 "prompt": prompt,
                 "completion": completion,
             }
-            for index, (prompt, completion) in enumerate(zip(prompts, rollout.completions_text))
+            for index, (prompt, completion) in enumerate(zip(prompts, completions))
         ]
         self._log_samples(trainer, rows, step)
         self.last_sample_step = step

@@ -68,6 +68,95 @@ def is_liger_kernel_available() -> bool:
         return False
 
 
+class LigerDPOLossComputer:
+    """Compute DPO loss using Liger Kernel's fused linear + DPOLoss kernel."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        ref_model: torch.nn.Module,
+        *,
+        beta: float,
+        loss_type: str,
+        label_smoothing: float = 0.0,
+        ignore_index: int = -100,
+        loss_parallel_enabled: bool = False,
+    ) -> None:
+        try:
+            from liger_kernel.chunked_loss import LigerFusedLinearDPOLoss
+        except ImportError as e:
+            raise ImportError(
+                "LigerFusedLinearDPOLoss requires liger-kernel. "
+                "Install it with: pip install liger-kernel"
+            ) from e
+
+        self.model = model
+        self.ref_model = ref_model
+        self.loss_parallel_enabled = loss_parallel_enabled
+        self.loss_fn = LigerFusedLinearDPOLoss(
+            beta=beta,
+            loss_type=loss_type,
+            label_smoothing=label_smoothing,
+            ignore_index=ignore_index,
+        )
+
+    def compute_loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute DPO loss without materializing full vocabulary logits."""
+
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        completion_mask = batch["completion_mask"]
+
+        outputs = get_transformer_backbone_model(self.model)(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        hidden_states = outputs.last_hidden_state[:, :-1].contiguous()
+
+        weight, bias = _materialize_liger_lm_head(
+            get_lm_head_model(self.model),
+            loss_parallel_enabled=self.loss_parallel_enabled,
+        )
+
+        with torch.no_grad():
+            ref_outputs = get_transformer_backbone_model(self.ref_model)(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+            ref_hidden_states = ref_outputs.last_hidden_state[:, :-1].contiguous()
+
+        ref_weight, ref_bias = _materialize_liger_lm_head(
+            get_lm_head_model(self.ref_model),
+            loss_parallel_enabled=self.loss_parallel_enabled,
+        )
+
+        shift_completion_mask = completion_mask[:, 1:].contiguous()
+        labels = input_ids[:, 1:].clone()
+        labels[shift_completion_mask == 0] = -100
+
+        loss, metrics = self.loss_fn(weight, hidden_states, labels, bias, ref_hidden_states, ref_weight, ref_bias)
+        (
+            chosen_logps,
+            rejected_logps,
+            chosen_logits_mean,
+            rejected_logits_mean,
+            nll_loss,
+            chosen_rewards,
+            rejected_rewards,
+        ) = metrics
+
+        return loss, {
+            "chosen_logps": chosen_logps,
+            "rejected_logps": rejected_logps,
+            "chosen_logits_mean": chosen_logits_mean,
+            "rejected_logits_mean": rejected_logits_mean,
+            "nll_loss": nll_loss,
+            "chosen_rewards": chosen_rewards,
+            "rejected_rewards": rejected_rewards,
+        }
+
 class LigerCELossComputer:
     """Compute cross entropy loss using Liger Kernel's fused linear + CELoss kernel."""
 

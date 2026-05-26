@@ -246,7 +246,7 @@ class TrainingBaseConfig:
 
     seed: int = 42
     val_check_interval: int = 500
-    task: Literal["sft", "grpo", "pretrain"] = "sft"
+    task: Literal["sft", "grpo", "pretrain", "dpo"] = "sft"
     output_dir: str = "outputs/default"
     liger_kernel: LigerConfig = field(default_factory=LigerConfig)
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
