@@ -58,7 +58,6 @@ class DPOLightningModule(L.LightningModule):
         # DPO hyperparameters
         self.beta = config.beta
         self.loss_type = config.loss_type
-        self.label_smoothing = config.label_smoothing
 
         # Liger fused DPO loss computer (initialized lazily in configure_model)
         self._liger_loss_computer = None
@@ -105,8 +104,8 @@ class DPOLightningModule(L.LightningModule):
                 self.ref_model,
                 beta=self.beta,
                 loss_type=self.loss_type,
-                label_smoothing=self.label_smoothing,
                 loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
+                compiled=self.config.liger_kernel.compiled,
             )
 
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
@@ -115,9 +114,9 @@ class DPOLightningModule(L.LightningModule):
         use_liger = self.config.liger_kernel.enabled
 
         if use_liger:
-            loss, metrics = compute_liger_dpo_loss(batch)
+            loss, metrics = compute_liger_dpo_loss(self, batch)
         else:
-            loss, metrics = compute_standard_dpo_loss(batch)
+            loss, metrics = compute_standard_dpo_loss(self, batch)
 
         # Log metrics
         on_step = stage == "train"

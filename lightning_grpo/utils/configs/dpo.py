@@ -44,9 +44,6 @@ class DPOConfig(TrainingBaseConfig):
     loss_type: Literal["sigmoid", "hinge", "ipo"] = "sigmoid"
     """DPO loss variant. 'sigmoid' is the standard DPO loss."""
 
-    label_smoothing: float = 0.0
-    """Label smoothing for robust DPO."""
-
     # Reference model
     ref_model_name_or_path: Optional[str] = None
     """Path to a separate reference model. If None, uses a frozen copy of the policy model."""

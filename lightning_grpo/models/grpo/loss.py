@@ -127,7 +127,8 @@ def compute_liger_cross_entropy_loss(
 
 # DPO Loss
 def _dpo_loss(
-    self,
+    loss_type: str,
+    beta: float,
     chosen_logratios: torch.Tensor,
     rejected_logratios: torch.Tensor,
     completion_mask: torch.Tensor,
@@ -136,33 +137,39 @@ def _dpo_loss(
 
     delta_score = chosen_logratios - rejected_logratios
 
-    if self.loss_type == "sigmoid":
-        loss = -torch.nn.functional.logsigmoid(self.beta * delta_score)
-    elif self.loss_type == "hinge":
-        loss = torch.relu(1 - self.beta * delta_score)
-    elif self.loss_type == "ipo":
+    if loss_type == "sigmoid":
+        loss = -torch.nn.functional.logsigmoid(beta * delta_score)
+    elif loss_type == "hinge":
+        loss = torch.relu(1 - beta * delta_score)
+    elif loss_type == "ipo":
         # IPO normalizes by completion length
         chosen_mask, rejected_mask = completion_mask.chunk(2, dim=0)
         chosen_avg = chosen_logratios / chosen_mask.sum(dim=1).clamp(min=1.0)
         rejected_avg = rejected_logratios / rejected_mask.sum(dim=1).clamp(min=1.0)
         ipo_delta = chosen_avg - rejected_avg
-        loss = (ipo_delta - 1 / (2 * self.beta)) ** 2
+        loss = (ipo_delta - 1 / (2 * beta)) ** 2
     else:
-        raise ValueError(f"Unknown DPO loss_type: {self.loss_type}")
+        raise ValueError(f"Unknown DPO loss_type: {loss_type}")
 
     return loss.mean()
 
 
-def compute_liger_dpo_loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+def compute_liger_dpo_loss(
+    liger_loss_computer: Any,
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute DPO loss using the shared Liger loss computer."""
 
-    if self._liger_loss_computer is None:
+    if liger_loss_computer is None:
         raise RuntimeError("Liger DPO loss computer is not initialized. Call configure_model() first.")
-    return self._liger_loss_computer.compute_loss(batch)
+    return liger_loss_computer.compute_loss(batch)
 
 
 def compute_standard_dpo_loss(
-    self,
+    model: torch.nn.Module,
+    ref_model: torch.nn.Module,
+    beta: float,
+    loss_type: str,
     batch: dict[str, torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute DPO loss using standard logits computation (fallback when Liger is disabled)."""
@@ -172,7 +179,7 @@ def compute_standard_dpo_loss(
     completion_mask = batch["completion_mask"]
 
     # Forward through policy model
-    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     shift_logits = outputs.logits[..., :-1, :].contiguous()
     shift_labels = input_ids[..., 1:].contiguous()
     shift_completion_mask = completion_mask[..., 1:].contiguous()
@@ -187,7 +194,7 @@ def compute_standard_dpo_loss(
 
     # Reference model forward (no gradients)
     with torch.no_grad():
-        ref_outputs = self.ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        ref_outputs = ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
         ref_shift_logits = ref_outputs.logits[..., :-1, :].contiguous()
         ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)
         ref_per_token_logps[shift_completion_mask == 0] = 0.0
@@ -199,11 +206,11 @@ def compute_standard_dpo_loss(
     rejected_logratios = rejected_logps - ref_rejected_logps
 
     # Compute DPO loss based on loss_type
-    loss = _dpo_loss(chosen_logratios, rejected_logratios, completion_mask)
+    loss = _dpo_loss(loss_type, beta, chosen_logratios, rejected_logratios, completion_mask)
 
     # Compute rewards for logging
-    chosen_rewards = self.beta * chosen_logratios.detach()
-    rejected_rewards = self.beta * rejected_logratios.detach()
+    chosen_rewards = beta * chosen_logratios.detach()
+    rejected_rewards = beta * rejected_logratios.detach()
 
     metrics_dict = {
         "chosen_logps": chosen_logps.detach(),

@@ -59,6 +59,27 @@ def _materialize_liger_lm_head(
     return weight, bias
 
 
+def _get_last_hidden_state(
+    self,
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    logits_to_keep: int,
+    output_router_logits: bool = True,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Forward pass to get last hidden state without computing logits."""
+    outputs = get_transformer_backbone_model(model)(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        output_router_logits=output_router_logits,
+    )
+    last_hidden_state = outputs.last_hidden_state
+    last_hidden_state = last_hidden_state[:, :-1, :]
+    last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]
+    return last_hidden_state, outputs
+
+
 def is_liger_kernel_available() -> bool:
     """Check if liger-kernel is installed."""
     try:
@@ -78,9 +99,9 @@ class LigerDPOLossComputer:
         *,
         beta: float,
         loss_type: str,
-        label_smoothing: float = 0.0,
         ignore_index: int = -100,
         loss_parallel_enabled: bool = False,
+        compiled: bool = True,
     ) -> None:
         try:
             from liger_kernel.chunked_loss import LigerFusedLinearDPOLoss
@@ -96,8 +117,8 @@ class LigerDPOLossComputer:
         self.loss_fn = LigerFusedLinearDPOLoss(
             beta=beta,
             loss_type=loss_type,
-            label_smoothing=label_smoothing,
             ignore_index=ignore_index,
+            compiled=compiled,
         )
 
     def compute_loss(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -176,26 +197,6 @@ class LigerCELossComputer:
         self.loss_parallel_enabled = loss_parallel_enabled
         self.aux_loss_computer = MoEAuxLossComputer(model)
 
-    def _get_last_hidden_state(
-        self,
-        model: torch.nn.Module,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        logits_to_keep: int,
-        output_router_logits: bool = True,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Forward pass to get last hidden state without computing logits."""
-        outputs = get_transformer_backbone_model(model)(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_router_logits=output_router_logits,
-        )
-        last_hidden_state = outputs.last_hidden_state
-        last_hidden_state = last_hidden_state[:, :-1, :]
-        last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]
-        return last_hidden_state, outputs
-
     def compute_loss(
         self,
         batch: dict[str, torch.Tensor],
@@ -225,7 +226,7 @@ class LigerCELossComputer:
         logits_to_keep = labels.shape[1] - 1
 
         # Shift for next-token prediction: hidden_states[:-1] predicts labels[1:]
-        shift_hidden, moe_outputs = self._get_last_hidden_state(
+        shift_hidden, moe_outputs = _get_last_hidden_state(
             self.model,
             input_ids=input_ids,
             attention_mask=attention_mask,
