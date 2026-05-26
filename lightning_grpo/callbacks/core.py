@@ -15,7 +15,6 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 from transformers.optimization import get_scheduler
 
-from lightning_grpo.models.rollout_engine import PolicyRolloutEngine
 from lightning_grpo.models.common import save_pth_weights, load_tokenizer
 from lightning_grpo.utils.configs.base import LoggingConfig, ModelConfig, TrainingBaseConfig
 from lightning_grpo.utils.modeling import resolve_export_model
@@ -290,26 +289,7 @@ class PeriodicSampleGenerationCallback(Callback):
         self.model_config = model_config
         self.tokenizer = load_tokenizer(model_config)
         self.tokenizer.padding_side = "left"
-        self.rollout_engine: PolicyRolloutEngine | None = None
         self.last_sample_step: int = -1
-
-    def _ensure_rollout_engine(self, pl_module: L.LightningModule) -> PolicyRolloutEngine | None:
-        """Create or refresh the in-process rollout engine for the current policy."""
-
-        model = resolve_export_model(pl_module)
-        if model is None:
-            return None
-
-        model_config = getattr(model, "config", None)
-        if self.rollout_engine is None:
-            self.rollout_engine = PolicyRolloutEngine(
-                policy_model=model,
-                tokenizer=self.tokenizer,
-                sampling_config_path=self.model_config.model_generation_config_path,
-            )
-        else:
-            self.rollout_engine.update_policy(model)
-        return self.rollout_engine
 
     def _write_csv_samples(self, logger: CSVLogger, rows: list[dict[str, Any]]) -> None:
         """Append generated samples to a CSV file under the CSV logger directory."""
@@ -360,11 +340,6 @@ class PeriodicSampleGenerationCallback(Callback):
         if step <= 0 or step == self.last_sample_step or step % every_n_steps != 0:
             return
 
-        rollout_engine = self._ensure_rollout_engine(pl_module)
-        if rollout_engine is None:
-            rank_zero_info("[PeriodicSampleGenerationCallback] No exportable model found; skipping sample generation.")
-            return
-
         prompts = list(self.logging_config.sample_prompts)
         if not prompts:
             return
@@ -383,10 +358,11 @@ class PeriodicSampleGenerationCallback(Callback):
 
         try:
             with torch.inference_mode():
-                rollout = rollout_engine.rollout(
+                rollout = model.generate(
                     prompt_ids=prompt_ids,
                     attention_mask=attention_mask,
-                    num_generations=1,
+                    generation_config=self.model_config.model_generation_config_path,
+                    output_router_logits=False,
                 )
         finally:
             if was_training:
