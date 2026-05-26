@@ -99,6 +99,7 @@ class LigerDPOLossComputer:
         *,
         beta: float,
         loss_type: str,
+        nll_coeff: float = 0.0,
         ignore_index: int = -100,
         loss_parallel_enabled: bool = False,
         compiled: bool = True,
@@ -113,6 +114,7 @@ class LigerDPOLossComputer:
 
         self.model = model
         self.ref_model = ref_model
+        self.nll_coeff = nll_coeff
         self.loss_parallel_enabled = loss_parallel_enabled
         self.loss_fn = LigerFusedLinearDPOLoss(
             beta=beta,
@@ -168,14 +170,19 @@ class LigerDPOLossComputer:
             rejected_rewards,
         ) = metrics
 
+        # Apply NLL regularization to prevent logps collapse
+        if self.nll_coeff > 0.0 and nll_loss is not None:
+            loss = loss + self.nll_coeff * nll_loss
+
         return loss, {
             "chosen_logps": chosen_logps,
             "rejected_logps": rejected_logps,
             "chosen_logits_mean": chosen_logits_mean,
             "rejected_logits_mean": rejected_logits_mean,
-            "nll_loss": nll_loss,
+            "nll_loss": nll_loss if nll_loss is not None else torch.tensor(0.0, device=loss.device),
             "chosen_rewards": chosen_rewards,
             "rejected_rewards": rejected_rewards,
+            "_policy_outputs": outputs,
         }
 
 class LigerCELossComputer:

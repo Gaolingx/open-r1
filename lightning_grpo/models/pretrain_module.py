@@ -18,6 +18,7 @@ from lightning_grpo.models.common import (
     load_tokenizer,
 )
 from lightning_grpo.models.grpo.loss import masked_token_stats, compute_cross_entropy_loss, compute_liger_cross_entropy_loss
+from lightning_grpo.models.grpo.liger_loss import LigerCELossComputer
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
@@ -38,6 +39,9 @@ class PretrainLightningModule(L.LightningModule):
         self.total_parameter_count = total
         self.tokenizer = load_tokenizer(config.model) if config.model.tokenizer_name_or_path else None
 
+        # Liger fused CE loss computer (initialized lazily in configure_model)
+        self._liger_loss_computer = None
+
     def forward(self, **batch: torch.Tensor) -> Any:
         """Forward tokens through the wrapped language model."""
 
@@ -49,6 +53,13 @@ class PretrainLightningModule(L.LightningModule):
         configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
         self.model = compile_model_if_configured(self.model, self.config.model)
+
+        # Initialize Liger fused CE loss if enabled
+        if self.config.liger_kernel.enabled:
+            self._liger_loss_computer = LigerCELossComputer(
+                self.model,
+                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
+            )
 
     def _model_forward(
         self,
@@ -76,12 +87,11 @@ class PretrainLightningModule(L.LightningModule):
 
         if use_liger:
             loss, outputs = compute_liger_cross_entropy_loss(
-                model=self.model,
+                self._liger_loss_computer,
                 batch=batch,
                 labels=labels,
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
-                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
             )
         elif self.config.distributed.tensor_parallel.loss_parallel:
             outputs = self._model_forward(batch)
@@ -108,16 +118,15 @@ class PretrainLightningModule(L.LightningModule):
         prog_bar = stage in {"train", "val"}
         self.log(f"{stage}/loss", loss, prog_bar=prog_bar, on_step=on_step, on_epoch=True, sync_dist=True)
 
-        if outputs is not None:
-            if not use_liger:
-                with torch.no_grad():
-                    stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
-                self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-                self.log(f"{stage}/entropy", stats["entropy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-                self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-                self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+        if not use_liger:
+            with torch.no_grad():
+                stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
+            self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+            self.log(f"{stage}/entropy", stats["entropy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+            self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+            self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
 
-            log_moe_metrics(self, outputs, stage, on_step=on_step)
+        log_moe_metrics(self, outputs, stage, on_step=on_step)
 
         return loss
 

@@ -44,6 +44,9 @@ class DPOConfig(TrainingBaseConfig):
     loss_type: Literal["sigmoid", "hinge", "ipo"] = "sigmoid"
     """DPO loss variant. 'sigmoid' is the standard DPO loss."""
 
+    nll_coeff: float = 0.0
+    """Coefficient for the NLL regularization term on chosen completions. Prevents logps collapse."""
+
     # Reference model
     ref_model_name_or_path: Optional[str] = None
     """Path to a separate reference model. If None, uses a frozen copy of the policy model."""

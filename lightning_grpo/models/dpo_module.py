@@ -31,6 +31,7 @@ from lightning_grpo.models.grpo.liger_loss import LigerDPOLossComputer
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
+from lightning_grpo.utils.metrics import log_moe_metrics
 
 
 class DPOLightningModule(L.LightningModule):
@@ -58,6 +59,7 @@ class DPOLightningModule(L.LightningModule):
         # DPO hyperparameters
         self.beta = config.beta
         self.loss_type = config.loss_type
+        self.nll_coeff = config.nll_coeff
 
         # Liger fused DPO loss computer (initialized lazily in configure_model)
         self._liger_loss_computer = None
@@ -104,6 +106,7 @@ class DPOLightningModule(L.LightningModule):
                 self.ref_model,
                 beta=self.beta,
                 loss_type=self.loss_type,
+                nll_coeff=self.nll_coeff,
                 loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
                 compiled=self.config.liger_kernel.compiled,
             )
@@ -114,9 +117,12 @@ class DPOLightningModule(L.LightningModule):
         use_liger = self.config.liger_kernel.enabled
 
         if use_liger:
-            loss, metrics = compute_liger_dpo_loss(self, batch)
+            loss, metrics = compute_liger_dpo_loss(self._liger_loss_computer, batch)
         else:
-            loss, metrics = compute_standard_dpo_loss(self, batch)
+            loss, metrics = compute_standard_dpo_loss(
+                self.model, self.ref_model, self.beta, self.loss_type, batch,
+                nll_coeff=self.nll_coeff,
+            )
 
         # Log metrics
         on_step = stage == "train"
@@ -137,6 +143,11 @@ class DPOLightningModule(L.LightningModule):
             self.log(f"{stage}/rewards/margin", reward_margin, on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/logps/chosen", metrics["chosen_logps"].mean(), on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/logps/rejected", metrics["rejected_logps"].mean(), on_step=on_step, on_epoch=True, sync_dist=True)
+            self.log(f"{stage}/nll_loss", metrics["nll_loss"], on_step=on_step, on_epoch=True, sync_dist=True)
+
+        policy_outputs = metrics.get("_policy_outputs")
+        if policy_outputs is not None:
+            log_moe_metrics(self, policy_outputs, stage, on_step=on_step)
 
         return loss
 

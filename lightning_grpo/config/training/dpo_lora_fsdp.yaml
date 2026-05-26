@@ -24,7 +24,7 @@ model:
 # DPO hyperparameters
 beta: 0.1
 loss_type: sigmoid
-label_smoothing: 0.0
+nll_coeff: 0.1
 
 data:
   dataset_name: trl-lib/ultrafeedback_binarized

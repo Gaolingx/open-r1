@@ -106,18 +106,17 @@ def compute_cross_entropy_loss(
 
 
 def compute_liger_cross_entropy_loss(
-    model: torch.nn.Module,
+    liger_loss_computer: Any,
     batch: dict[str, torch.Tensor],
     labels: torch.Tensor,
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
-    loss_parallel_enabled: bool = False,
 ) -> tuple[torch.Tensor, Any]:
-    """Compute token-level next-token loss using Liger Kernel's fused kernel."""
-    from lightning_grpo.models.grpo.liger_loss import LigerCELossComputer
+    """Compute token-level next-token loss using the shared Liger CE loss computer."""
 
-    loss_computer = LigerCELossComputer(model, loss_parallel_enabled=loss_parallel_enabled)
-    return loss_computer.compute_loss(
+    if liger_loss_computer is None:
+        raise RuntimeError("Liger CE loss computer is not initialized. Call configure_model() first.")
+    return liger_loss_computer.compute_loss(
         batch=batch,
         labels=labels,
         ignore_index=ignore_index,
@@ -171,6 +170,7 @@ def compute_standard_dpo_loss(
     beta: float,
     loss_type: str,
     batch: dict[str, torch.Tensor],
+    nll_coeff: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute DPO loss using standard logits computation (fallback when Liger is disabled)."""
 
@@ -208,6 +208,24 @@ def compute_standard_dpo_loss(
     # Compute DPO loss based on loss_type
     loss = _dpo_loss(loss_type, beta, chosen_logratios, rejected_logratios, completion_mask)
 
+    # NLL regularization on chosen completions to prevent logps collapse
+    nll_loss = torch.tensor(0.0, device=loss.device)
+    if nll_coeff > 0.0:
+        batch_size = shift_logits.size(0) // 2
+        chosen_logits = shift_logits[:batch_size]
+        chosen_labels = shift_labels[:batch_size]
+        chosen_completion_mask = shift_completion_mask[:batch_size]
+        # Mask non-completion tokens with ignore_index
+        chosen_nll_labels = chosen_labels.clone()
+        chosen_nll_labels[chosen_completion_mask == 0] = -100
+        vocab_size = chosen_logits.size(-1)
+        nll_loss = F.cross_entropy(
+            chosen_logits.reshape(-1, vocab_size),
+            chosen_nll_labels.reshape(-1),
+            ignore_index=-100,
+        )
+        loss = loss + nll_coeff * nll_loss
+
     # Compute rewards for logging
     chosen_rewards = beta * chosen_logratios.detach()
     rejected_rewards = beta * rejected_logratios.detach()
@@ -217,9 +235,10 @@ def compute_standard_dpo_loss(
         "rejected_logps": rejected_logps.detach(),
         "chosen_logits_mean": shift_logits[:shift_logits.size(0) // 2].mean().detach(),
         "rejected_logits_mean": shift_logits[shift_logits.size(0) // 2:].mean().detach(),
-        "nll_loss": torch.tensor(0.0, device=loss.device),
+        "nll_loss": nll_loss.detach(),
         "chosen_rewards": chosen_rewards,
         "rejected_rewards": rejected_rewards,
+        "_policy_outputs": outputs,
     }
 
     return loss, metrics_dict
