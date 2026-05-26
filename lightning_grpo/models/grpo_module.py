@@ -18,6 +18,7 @@ from lightning_grpo.models.common import (
     load_tokenizer,
 )
 from lightning_grpo.models.grpo.rollout import LocalGenerateRolloutCoordinator
+from lightning_grpo.models.grpo.loss import StandardGRPOLossComputer
 from lightning_grpo.models.grpo.liger_loss import LigerGRPOLossComputer
 from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
@@ -46,6 +47,7 @@ class GRPOLightningModule(L.LightningModule):
         self.reward_manager = GRPORewardManager(config, self.tokenizer, device=self.device)
         self.reward_weights = torch.tensor(config.reward.active.weights, dtype=torch.float32)
         self._liger_loss_computer: LigerGRPOLossComputer | None = None
+        self._standard_loss_computer: StandardGRPOLossComputer | None = None
 
     def _build_reference_model(self) -> torch.nn.Module | None:
         """Create the frozen reference model used for KL regularization."""
@@ -72,44 +74,37 @@ class GRPOLightningModule(L.LightningModule):
             configure_tensor_parallel(self.reference_model, self.config.distributed, self.device_mesh)
             configure_fully_shard(self.reference_model, self.config.distributed, self.config.precision, self.device_mesh)
 
-        if not self.config.liger_kernel.enabled:
-            raise RuntimeError("GRPO currently requires liger_kernel.enabled=True for the fused GRPO loss.")
-        self._liger_loss_computer = LigerGRPOLossComputer(
-            self,
-            self.reward_manager,
-            self.metrics_aggregator,
-            rollout_temperature=self.config.rollout.temperature,
-            loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
-        )
-
-    def compute_per_token_logps(
-        self,
-        prompt_ids: torch.Tensor,
-        prompt_mask: torch.Tensor,
-        completion_ids: torch.Tensor,
-        completion_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute old policy log-probabilities for generated completion tokens."""
-
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)
-        outputs = self.policy(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-        shift_logits = outputs.logits[:, :-1, :]
-        shift_labels = input_ids[:, 1:]
-        per_token_logps = torch.log_softmax(shift_logits, dim=-1).gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
-        start = prompt_ids.size(1) - 1
-        return per_token_logps[:, start: start + logits_to_keep] * completion_mask.to(per_token_logps.dtype)
+        if self.config.liger_kernel.enabled:
+            self._liger_loss_computer = LigerGRPOLossComputer(
+                self,
+                self.reward_manager,
+                self.metrics_aggregator,
+                rollout_temperature=self.config.rollout.temperature,
+                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
+            )
+        else:
+            self._standard_loss_computer = StandardGRPOLossComputer(
+                self,
+                self.reward_manager,
+                self.metrics_aggregator,
+                rollout_temperature=self.config.rollout.temperature,
+                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
+            )
 
     def _shared_step(self, batch: dict[str, list[Any]], stage: str) -> torch.Tensor:
-        """Generate rollouts, compute fused GRPO loss, and log metrics."""
+        """Generate rollouts, compute GRPO loss, and log metrics."""
 
-        if self._liger_loss_computer is None:
-            raise RuntimeError("GRPO loss computer is not initialized. Call configure_model() first.")
         rollout_batch = self.rollout_coordinator.rollout(batch, training=stage == "train")
         self.reward_manager.device = self.device
         self.reward_weights = self.reward_weights.to(self.device)
-        loss, metrics = self._liger_loss_computer.compute_loss(rollout_batch, training=stage == "train")
+        if self.config.liger_kernel.enabled:
+            if self._liger_loss_computer is None:
+                raise RuntimeError("GRPO loss computer is not initialized. Call configure_model() first.")
+            loss, metrics = self._liger_loss_computer.compute_loss(rollout_batch, training=stage == "train")
+        else:
+            if self._standard_loss_computer is None:
+                raise RuntimeError("Standard GRPO loss computer is not initialized. Call configure_model() first.")
+            loss, metrics = self._standard_loss_computer.compute_loss(rollout_batch, training=stage == "train")
         self.metrics_aggregator.log_metrics(stage, loss, metrics, on_step=stage == "train", on_epoch=True)
 
         if self.config.rollout.debug_samples and self.trainer.is_global_zero:

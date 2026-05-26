@@ -90,6 +90,7 @@ def main() -> None:
         model_config=config.model,
         optimization_config=config.optimization,
         system_prompt=config.system_prompt,
+        rollout_config=config.rollout,
     )
     module = GRPOLightningModule(config)
     trainer = build_trainer(config)

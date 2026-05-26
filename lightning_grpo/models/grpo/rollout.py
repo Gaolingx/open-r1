@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+from lightning_grpo.models.common import compute_per_token_logps
 from lightning_grpo.models.grpo.reward import execute_tool, parse_tool_calls
 from lightning_grpo.data.base import apply_chat_template
 
@@ -22,6 +23,14 @@ class LocalGenerateRolloutCoordinator:
 
         return self.module.config.rollout.num_generations if training else 1
 
+    def _max_prompt_length(self) -> int:
+        """Return a prompt window that leaves room for at least one completion token."""
+
+        max_total_length = self.module.config.rollout.max_total_length
+        if max_total_length <= 1:
+            raise ValueError("rollout.max_total_length must be greater than 1 for GRPO loss computation.")
+        return min(self.module.config.rollout.max_prompt_length, max_total_length - 1)
+
     def _tokenize_prompts(self, prompts: list[str]) -> dict[str, torch.Tensor]:
         """Left-pad prompts and truncate to the configured prompt window."""
 
@@ -34,7 +43,7 @@ class LocalGenerateRolloutCoordinator:
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=self.module.config.rollout.max_prompt_length,
+                max_length=self._max_prompt_length(),
                 add_special_tokens=False,
                 return_token_type_ids=False,
             )
@@ -48,7 +57,6 @@ class LocalGenerateRolloutCoordinator:
 
         tokenizer = self.module.tokenizer
         encoded = self._tokenize_prompts(prompts)
-        prompt_lens = encoded["attention_mask"].sum(dim=1)
         generation_kwargs = {
             "max_new_tokens": self.module.config.rollout.max_completion_length,
             "do_sample": self.module.config.rollout.temperature > 0,
@@ -60,6 +68,7 @@ class LocalGenerateRolloutCoordinator:
         outputs = self.module.policy.generate(
             input_ids=encoded["input_ids"],
             attention_mask=encoded["attention_mask"],
+            output_router_logits=False,
             **generation_kwargs,
         )
 
@@ -102,7 +111,7 @@ class LocalGenerateRolloutCoordinator:
     def _rollout_reasoning(self, batch: dict[str, list[Any]], *, num_generations: int) -> dict[str, Any]:
         """Generate single-turn reasoning RL completions."""
 
-        prompts = list(batch["prompt"])
+        prompts = list(batch["prompt_text"])
         expanded_prompts = [prompt for prompt in prompts for _ in range(num_generations)]
         completion_ids, completion_mask, completions = self._generate_once(expanded_prompts)
         metadata = []
@@ -144,8 +153,6 @@ class LocalGenerateRolloutCoordinator:
                     context = self._render_messages(chat_state, tools, add_generation_prompt=True, open_thinking=open_thinking)
                     turn_ids, _, turn_texts = self._generate_once([context])
                     generated_ids = [token for token in turn_ids[0].tolist() if token != tokenizer.pad_token_id]
-                    if tokenizer.eos_token_id is not None:
-                        generated_ids = [token for token in generated_ids if token != tokenizer.eos_token_id]
                     turn_text = turn_texts[0]
                     turn_outputs.append(turn_text)
                     response_ids.extend(generated_ids)
@@ -175,6 +182,10 @@ class LocalGenerateRolloutCoordinator:
                     response_mask.extend([0] * len(obs_delta))
 
                 all_prompts.append(initial_prompt)
+                if not response_ids:
+                    fallback_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
+                    response_ids.append(fallback_token_id)
+                    response_mask.append(1)
                 response_ids_batch.append(response_ids)
                 response_masks_batch.append(response_mask)
                 completions.append(turn_outputs[-1] if turn_outputs else "")
@@ -201,11 +212,22 @@ class LocalGenerateRolloutCoordinator:
         prompt_encoded = self._tokenize_prompts(prompts)
         prompt_ids = prompt_encoded["input_ids"]
         prompt_mask = prompt_encoded["attention_mask"]
-        max_completion = min(completion_ids.size(1), self.module.config.rollout.max_total_length - prompt_ids.size(1))
+        completion_budget = self.module.config.rollout.max_total_length - prompt_ids.size(1)
+        if completion_budget <= 0:
+            raise RuntimeError(
+                "Tokenized prompts leave no room for completion tokens. "
+                "Reduce rollout.max_prompt_length or increase rollout.max_total_length."
+            )
+        max_completion = min(completion_ids.size(1), completion_budget)
+        if max_completion <= 0:
+            fallback_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
+            completion_ids = completion_ids.new_full((completion_ids.size(0), 1), fallback_token_id)
+            completion_mask = completion_mask.new_ones((completion_mask.size(0), 1))
+            max_completion = 1
         completion_ids = completion_ids[:, :max_completion]
         completion_mask = completion_mask[:, :max_completion]
         with torch.no_grad():
-            old_logps = self.module.compute_per_token_logps(prompt_ids, prompt_mask, completion_ids, completion_mask)
+            old_logps = compute_per_token_logps(self.module, prompt_ids, prompt_mask, completion_ids, completion_mask)
         completion_truncated = (completion_mask.sum(dim=1) >= max_completion).to(torch.long)
         sample_ids = torch.arange(completion_ids.size(0), device=self.module.device) // num_generations
 

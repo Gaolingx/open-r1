@@ -17,6 +17,7 @@ from lightning_grpo.data.base import (
     preprocess_chat_messages,
     resolve_shuffle_state,
 )
+from lightning_grpo.data.converter import json_loads_if_needed
 from lightning_grpo.models.common import load_tokenizer
 
 
@@ -118,39 +119,33 @@ class DPODataModule(ChatTemplateDataModule):
         """Load and preprocess train and validation datasets."""
 
         dataset_dict = self.load_dataset_dict()
+        formatter = self.build_conversation_template()
 
         train_split = dataset_dict[self.data_config.train_split]
-        self.train_dataset = self._tokenize_dataset(train_split)
+        self.train_dataset = self._tokenize_dataset(train_split, formatter)
 
         self.val_dataset = None
         val_split_name = self.resolve_val_split_name(dataset_dict)
         if val_split_name is not None:
-            self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name])
+            self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name], formatter)
 
-    def _is_conversational(self, sample: dict[str, Any]) -> bool:
-        """Detect whether the dataset uses conversational format (message lists)."""
+    @staticmethod
+    def _split_messages_for_dpo(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split canonical messages into prompt and assistant completion messages."""
 
-        chosen = sample.get(self.data_config.chosen_column)
-        if isinstance(chosen, list) and len(chosen) > 0:
-            if isinstance(chosen[0], dict) and "role" in chosen[0]:
-                return True
-        return False
+        if messages and messages[-1].get("role") == "assistant":
+            return messages[:-1], [messages[-1]]
+        return messages, []
 
-    def _tokenize_dataset(self, dataset: Dataset) -> Dataset:
+    def _tokenize_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
         """Convert dataset rows into tokenized DPO preference pairs."""
 
-        tokenizer = self.tokenizer
         chat_processor = self.chat_processor
         max_seq_length = self.data_config.max_seq_length
         chosen_column = self.data_config.chosen_column
         rejected_column = self.data_config.rejected_column
-        prompt_column = self.data_config.prompt_column
-        system_prompt = self.system_prompt
         iter_batch_samples = self.iter_batch_samples
-
-        def tokenize_text(text: str) -> list[int]:
-            """Tokenize a plain text string without special tokens."""
-            return tokenizer.encode(text, add_special_tokens=False)
+        split_messages_for_dpo = self._split_messages_for_dpo
 
         def tokenize_messages(messages: list[dict[str, Any]]) -> list[int]:
             """Tokenize a list of chat messages using the chat template."""
@@ -162,6 +157,19 @@ class DPODataModule(ChatTemplateDataModule):
             )
             return list(processed["input_ids"])
 
+        def normalize_preference_sample(raw_sample: dict[str, Any], completion_column: str) -> dict[str, Any]:
+            """Build one canonical prompt+completion sample for a DPO side."""
+
+            raw_completion = json_loads_if_needed(raw_sample[completion_column])
+            if isinstance(raw_completion, list):
+                sample = dict(raw_sample)
+                sample["messages"] = raw_completion
+                return formatter(sample)
+
+            sample = dict(raw_sample)
+            sample["response"] = raw_completion
+            return formatter(sample)
+
         def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
             """Tokenize a batch of preference samples into prompt/chosen/rejected ids."""
 
@@ -170,70 +178,21 @@ class DPODataModule(ChatTemplateDataModule):
             all_rejected_ids: list[list[int]] = []
 
             samples = iter_batch_samples(batch)
-            for sample in samples:
-                chosen_raw = sample[chosen_column]
-                rejected_raw = sample[rejected_column]
+            for raw_sample in samples:
+                chosen_sample = normalize_preference_sample(raw_sample, chosen_column)
+                rejected_sample = normalize_preference_sample(raw_sample, rejected_column)
+                chosen_messages, chosen_tools = chat_processor.prepare_sample(chosen_sample)
+                rejected_messages, rejected_tools = chat_processor.prepare_sample(rejected_sample)
+                chosen_messages = preprocess_chat_messages(chosen_messages)
+                rejected_messages = preprocess_chat_messages(rejected_messages)
 
-                # Conversational format: chosen/rejected are message lists
-                if isinstance(chosen_raw, list) and len(chosen_raw) > 0 and isinstance(chosen_raw[0], dict):
-                    # Extract prompt messages if available
-                    prompt_messages = sample.get(prompt_column, [])
-                    if isinstance(prompt_messages, str):
-                        prompt_messages = [{"role": "user", "content": prompt_messages}]
-                    elif not prompt_messages:
-                        # If no explicit prompt, infer from chosen (all messages except last assistant)
-                        prompt_messages = []
-                        for msg in chosen_raw:
-                            if msg.get("role") == "assistant":
-                                break
-                            prompt_messages.append(msg)
-                        chosen_raw = chosen_raw[len(prompt_messages):]
-                        rejected_raw = rejected_raw[len(prompt_messages):]
-
-                    # Optionally prepend system prompt
-                    if system_prompt and not any(m.get("role") == "system" for m in prompt_messages):
-                        prompt_messages = [{"role": "system", "content": system_prompt}] + prompt_messages
-
-                    # Tokenize prompt
-                    if prompt_messages:
-                        prompt_ids = tokenize_messages(prompt_messages + [{"role": "assistant", "content": ""}])
-                        # Remove the trailing empty assistant tokens (we just want the prompt prefix)
-                        # Re-tokenize without generation prompt to get clean prompt ids
-                        prompt_text = tokenizer.apply_chat_template(
-                            prompt_messages, tokenize=False, add_generation_prompt=True,
-                        ) if hasattr(tokenizer, "apply_chat_template") else ""
-                        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False) if prompt_text else []
-                    else:
-                        prompt_ids = []
-
-                    # Tokenize chosen and rejected completions
-                    chosen_text = tokenizer.apply_chat_template(
-                        prompt_messages + (chosen_raw if isinstance(chosen_raw, list) else [chosen_raw]),
-                        tokenize=False, add_generation_prompt=False,
-                    ) if hasattr(tokenizer, "apply_chat_template") else str(chosen_raw)
-                    chosen_all_ids = tokenizer.encode(chosen_text, add_special_tokens=False)
-                    chosen_ids = chosen_all_ids[len(prompt_ids):]
-
-                    rejected_text = tokenizer.apply_chat_template(
-                        prompt_messages + (rejected_raw if isinstance(rejected_raw, list) else [rejected_raw]),
-                        tokenize=False, add_generation_prompt=False,
-                    ) if hasattr(tokenizer, "apply_chat_template") else str(rejected_raw)
-                    rejected_all_ids = tokenizer.encode(rejected_text, add_special_tokens=False)
-                    rejected_ids = rejected_all_ids[len(prompt_ids):]
-
-                else:
-                    # Standard text format
-                    prompt_text = sample.get(prompt_column, "")
-                    if isinstance(prompt_text, str) and prompt_text:
-                        prompt_ids = tokenize_text(prompt_text)
-                    else:
-                        prompt_ids = []
-
-                    chosen_text = chosen_raw if isinstance(chosen_raw, str) else str(chosen_raw)
-                    chosen_ids = tokenize_text(chosen_text)
-
-                    rejected_text = rejected_raw if isinstance(rejected_raw, str) else str(rejected_raw)
-                    rejected_ids = tokenize_text(rejected_text)
+                prompt_messages, chosen_completion = split_messages_for_dpo(chosen_messages)
+                _, rejected_completion = split_messages_for_dpo(rejected_messages)
+                prompt_ids = tokenize_messages(prompt_messages) if prompt_messages else []
+                chosen_all_ids = tokenize_messages(prompt_messages + chosen_completion)
+                rejected_all_ids = tokenize_messages(prompt_messages + rejected_completion)
+                chosen_ids = chosen_all_ids[len(prompt_ids):]
+                rejected_ids = rejected_all_ids[len(prompt_ids):]
 
                 # Truncate to max_seq_length
                 max_completion_len = max_seq_length - len(prompt_ids)

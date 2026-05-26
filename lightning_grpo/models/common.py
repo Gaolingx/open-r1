@@ -198,6 +198,26 @@ def load_tokenizer(model_config: ModelConfig) -> PreTrainedTokenizerBase:
     return tokenizer
 
 
+def compute_per_token_logps(
+    self,
+    prompt_ids: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    completion_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute old policy log-probabilities for generated completion tokens."""
+
+    input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+    attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+    logits_to_keep = completion_ids.size(1)
+    outputs = self.policy(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    shift_logits = outputs.logits[:, :-1, :]
+    shift_labels = input_ids[:, 1:]
+    per_token_logps = torch.log_softmax(shift_logits, dim=-1).gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+    start = prompt_ids.size(1) - 1
+    return per_token_logps[:, start: start + logits_to_keep] * completion_mask.to(per_token_logps.dtype)
+
+
 def count_trainable_parameters(model: PreTrainedModel) -> tuple[int, int]:
     """Return trainable and total parameter counts."""
 

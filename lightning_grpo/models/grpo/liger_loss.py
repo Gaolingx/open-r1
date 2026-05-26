@@ -62,7 +62,6 @@ def _materialize_liger_lm_head(
 
 
 def _get_last_hidden_state(
-    self,
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -331,6 +330,8 @@ class LigerGRPOLossComputer:
         )
 
     def compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
+        if num_generations <= 1:
+            return torch.zeros_like(rewards)
         grouped_rewards = rewards.view(-1, num_generations)
         grouped_mean = grouped_rewards.mean(dim=1, keepdim=True)
         grouped_std = grouped_rewards.std(dim=1, keepdim=True)

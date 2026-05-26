@@ -214,10 +214,16 @@ class ChatTemplateProcessor:
             "attention_mask": list(tokenized["attention_mask"]),
         }
 
-    def prepare_sample(self, sample: Mapping[str, Any]) -> tuple[list[dict[str, Any]], Any]:
+    def prepare_sample(
+        self,
+        sample: Mapping[str, Any],
+        *,
+        messages_column: str = "messages",
+        tools_column: str = "tools",
+    ) -> tuple[list[dict[str, Any]], Any]:
         """Return messages and tools from a converted sample."""
 
-        messages, tools = self.normalize_messages(sample["messages"], sample.get("tools"))
+        messages, tools = self.normalize_messages(sample[messages_column], sample.get(tools_column))
         return messages, tools
 
 

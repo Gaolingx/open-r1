@@ -9,7 +9,6 @@ from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.parallel import loss_parallel
 
 
-# CE Loss
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Compute a mask-aware mean."""
 
@@ -83,6 +82,7 @@ def masked_token_stats(logits: torch.Tensor, labels: torch.Tensor, ignore_index:
     }
 
 
+# CE Loss
 def compute_cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -252,6 +252,8 @@ def compute_grpo_advantages(
 ) -> torch.Tensor:
     """Normalize rewards within each prompt group to produce GRPO advantages."""
 
+    if num_generations <= 1:
+        return torch.zeros_like(rewards)
     grouped_rewards = rewards.view(-1, num_generations)
     grouped_mean = grouped_rewards.mean(dim=1, keepdim=True)
     grouped_std = grouped_rewards.std(dim=1, keepdim=True)
@@ -371,31 +373,38 @@ def compute_standard_grpo_loss(
     completion_mask = batch["completion_mask"]
     old_per_token_logps = batch.get("old_per_token_logps")
 
-    input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-    attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-    logits_to_keep = completion_ids.shape[1]
+    model_input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+    model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+    logits_to_keep = completion_ids.size(1)
 
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-    logits = materialize_vocab_parallel_logits(outputs.logits[:, :-1, :])
-    logits = logits[:, -logits_to_keep:, :] / temperature
-    per_token_logps = selective_log_softmax(logits, completion_ids)
+    outputs = model(input_ids=model_input_ids, attention_mask=model_attention_mask, use_cache=False, output_router_logits=True)
+    logits = materialize_vocab_parallel_logits(outputs.logits)
+    shift_logits = logits[:, :-1, :]
+    completion_logits = shift_logits[:, -logits_to_keep:, :]
+    if temperature != 1.0:
+        completion_logits = completion_logits / temperature
+    per_token_logps = selective_log_softmax(completion_logits, completion_ids)
 
     ref_per_token_logps = None
     if ref_model is not None:
         with torch.no_grad():
-            ref_outputs = ref_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            ref_logits = materialize_vocab_parallel_logits(ref_outputs.logits[:, :-1, :])
-            ref_logits = ref_logits[:, -logits_to_keep:, :] / temperature
-            ref_per_token_logps = selective_log_softmax(ref_logits, completion_ids)
+            ref_outputs = ref_model(input_ids=model_input_ids, attention_mask=model_attention_mask, use_cache=False)
+            ref_logits = materialize_vocab_parallel_logits(ref_outputs.logits)
+            ref_shift_logits = ref_logits[:, :-1, :]
+            ref_completion_logits = ref_shift_logits[:, -logits_to_keep:, :]
+            if temperature != 1.0:
+                ref_completion_logits = ref_completion_logits / temperature
+            ref_per_token_logps = selective_log_softmax(ref_completion_logits, completion_ids)
 
     loss_mask = completion_mask
     if "tool_mask" in batch:
         loss_mask = completion_mask * batch["tool_mask"]
 
-    per_token_loss, metrics = compute_grpo_per_token_loss(
+    epsilon_high = epsilon_high if loss_type == "cispo" else epsilon_low
+    per_token_loss, loss_metrics = compute_grpo_per_token_loss(
         per_token_logps,
         old_per_token_logps,
-        advantages.to(per_token_logps.device),
+        advantages,
         loss_mask,
         ref_per_token_logps=ref_per_token_logps,
         beta=beta,
@@ -403,33 +412,153 @@ def compute_standard_grpo_loss(
         epsilon_high=epsilon_high,
         loss_type=loss_type,
     )
-    with tensor_parallel_loss_context(loss_parallel_enabled):
-        loss = reduce_grpo_loss(
-            per_token_loss,
-            loss_mask,
-            loss_type=loss_type,
-            max_completion_length=max_completion_length,
+    loss = reduce_grpo_loss(
+        per_token_loss,
+        loss_mask,
+        loss_type=loss_type,
+        max_completion_length=max_completion_length,
+    )
+
+    with torch.no_grad():
+        entropy = entropy_from_logits(completion_logits)
+        completion_lengths = completion_mask.sum(dim=1).float()
+        completion_truncated = batch.get("completion_truncated", completion_lengths >= completion_mask.shape[1])
+        local_metrics = {
+            "loss_mask": loss_mask.detach(),
+            "per_token_kl": loss_metrics["per_token_kl"].detach(),
+            "entropy": entropy.detach(),
+            "completion_lengths": completion_lengths.detach(),
+            "completion_truncated": completion_truncated.to(torch.float32).detach(),
+            "is_low_clipped": loss_metrics["is_low_clipped"].detach(),
+            "is_high_clipped": loss_metrics["is_high_clipped"].detach(),
+            "is_region_clipped": loss_metrics["is_region_clipped"].detach(),
+            "is_cispo_clipped": loss_metrics["is_cispo_clipped"].detach(),
+        }
+    local_metrics["_policy_outputs"] = outputs
+    return loss, local_metrics
+
+
+class StandardGRPOLossComputer:
+    """Compute standard PyTorch GRPO loss and metrics with the same orchestration as Liger."""
+
+    def __init__(
+        self,
+        module: Any,
+        reward_manager: Any,
+        metrics_aggregator: Any,
+        *,
+        rollout_temperature: float,
+        loss_parallel_enabled: bool = False,
+    ) -> None:
+
+        self.module = module
+        self.reward_manager = reward_manager
+        self.metrics_aggregator = metrics_aggregator
+        self.rollout_temperature = rollout_temperature
+        self.loss_parallel_enabled = loss_parallel_enabled
+
+    def compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
+        return compute_grpo_advantages(
+            rewards,
+            num_generations,
+            advantage_epsilon=self.module.config.rollout.advantage_epsilon,
         )
 
-    metrics.update(
-        {
-            "per_token_logps": per_token_logps.detach(),
-            "per_token_kl": metrics["per_token_kl"].detach(),
-            "entropy": entropy_from_logits(logits).detach(),
-            "loss_mask": loss_mask.detach(),
-            "is_low_clipped": metrics["is_low_clipped"].detach(),
-            "is_high_clipped": metrics["is_high_clipped"].detach(),
-            "is_region_clipped": metrics["is_region_clipped"].detach(),
-            "is_cispo_clipped": metrics["is_cispo_clipped"].detach(),
-            "completion_lengths": completion_mask.sum(dim=1).float().detach(),
-            "completion_truncated": batch.get(
-                "completion_truncated",
-                torch.zeros(completion_ids.shape[0], device=completion_ids.device, dtype=torch.float32),
-            ).to(torch.float32).detach(),
-            "_policy_outputs": outputs,
-        }
-    )
-    return loss, metrics
+    def normalize_grouped_advantages(
+        self,
+        *,
+        local_rewards: torch.Tensor,
+        global_rewards: torch.Tensor,
+        local_sample_ids: torch.Tensor,
+        global_sample_ids: torch.Tensor,
+        num_generations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize rewards by globally gathered prompt groups, matching the Liger GRPO loss."""
+
+        if global_rewards.numel() % num_generations != 0:
+            raise ValueError(
+                f"Global rollout batch ({global_rewards.numel()}) must be divisible by num_generations "
+                f"({num_generations}) so prompt groups can be normalized correctly."
+            )
+
+        grouped_sample_ids = global_sample_ids.view(-1, num_generations)
+        if not torch.all(grouped_sample_ids == grouped_sample_ids[:, :1]):
+            raise RuntimeError(
+                "Distributed GRPO prompt groups are not contiguous after gather. "
+                "Each prompt must contribute exactly num_generations completions before advantage normalization."
+            )
+
+        global_advantages = self.compute_advantages(global_rewards, num_generations)
+        local_batch_size = local_rewards.numel()
+        process_index = getattr(getattr(self.module, "trainer", None), "global_rank", 0)
+        start = process_index * local_batch_size
+        end = start + local_batch_size
+        local_advantages = global_advantages[start:end]
+        expected_sample_ids = global_sample_ids[start:end].to(local_sample_ids.device)
+        if local_advantages.numel() != local_batch_size or not torch.equal(expected_sample_ids, local_sample_ids):
+            raise RuntimeError(
+                "Failed to recover this rank's advantages from the gathered reward tensor. "
+                "Ensure every rank receives the same local rollout batch size."
+            )
+        return local_advantages, global_advantages
+
+    def compute_loss(
+        self,
+        rollout_batch: dict[str, torch.Tensor | list[object]],
+        *,
+        training: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute standard GRPO loss and logged metrics for a rollout batch."""
+
+        sample_ids = rollout_batch["sample_ids"]
+        completion_truncated = rollout_batch["completion_truncated"]
+        rewards, rewards_per_func = self.reward_manager.compute_rewards(
+            prompts=rollout_batch["prompts"],
+            completions=rollout_batch["completions"],
+            completion_id_lists=rollout_batch["completion_id_lists"],
+            metadata=rollout_batch["metadata"],
+        )
+        global_rewards_per_func = self.metrics_aggregator.gather_tensor(rewards_per_func.detach())
+        global_sample_ids = self.metrics_aggregator.gather_tensor(sample_ids.detach())
+        num_generations = self.module.rollout_coordinator.resolve_num_generations(training)
+        global_rewards = (global_rewards_per_func * self.module.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
+        local_advantages, global_advantages = self.normalize_grouped_advantages(
+            local_rewards=rewards.detach(),
+            global_rewards=global_rewards,
+            local_sample_ids=sample_ids.detach(),
+            global_sample_ids=global_sample_ids,
+            num_generations=num_generations,
+        )
+
+        config = self.module.config
+        loss_type = "bnpo" if config.rollout.loss_type == "grpo" else config.rollout.loss_type
+        epsilon_high = config.rollout.epsilon_high if config.rollout.loss_type == "cispo" else config.rollout.epsilon
+        loss, local_metrics = compute_standard_grpo_loss(
+            self.module.policy,
+            rollout_batch,
+            local_advantages.to(self.module.device),
+            ref_model=self.module.reference_model,
+            beta=config.rollout.kl_beta,
+            epsilon_low=config.rollout.epsilon,
+            epsilon_high=epsilon_high,
+            loss_type=loss_type,
+            temperature=self.rollout_temperature,
+            max_completion_length=config.rollout.max_completion_length,
+            loss_parallel_enabled=self.loss_parallel_enabled,
+        )
+
+        metrics = build_standard_grpo_training_metrics(
+            self.metrics_aggregator,
+            rewards_per_func=rewards_per_func,
+            reward_weights=self.module.reward_weights,
+            num_generations=num_generations,
+            local_metrics={**local_metrics, "completion_truncated": completion_truncated.to(torch.float32)},
+            global_advantages=global_advantages,
+            reward_names=config.reward.active.reward_funcs,
+            moe_outputs=local_metrics.get("_policy_outputs"),
+        )
+
+        return loss, metrics
 
 
 def build_standard_grpo_training_metrics(
