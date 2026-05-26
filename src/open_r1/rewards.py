@@ -37,53 +37,6 @@ from .utils.competitive_programming import score_submission as cf_score_submissi
 from .utils.competitive_programming import score_subtask
 
 
-ANSWER_TAG_FORMAT_MODES = {"strict", "no_answer_tag", "auto"}
-
-
-def _validate_format_mode(format_mode: str) -> str:
-    if format_mode not in ANSWER_TAG_FORMAT_MODES:
-        raise ValueError(
-            f"Unsupported format_mode '{format_mode}'. Expected one of {sorted(ANSWER_TAG_FORMAT_MODES)}"
-        )
-    return format_mode
-
-
-def _matches_format_pattern(text: str, format_mode: str, *, require_code_block: bool = False, language: str | None = None) -> bool:
-    format_mode = _validate_format_mode(format_mode)
-
-    answer_body = r".*?"
-    if require_code_block:
-        if language is None:
-            raise ValueError("language is required when require_code_block=True")
-        answer_body = rf".*?```{re.escape(language)}.*?```.*?"
-
-    strict_pattern = rf"^<think>\n.*?\n</think>\n<answer>\n{answer_body}\n</answer>$"
-    no_answer_tag_pattern = rf"^<think>\n.*?\n</think>\n{answer_body}$"
-
-    patterns = [strict_pattern, no_answer_tag_pattern] if format_mode == "auto" else [
-        strict_pattern if format_mode == "strict" else no_answer_tag_pattern
-    ]
-    return any(re.match(pattern, text, re.DOTALL | re.MULTILINE) for pattern in patterns)
-
-
-def _count_tag_score(text: str, format_mode: str) -> float:
-    format_mode = _validate_format_mode(format_mode)
-
-    think_open = 1 if text.count("<think>\n") == 1 else 0
-    think_close = 1 if text.count("\n</think>\n") == 1 else 0
-    answer_open = 1 if text.count("\n<answer>\n") == 1 else 0
-    answer_close = 1 if text.count("\n</answer>") == 1 else 0
-
-    if format_mode == "strict":
-        return 0.25 * (think_open + think_close + answer_open + answer_close)
-    if format_mode == "no_answer_tag":
-        return 0.5 * (think_open + think_close)
-    return max(
-        0.25 * (think_open + think_close + answer_open + answer_close),
-        0.5 * (think_open + think_close),
-    )
-
-
 def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]
@@ -129,20 +82,34 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
     return rewards
 
 
-def format_reward(completions, format_mode: str = "strict", **kwargs):
-    """Reward function that checks whether responses follow the configured think/answer tag template."""
+def format_reward(completions, **kwargs):
+    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
+    pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
     completion_contents = [completion[0]["content"] for completion in completions]
-    return [1.0 if _matches_format_pattern(content, format_mode) else 0.0 for content in completion_contents]
+    matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+    return [1.0 if match else 0.0 for match in matches]
 
 
-def tag_count_reward(completions, format_mode: str = "strict", **kwargs) -> list[float]:
-    """Reward function that checks if we produce the desired tags associated with `format_reward()`.
+def tag_count_reward(completions, **kwargs) -> list[float]:
+    """Reward function that checks if we produce the desired number of think and answer tags associated with `format_reward()`.
 
     Adapted from: https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb#file-grpo_demo-py-L90
     """
 
+    def count_tags(text: str) -> float:
+        count = 0.0
+        if text.count("<think>\n") == 1:
+            count += 0.25
+        if text.count("\n</think>\n") == 1:
+            count += 0.25
+        if text.count("\n<answer>\n") == 1:
+            count += 0.25
+        if text.count("\n</answer>") == 1:
+            count += 0.25
+        return count
+
     contents = [completion[0]["content"] for completion in completions]
-    return [_count_tag_score(content, format_mode) for content in contents]
+    return [count_tags(c) for c in contents]
 
 
 def reasoning_steps_reward(completions, **kwargs):
@@ -625,7 +592,7 @@ def code_reward(
     return execution_provider.execute_scripts(scripts, ["python"] * len(scripts))
 
 
-def get_code_format_reward(language: str = "python", format_mode: str = "strict"):
+def get_code_format_reward(language: str = "python"):
     """Format reward function specifically for code responses.
 
     Args:
@@ -637,17 +604,15 @@ def get_code_format_reward(language: str = "python", format_mode: str = "strict"
         languages = kwargs["language"] if "language" in kwargs else [language] * len(completions)
 
         completion_contents = [completion[0]["content"] for completion in completions]
-        return [
-            1.0
-            if _matches_format_pattern(
+        matches = [
+            re.match(
+                rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{sample_language}.*?```.*?\n</answer>$",
                 content,
-                format_mode,
-                require_code_block=True,
-                language=sample_language,
+                re.DOTALL | re.MULTILINE,
             )
-            else 0.0
             for content, sample_language in zip(completion_contents, languages)
         ]
+        return [1.0 if match else 0.0 for match in matches]
 
     return code_format_reward
 
@@ -678,27 +643,10 @@ def get_soft_overlong_punishment(max_completion_len, soft_punish_cache):
     return soft_overlong_punishment_reward
 
 
-def reward_model_score_reward(
-    completions,
-    reward_model_engine=None,
-    reward_model_texts: Optional[list[str]] = None,
-    **kwargs,
-) -> list[Optional[float]]:
-    """Reward function that scores completions with a reward model."""
-
-    if reward_model_engine is None:
-        raise ValueError("reward_model_score requires a configured reward_model_engine.")
-
-    texts = reward_model_texts or [completion[0]["content"] for completion in completions]
-    samples = [{"text": text} for text in texts]
-    return [float(score) for score in reward_model_engine.score(samples)]
-
-
 def get_reward_funcs(script_args) -> list[Callable]:
-    format_mode = getattr(script_args, "format_mode", "strict")
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
-        "format": update_wrapper(partial(format_reward, format_mode=format_mode), format_reward),
+        "format": format_reward,
         "reasoning_steps": reasoning_steps_reward,
         "cosine": get_cosine_scaled_reward(
             min_value_wrong=script_args.cosine_min_value_wrong,
@@ -746,18 +694,11 @@ def get_reward_funcs(script_args) -> list[Callable]:
             ),
             cf_code_reward,
         ),
-        "code_format": get_code_format_reward(language=script_args.code_language, format_mode=format_mode),
-        "tag_count": update_wrapper(partial(tag_count_reward, format_mode=format_mode), tag_count_reward),
+        "code_format": get_code_format_reward(language=script_args.code_language),
+        "tag_count": tag_count_reward,
         "soft_overlong_punishment": get_soft_overlong_punishment(
             max_completion_len=script_args.max_completion_len,
             soft_punish_cache=script_args.soft_punish_cache,
-        ),
-        "reward_model_score": update_wrapper(
-            partial(
-                reward_model_score_reward,
-                reward_model_engine=getattr(script_args, "reward_model_engine", None),
-            ),
-            reward_model_score_reward,
         ),
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]

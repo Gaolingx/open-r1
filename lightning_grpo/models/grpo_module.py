@@ -1,0 +1,160 @@
+"""Lightning module for Group Relative Policy Optimization (GRPO)."""
+
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+import lightning as L
+import torch
+from lightning.pytorch.utilities import rank_zero_info
+
+from lightning_grpo.models.common import (
+    build_optimizer,
+    build_scheduler,
+    compile_model_if_configured,
+    count_trainable_parameters,
+    export_configured_model,
+    load_tokenizer,
+)
+from lightning_grpo.models.grpo.rollout import LocalGenerateRolloutCoordinator
+from lightning_grpo.models.grpo.liger_loss import LigerGRPOLossComputer
+from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
+from lightning_grpo.models.grpo.reward import GRPORewardManager
+from lightning_grpo.strategies.fsdp2 import configure_fully_shard
+from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
+from lightning_grpo.utils.configs.grpo import GRPOConfig
+from lightning_grpo.utils.modeling import load_causal_lm
+
+
+class GRPOLightningModule(L.LightningModule):
+    """Lightning module for local-rollout GRPO, reasoning RL, and agentic RL."""
+
+    def __init__(self, config: GRPOConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.policy = load_causal_lm(config.model, config.precision)
+        self.save_hyperparameters(config.to_dict())
+
+        trainable, total = count_trainable_parameters(self.policy)
+        self.trainable_parameter_count = trainable
+        self.total_parameter_count = total
+        self.tokenizer = load_tokenizer(config.model)
+        self.reference_model = self._build_reference_model()
+        self.rollout_coordinator = LocalGenerateRolloutCoordinator(self)
+        self.metrics_aggregator = GRPOMetricsAggregator(self)
+        self.reward_manager = GRPORewardManager(config, self.tokenizer, device=self.device)
+        self.reward_weights = torch.tensor(config.reward.active.weights, dtype=torch.float32)
+        self._liger_loss_computer: LigerGRPOLossComputer | None = None
+
+    def _build_reference_model(self) -> torch.nn.Module | None:
+        """Create the frozen reference model used for KL regularization."""
+
+        if not self.config.rollout.use_reference_model:
+            return None
+        reference_model = load_causal_lm(self.config.ref_model, self.config.precision) if self.config.ref_model else copy.deepcopy(self.policy)
+        reference_model.requires_grad_(False)
+        reference_model.eval()
+        return reference_model
+
+    def forward(self, **batch: torch.Tensor) -> Any:
+        """Forward tokens through the wrapped policy model."""
+
+        return self.policy(**batch)
+
+    def configure_model(self) -> None:
+        """Apply tensor parallelism, FSDP2, compile, then initialize GRPO loss."""
+
+        configure_tensor_parallel(self.policy, self.config.distributed, self.device_mesh)
+        configure_fully_shard(self.policy, self.config.distributed, self.config.precision, self.device_mesh)
+        self.policy = compile_model_if_configured(self.policy, self.config.model)
+        if self.reference_model is not None:
+            configure_tensor_parallel(self.reference_model, self.config.distributed, self.device_mesh)
+            configure_fully_shard(self.reference_model, self.config.distributed, self.config.precision, self.device_mesh)
+
+        if not self.config.liger_kernel.enabled:
+            raise RuntimeError("GRPO currently requires liger_kernel.enabled=True for the fused GRPO loss.")
+        self._liger_loss_computer = LigerGRPOLossComputer(
+            self,
+            self.reward_manager,
+            self.metrics_aggregator,
+            rollout_temperature=self.config.rollout.temperature,
+            loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
+        )
+
+    def compute_per_token_logps(
+        self,
+        prompt_ids: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        completion_ids: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute old policy log-probabilities for generated completion tokens."""
+
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+        outputs = self.policy(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        shift_logits = outputs.logits[:, :-1, :]
+        shift_labels = input_ids[:, 1:]
+        per_token_logps = torch.log_softmax(shift_logits, dim=-1).gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+        start = prompt_ids.size(1) - 1
+        return per_token_logps[:, start: start + logits_to_keep] * completion_mask.to(per_token_logps.dtype)
+
+    def _shared_step(self, batch: dict[str, list[Any]], stage: str) -> torch.Tensor:
+        """Generate rollouts, compute fused GRPO loss, and log metrics."""
+
+        if self._liger_loss_computer is None:
+            raise RuntimeError("GRPO loss computer is not initialized. Call configure_model() first.")
+        rollout_batch = self.rollout_coordinator.rollout(batch, training=stage == "train")
+        self.reward_manager.device = self.device
+        self.reward_weights = self.reward_weights.to(self.device)
+        loss, metrics = self._liger_loss_computer.compute_loss(rollout_batch, training=stage == "train")
+        self.metrics_aggregator.log_metrics(stage, loss, metrics, on_step=stage == "train", on_epoch=True)
+
+        if self.config.rollout.debug_samples and self.trainer.is_global_zero:
+            every = max(1, self.config.rollout.debug_every_n_steps)
+            if self.global_step % every == 0:
+                rank_zero_info(f"[GRPO DEBUG] prompt={rollout_batch['prompts'][0]!r}")
+                rank_zero_info(f"[GRPO DEBUG] completion={rollout_batch['completions'][0]!r}")
+        return loss
+
+    def on_fit_start(self) -> None:
+        """Log static parameter counts once training starts."""
+
+        if self.logger is None or not self.trainer.is_global_zero:
+            return
+        self.logger.log_metrics(
+            {
+                "model/trainable_parameters": float(self.trainable_parameter_count),
+                "model/total_parameters": float(self.total_parameter_count),
+            },
+            step=self.global_step,
+        )
+
+    def training_step(self, batch: dict[str, list[Any]], batch_idx: int) -> torch.Tensor:
+        """Compute one on-policy GRPO training step."""
+
+        return self._shared_step(batch, "train")
+
+    def validation_step(self, batch: dict[str, list[Any]], batch_idx: int) -> torch.Tensor:
+        """Run validation rollouts with one completion per prompt."""
+
+        return self._shared_step(batch, "val")
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        """Create optimizer and scheduler for Lightning."""
+
+        optimizer = build_optimizer(self.parameters(), self.config.optimization)
+        scheduler = build_scheduler(optimizer, self.config.optimization, self.trainer.estimated_stepping_batches)
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
+    def on_train_end(self) -> None:
+        """Export a Hugging Face-compatible model directory after training."""
+
+        if not self.trainer.is_global_zero:
+            return
+        export_dir = self.config.output_dir + "/hf_final"
+        exported_paths = export_configured_model(self.policy, self.config.model, export_dir, tokenizer=self.tokenizer)
+        if exported_paths:
+            rank_zero_info(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")

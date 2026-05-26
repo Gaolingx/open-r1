@@ -5,6 +5,7 @@ from pathlib import Path
 from lightning_grpo.utils.config import load_yaml_config
 from lightning_grpo.utils.configs.base import TrainingBaseConfig
 from lightning_grpo.utils.configs.dpo import DPOConfig
+from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
 from lightning_grpo.utils.configs.sft import SFTConfig
 
@@ -12,6 +13,7 @@ CONFIG_REGISTRY = {
     "sft": SFTConfig,
     "pretrain": PretrainConfig,
     "dpo": DPOConfig,
+    "grpo": GRPOConfig,
 }
 
 

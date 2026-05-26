@@ -26,7 +26,6 @@ from open_r1.rewards import (
     get_reward_funcs,
     get_soft_overlong_punishment,
     len_reward,
-    reward_model_score_reward,
     reasoning_steps_reward,
     tag_count_reward,
 )
@@ -50,7 +49,6 @@ class TestGetRewardFuncs(unittest.TestCase):
             "ioi_code",
             "code_format",
             "binary_code",
-            "reward_model_score",
         ]
         reward_func_names = [
             "accuracy_reward",
@@ -64,7 +62,6 @@ class TestGetRewardFuncs(unittest.TestCase):
             "ioi_code_reward",
             "code_format_reward",
             "binary_code_reward",
-            "reward_model_score_reward",
         ]
 
         args = GRPOScriptArguments(
@@ -73,25 +70,9 @@ class TestGetRewardFuncs(unittest.TestCase):
         )
 
         reward_funcs = get_reward_funcs(args)
-        self.assertEqual(len(reward_funcs), 12)
+        self.assertEqual(len(reward_funcs), 11)
         for func_name, func in zip(reward_func_names, reward_funcs):
             self.assertEqual(func_name, func.__name__)
-
-    def test_reward_model_score_reward(self):
-        class DummyRewardModelEngine:
-            def score(self, samples):
-                return [0.25 * (index + 1) for index, _ in enumerate(samples)]
-
-        completions = [
-            [{"content": "answer a"}],
-            [{"content": "answer b"}],
-        ]
-        rewards = reward_model_score_reward(
-            completions,
-            reward_model_engine=DummyRewardModelEngine(),
-            reward_model_texts=["prompt a\nanswer a", "prompt b\nanswer b"],
-        )
-        self.assertEqual(rewards, [0.25, 0.5])
 
 
 class TestRewards(unittest.TestCase):
@@ -136,21 +117,6 @@ class TestRewards(unittest.TestCase):
             completion = [[{"content": fmt}]]
             rewards = format_reward(completion)
             self.assertEqual(rewards[0], 0.0)
-
-    def test_format_reward_without_answer_tag_mode(self):
-        """Test format_reward with think-only output under no_answer_tag mode."""
-        completion = [[{"content": "<think>\nSome reasoning\n</think>\nThe answer"}]]
-        rewards = format_reward(completion, format_mode="no_answer_tag")
-        self.assertEqual(rewards[0], 1.0)
-
-    def test_format_reward_auto_mode_accepts_both_templates(self):
-        """Test format_reward auto mode with and without answer tags."""
-        completions = [
-            [{"content": "<think>\nSome reasoning\n</think>\n<answer>\nThe answer\n</answer>"}],
-            [{"content": "<think>\nSome reasoning\n</think>\nThe answer"}],
-        ]
-        rewards = format_reward(completions, format_mode="auto")
-        self.assertEqual(rewards, [1.0, 1.0])
 
     def test_reasoning_steps_reward(self):
         """Test reasoning_steps_reward with various formats."""
@@ -481,21 +447,6 @@ class TestRepetitionPenaltyReward(unittest.TestCase):
         rewards = tag_count_reward(completion)
         self.assertEqual(rewards[0], 0.0)
 
-    def test_tag_count_reward_without_answer_tags_mode(self):
-        """Test tag_count_reward when answer tags are intentionally omitted."""
-        completion = [[{"content": "<think>\nSome reasoning\n</think>\nThe answer"}]]
-        rewards = tag_count_reward(completion, format_mode="no_answer_tag")
-        self.assertEqual(rewards[0], 1.0)
-
-    def test_tag_count_reward_auto_mode_prefers_valid_template(self):
-        """Test tag_count_reward auto mode for both supported templates."""
-        completions = [
-            [{"content": "<think>\nSome reasoning\n</think>\nThe answer"}],
-            [{"content": "<think>\nSome reasoning\n</think>\n<answer>\nThe answer\n</answer>"}],
-        ]
-        rewards = tag_count_reward(completions, format_mode="auto")
-        self.assertEqual(rewards, [1.0, 1.0])
-
     def test_full_repetition_with_language(self):
         reward_fn = get_repetition_penalty_reward(ngram_size=2, max_penalty=-1.0, language="en")
         completions = [[{"content": "that that that that that"}]]
@@ -565,19 +516,6 @@ class TestCodeFormat(unittest.TestCase):
             completion = [[{"content": fmt}]]
             rewards = reward_fn(completion)
             self.assertEqual(rewards[0], 0.0)
-
-    def test_code_format_without_answer_tags_mode(self):
-        """Test code format reward when answer tags are omitted."""
-        completion = [
-            [
-                {
-                    "content": "<think>\nLet's solve this\n</think>\n```python\ndef hello():\n    print('world')\n```"
-                }
-            ]
-        ]
-        reward_fn = get_code_format_reward(language="python", format_mode="no_answer_tag")
-        rewards = reward_fn(completion)
-        self.assertEqual(rewards[0], 1.0)
 
     def test_multiple_code_blocks(self):
         """Test format reward with multiple code blocks in think and answer sections."""
