@@ -30,6 +30,7 @@ class GRPORolloutCoordinator:
             policy_model=policy,
             tokenizer=tokenizer,
             sampling_config_path=config.rollout.sampling_config_path,
+            max_completion_length=config.rollout.max_completion_length,
             generation_batch_size=config.rollout.generation_batch_size,
             reward_model_config=config.reward.rlhf.reward_model,
             vllm_config=getattr(config.rollout.engine, "vllm", None),

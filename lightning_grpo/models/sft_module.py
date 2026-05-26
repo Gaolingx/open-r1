@@ -73,7 +73,7 @@ class SFTLightningModule(L.LightningModule):
         """Run one optimization/evaluation step and log metrics."""
 
         labels = batch["labels"]
-        use_liger = self.config.use_liger_kernel
+        use_liger = self.config.liger_kernel.enabled
         outputs = None
 
         if use_liger:

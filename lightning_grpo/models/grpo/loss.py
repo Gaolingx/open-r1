@@ -10,6 +10,9 @@ import torch.nn.functional as F
 from lightning_grpo.models.common import entropy_from_logits, masked_mean, materialize_vocab_parallel_logits
 from lightning_grpo.models.rollout_engine import compute_per_token_logps
 
+from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
+from lightning_grpo.models.grpo.reward import GRPORewardManager
+
 
 class GRPOLossComputer:
     """Compute GRPO loss and derived metrics."""
@@ -17,8 +20,8 @@ class GRPOLossComputer:
     def __init__(
         self,
         module: Any,
-        reward_manager: Any,
-        metrics_aggregator: Any,
+        reward_manager: GRPORewardManager,
+        metrics_aggregator: GRPOMetricsAggregator,
         *,
         rollout_temperature: float,
     ) -> None:
@@ -94,7 +97,7 @@ class GRPOLossComputer:
 
     def compute_loss(
         self,
-        rollout_batch: dict[str, torch.Tensor | list[Any]],
+        rollout_batch: dict[str, torch.Tensor | list[object]],
         *,
         training: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:

@@ -234,6 +234,13 @@ class DistributedConfig:
 
 
 @dataclass
+class LigerConfig:
+    """Liger kernel configuration."""
+    enabled: bool = False
+    compiled: bool = True
+
+
+@dataclass
 class TrainingBaseConfig:
     """Top-level configuration consumed by Lightning entrypoints."""
 
@@ -241,7 +248,7 @@ class TrainingBaseConfig:
     val_check_interval: int = 500
     task: Literal["sft", "grpo", "pretrain"] = "sft"
     output_dir: str = "outputs/default"
-    use_liger_kernel: bool = False
+    liger_kernel: LigerConfig = field(default_factory=LigerConfig)
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)

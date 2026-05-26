@@ -10,15 +10,16 @@ Reference: https://github.com/linkedin/Liger-Kernel
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor, Replicate
 
 from lightning_grpo.models.common import get_lm_head_model, get_transformer_backbone_model
+from lightning_grpo.utils.metrics import MoEAuxLossComputer, collect_moe_metrics
 
-logger = logging.getLogger(__name__)
+from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
+from lightning_grpo.models.grpo.reward import GRPORewardManager
 
 
 def _materialize_liger_lm_head_parameter(
@@ -83,8 +84,8 @@ class LigerGRPOLossComputer:
     def __init__(
         self,
         module: Any,
-        reward_manager: Any,
-        metrics_aggregator: Any,
+        reward_manager: GRPORewardManager,
+        metrics_aggregator: GRPOMetricsAggregator,
         *,
         rollout_temperature: float,
         loss_parallel_enabled: bool = False,
@@ -102,12 +103,14 @@ class LigerGRPOLossComputer:
         self.metrics_aggregator = metrics_aggregator
         self.rollout_temperature = rollout_temperature
         self.loss_parallel_enabled = loss_parallel_enabled
+        self.aux_loss_computer = MoEAuxLossComputer(module.policy)
 
         config = module.config
         loss_type = "bnpo" if config.rollout.loss_type == "grpo" else config.rollout.loss_type
         epsilon_high = config.rollout.epsilon_high if config.rollout.loss_type == "cispo" else config.rollout.epsilon
         self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
             beta=config.rollout.kl_beta,
+            compiled=config.liger_kernel.compiled,
             epsilon_low=config.rollout.epsilon,
             epsilon_high=epsilon_high,
             temperature=rollout_temperature,
@@ -168,7 +171,7 @@ class LigerGRPOLossComputer:
         attention_mask: torch.Tensor,
         logits_to_keep: int,
         output_router_logits: bool = True,
-    ) -> tuple[torch.Tensor, Any]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Forward pass to get last hidden state without computing logits."""
         outputs = get_transformer_backbone_model(model)(
             input_ids=input_ids,
@@ -183,7 +186,7 @@ class LigerGRPOLossComputer:
 
     def compute_loss(
         self,
-        rollout_batch: dict[str, torch.Tensor | list[Any]],
+        rollout_batch: dict[str, torch.Tensor | list[object]],
         *,
         training: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -204,7 +207,7 @@ class LigerGRPOLossComputer:
         model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.shape[1]
 
-        last_hidden_state, moe_metrics = self._get_last_hidden_state(
+        last_hidden_state, moe_outputs = self._get_last_hidden_state(
             self.module.policy,
             input_ids=model_input_ids,
             attention_mask=model_attention_mask,
@@ -271,6 +274,9 @@ class LigerGRPOLossComputer:
             ref_weight,
             ref_bias,
         )
+        aux_loss, aux_metrics = self.aux_loss_computer.compute(moe_outputs, model_attention_mask)
+        if aux_loss is not None:
+            loss = loss + aux_loss.to(loss.device)
 
         with torch.no_grad():
             mean_kl = liger_metrics[0] if self.module.config.rollout.kl_beta != 0.0 else completion_ids.new_tensor(0.0, dtype=torch.float32)
@@ -308,8 +314,9 @@ class LigerGRPOLossComputer:
             global_is_cispo_clipped=global_is_cispo_clipped,
             global_advantages=global_advantages,
             reward_names=self.module.config.reward.active.reward_funcs,
-            moe_outputs=moe_metrics,
+            moe_outputs=moe_outputs,
         )
+        metrics.update(aux_metrics)
 
         return loss, metrics
 
@@ -331,6 +338,7 @@ class LigerCELossComputer:
 
         self.model = model
         self.loss_parallel_enabled = loss_parallel_enabled
+        self.aux_loss_computer = MoEAuxLossComputer(model)
 
     def _get_last_hidden_state(
         self,
@@ -339,7 +347,7 @@ class LigerCELossComputer:
         attention_mask: torch.Tensor,
         logits_to_keep: int,
         output_router_logits: bool = True,
-    ) -> tuple[torch.Tensor, Any]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Forward pass to get last hidden state without computing logits."""
         outputs = get_transformer_backbone_model(model)(
             input_ids=input_ids,
@@ -358,7 +366,7 @@ class LigerCELossComputer:
         labels: torch.Tensor,
         ignore_index: int = -100,
         label_smoothing: float = 0.0,
-    ) -> tuple[torch.Tensor, Any]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute CE loss using Liger Kernel's fused linear + cross-entropy.
 
         Instead of materializing the full [batch*seq, vocab] logits tensor, this
@@ -381,7 +389,7 @@ class LigerCELossComputer:
         logits_to_keep = labels.shape[1] - 1
 
         # Shift for next-token prediction: hidden_states[:-1] predicts labels[1:]
-        shift_hidden, moe_metrics = self._get_last_hidden_state(
+        shift_hidden, moe_outputs = self._get_last_hidden_state(
             self.model,
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -408,4 +416,9 @@ class LigerCELossComputer:
             label_smoothing=label_smoothing,
         )
         loss = loss_fn(weight, shift_hidden_2d, shift_labels_1d, bias)
-        return loss, moe_metrics
+        metrics = collect_moe_metrics(moe_outputs)
+        aux_loss, aux_metrics = self.aux_loss_computer.compute(moe_outputs, attention_mask)
+        if aux_loss is not None:
+            loss = loss + aux_loss.to(loss.device)
+        metrics.update(aux_metrics)
+        return loss, metrics

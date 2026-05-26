@@ -117,6 +117,7 @@ class VLLMRolloutEngine(RolloutEngine):
         model_name_or_path: str,
         tokenizer: PreTrainedTokenizerBase,
         sampling_config_path: Optional[str] = None,
+        max_completion_length: int = 2048,
         world_size: int = 1,
         local_rank: int = 0,
         global_rank: int = 0,
@@ -129,6 +130,7 @@ class VLLMRolloutEngine(RolloutEngine):
         self.local_rank = local_rank
         self.global_rank = global_rank
         self.is_main_process = (global_rank == 0)
+        self.max_completion_length = int(max_completion_length)
 
         # Load generation config
         self.generation_config = _load_generation_config(
@@ -242,7 +244,7 @@ class VLLMRolloutEngine(RolloutEngine):
             "temperature": gen_config.temperature if gen_config.temperature else 1.0,
             "top_p": gen_config.top_p if gen_config.top_p else 1.0,
             "top_k": gen_config.top_k if gen_config.top_k else -1,
-            "max_tokens": gen_config.max_new_tokens if gen_config.max_new_tokens else 2048,
+            "max_tokens": gen_config.max_new_tokens if gen_config.max_new_tokens else self.max_completion_length,
             "repetition_penalty": config.repetition_penalty,
             "logprobs": config.logprobs,
         }

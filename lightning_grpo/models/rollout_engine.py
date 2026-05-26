@@ -109,12 +109,14 @@ class PolicyRolloutEngine(RolloutEngine):
         policy_model: torch.nn.Module,
         tokenizer: PreTrainedTokenizerBase,
         sampling_config_path: Optional[str],
+        max_completion_length: int,
         generation_batch_size: int = 0,
         output_router_logits: bool = False,
     ) -> None:
         self.policy_model = policy_model
         self.tokenizer = tokenizer
         self.generation_config = _load_generation_config(sampling_config_path, policy_model.generation_config)
+        self.max_completion_length = int(max_completion_length)
         self.generation_batch_size = max(0, int(generation_batch_size))
         self.output_router_logits = output_router_logits
 
@@ -183,6 +185,8 @@ class PolicyRolloutEngine(RolloutEngine):
             for key, value in self.generation_config.to_dict().items()
             if key not in self._GENERATION_CONFIG_OVERRIDE_KEYS and value is not None
         }
+        generation_config.pop("max_length", None)
+        generation_config["max_new_tokens"] = self.max_completion_length
         generation_config["num_return_sequences"] = num_generations
         generation_config.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         generation_config.setdefault("eos_token_id", self.tokenizer.eos_token_id)
@@ -368,6 +372,7 @@ def create_rollout_engine(
     policy_model: torch.nn.Module,
     tokenizer: PreTrainedTokenizerBase,
     sampling_config_path: Optional[str] = None,
+    max_completion_length: int = 2048,
     generation_batch_size: int = 0,
     reward_model_config: Optional[RewardModelConfig] = None,
     vllm_config: Optional[Any] = None,
@@ -384,6 +389,7 @@ def create_rollout_engine(
             policy_model=policy_model,
             tokenizer=tokenizer,
             sampling_config_path=sampling_config_path,
+            max_completion_length=max_completion_length,
             generation_batch_size=generation_batch_size,
         )
     if engine_type == "vllm":
@@ -398,6 +404,7 @@ def create_rollout_engine(
             model_name_or_path=model_name_or_path,
             tokenizer=tokenizer,
             sampling_config_path=sampling_config_path,
+            max_completion_length=max_completion_length,
             world_size=world_size,
             local_rank=local_rank,
             global_rank=global_rank,

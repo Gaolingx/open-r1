@@ -73,7 +73,7 @@ class PretrainLightningModule(L.LightningModule):
         """Run one optimization/evaluation step and log metrics."""
 
         labels = batch["labels"]
-        use_liger = self.config.use_liger_kernel
+        use_liger = self.config.liger_kernel.enabled
         outputs = None
 
         if use_liger:
@@ -84,7 +84,6 @@ class PretrainLightningModule(L.LightningModule):
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
                 loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
-                output_router_logits=True,
             )
         elif self.config.distributed.tensor_parallel.loss_parallel:
             outputs = self._model_forward(batch)
