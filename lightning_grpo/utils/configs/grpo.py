@@ -25,6 +25,11 @@ class GRPODataConfig(ChatDataConfig):
 class GRPORolloutConfig:
     """Rollout and policy-gradient hyperparameters for GRPO."""
 
+    engine: Literal["torch", "sglang"] = "torch"
+    sglang_base_url: str = "http://localhost:8998"
+    sglang_model_path: Optional[str] = None
+    sglang_shared_path: str = "./sglang_ckpt_grpo"
+    sglang_timeout: int = 120
     num_generations: int = 4
     max_prompt_length: int = 1024
     max_completion_length: int = 1024

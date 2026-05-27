@@ -9,14 +9,32 @@ from typing import Any
 import torch
 
 from lightning_grpo.models.common import compute_per_token_logps
+from lightning_grpo.models.grpo.rollout_engine import create_rollout_engine
 from lightning_grpo.models.grpo.reward import execute_tool, parse_tool_calls
 from lightning_grpo.data.base import apply_chat_template
 
 class LocalGenerateRolloutCoordinator:
-    """Generate on-policy rollouts locally with ``model.generate``."""
+    """Coordinate GRPO rollouts through the configured inference engine."""
 
     def __init__(self, module: Any) -> None:
         self.module = module
+        rollout_config = module.config.rollout
+        sglang_model_path = rollout_config.sglang_model_path or module.config.model.tokenizer_name_or_path or module.config.model.model_name_or_path
+        self.rollout_engine = create_rollout_engine(
+            engine_type=rollout_config.engine,
+            policy_model=module.policy,
+            tokenizer=module.tokenizer,
+            device=str(module.device),
+            sglang_base_url=rollout_config.sglang_base_url,
+            sglang_model_path=sglang_model_path,
+            sglang_shared_path=rollout_config.sglang_shared_path,
+            sglang_timeout=rollout_config.sglang_timeout,
+        )
+
+    def update_policy(self) -> None:
+        """Refresh the rollout engine's policy weights or model handle."""
+
+        self.rollout_engine.update_policy(self.module.policy)
 
     def resolve_num_generations(self, training: bool) -> int:
         """Return the number of completions sampled per prompt."""
@@ -51,42 +69,24 @@ class LocalGenerateRolloutCoordinator:
             tokenizer.padding_side = old_padding_side
         return {key: value.to(self.module.device) for key, value in encoded.items()}
 
+    def _generate(self, prompts: list[str], *, num_generations: int = 1) -> tuple[torch.Tensor, torch.Tensor, list[str], torch.Tensor]:
+        """Generate completions with the configured rollout engine."""
+
+        encoded = self._tokenize_prompts(prompts)
+        result = self.rollout_engine.rollout(
+            prompt_ids=encoded["input_ids"],
+            attention_mask=encoded["attention_mask"],
+            num_generations=num_generations,
+            max_new_tokens=self.module.config.rollout.max_completion_length,
+            temperature=self.module.config.rollout.temperature,
+        )
+        return result.completion_ids, result.completion_mask, result.completions, result.per_token_logps
+
     @torch.no_grad()
     def _generate_once(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
         """Generate one completion for each prompt and return padded completion ids."""
 
-        tokenizer = self.module.tokenizer
-        encoded = self._tokenize_prompts(prompts)
-        generation_kwargs = {
-            "max_new_tokens": self.module.config.rollout.max_completion_length,
-            "do_sample": self.module.config.rollout.temperature > 0,
-            "temperature": self.module.config.rollout.temperature,
-            "top_p": self.module.config.rollout.top_p,
-            "pad_token_id": tokenizer.pad_token_id,
-            "eos_token_id": tokenizer.eos_token_id,
-        }
-        outputs = self.module.policy.generate(
-            input_ids=encoded["input_ids"],
-            attention_mask=encoded["attention_mask"],
-            output_router_logits=False,
-            **generation_kwargs,
-        )
-
-        input_width = encoded["input_ids"].size(1)
-        completion_rows: list[torch.Tensor] = []
-        completion_texts: list[str] = []
-        for row in outputs:
-            completion = row[input_width:]
-            if completion.numel() == 0:
-                completion = row.new_tensor([tokenizer.eos_token_id or tokenizer.pad_token_id])
-            completion_rows.append(completion)
-            completion_texts.append(tokenizer.decode(completion, skip_special_tokens=True))
-        completion_ids = torch.nn.utils.rnn.pad_sequence(
-            completion_rows,
-            batch_first=True,
-            padding_value=tokenizer.pad_token_id,
-        )
-        completion_mask = (completion_ids != tokenizer.pad_token_id).long()
+        completion_ids, completion_mask, completion_texts, _ = self._generate(prompts, num_generations=1)
         return completion_ids, completion_mask, completion_texts
 
     def _render_messages(self, messages: list[dict[str, Any]], tools: Any, *, add_generation_prompt: bool, open_thinking: bool) -> str:
@@ -113,7 +113,7 @@ class LocalGenerateRolloutCoordinator:
 
         prompts = list(batch["prompt_text"])
         expanded_prompts = [prompt for prompt in prompts for _ in range(num_generations)]
-        completion_ids, completion_mask, completions = self._generate_once(expanded_prompts)
+        completion_ids, completion_mask, completions, old_logps = self._generate(prompts, num_generations=num_generations)
         metadata = []
         for index, completion in enumerate(completions):
             sample_index = index // num_generations
@@ -125,7 +125,15 @@ class LocalGenerateRolloutCoordinator:
                     "unfinished": False,
                 }
             )
-        return self._pack_rollout(expanded_prompts, completion_ids, completion_mask, completions, metadata, num_generations=num_generations)
+        return self._pack_rollout(
+            expanded_prompts,
+            completion_ids,
+            completion_mask,
+            completions,
+            metadata,
+            num_generations=num_generations,
+            old_per_token_logps=old_logps,
+        )
 
     def _rollout_agentic(self, batch: dict[str, list[Any]], *, num_generations: int) -> dict[str, Any]:
         """Run multi-turn local tool-call rollouts and mask tool observations from loss."""
@@ -205,6 +213,7 @@ class LocalGenerateRolloutCoordinator:
         completions: list[str],
         metadata: list[dict[str, Any]],
         num_generations: int,
+        old_per_token_logps: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Pack generated samples into tensors consumed by the GRPO loss."""
 
@@ -226,8 +235,11 @@ class LocalGenerateRolloutCoordinator:
             max_completion = 1
         completion_ids = completion_ids[:, :max_completion]
         completion_mask = completion_mask[:, :max_completion]
-        with torch.no_grad():
-            old_logps = compute_per_token_logps(self.module, prompt_ids, prompt_mask, completion_ids, completion_mask)
+        if old_per_token_logps is not None:
+            old_logps = old_per_token_logps[:, :max_completion].to(self.module.device) * completion_mask.to(old_per_token_logps.dtype)
+        else:
+            with torch.no_grad():
+                old_logps = compute_per_token_logps(self.module, prompt_ids, prompt_mask, completion_ids, completion_mask)
         completion_truncated = (completion_mask.sum(dim=1) >= max_completion).to(torch.long)
         sample_ids = torch.arange(completion_ids.size(0), device=self.module.device) // num_generations
 

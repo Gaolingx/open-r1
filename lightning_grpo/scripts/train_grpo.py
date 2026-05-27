@@ -53,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_gen_len", type=int, default=None, help="Maximum new tokens per rollout turn")
     parser.add_argument("--thinking_ratio", type=float, default=None, help="Probability of enabling reasoning/thinking mode")
     parser.add_argument("--mode", type=str, default=None, choices=["reasoning", "agentic"], help="GRPO data/rollout mode")
+    parser.add_argument("--rollout_engine", type=str, default=None, choices=["torch", "sglang"], help="Rollout inference engine")
+    parser.add_argument("--sglang_base_url", type=str, default=None, help="SGLang server URL")
+    parser.add_argument("--sglang_model_path", type=str, default=None, help="Tokenizer/model path used by SGLang")
+    parser.add_argument("--sglang_shared_path", type=str, default=None, help="Shared checkpoint path for SGLang weight updates")
+    parser.add_argument("--sglang_timeout", type=int, default=None, help="SGLang HTTP timeout in seconds")
     return parser.parse_args()
 
 
@@ -83,6 +88,16 @@ def main() -> None:
         config.data.thinking_ratio = args.thinking_ratio
     if args.mode is not None:
         config.data.mode = args.mode
+    if args.rollout_engine is not None:
+        config.rollout.engine = args.rollout_engine
+    if args.sglang_base_url is not None:
+        config.rollout.sglang_base_url = args.sglang_base_url
+    if args.sglang_model_path is not None:
+        config.rollout.sglang_model_path = args.sglang_model_path
+    if args.sglang_shared_path is not None:
+        config.rollout.sglang_shared_path = args.sglang_shared_path
+    if args.sglang_timeout is not None:
+        config.rollout.sglang_timeout = args.sglang_timeout
 
     L.seed_everything(config.seed, workers=True)
     data_module = GRPODataModule(

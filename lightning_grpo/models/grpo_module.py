@@ -70,6 +70,7 @@ class GRPOLightningModule(L.LightningModule):
         configure_tensor_parallel(self.policy, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.policy, self.config.distributed, self.config.precision, self.device_mesh)
         self.policy = compile_model_if_configured(self.policy, self.config.model)
+        self.rollout_coordinator.update_policy()
         if self.reference_model is not None:
             configure_tensor_parallel(self.reference_model, self.config.distributed, self.device_mesh)
             configure_fully_shard(self.reference_model, self.config.distributed, self.config.precision, self.device_mesh)
@@ -131,6 +132,12 @@ class GRPOLightningModule(L.LightningModule):
         """Compute one on-policy GRPO training step."""
 
         return self._shared_step(batch, "train")
+
+    def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
+        """Refresh external rollout-engine weights after optimizer updates."""
+
+        if self.config.rollout.engine == "sglang":
+            self.rollout_coordinator.update_policy()
 
     def validation_step(self, batch: dict[str, list[Any]], batch_idx: int) -> torch.Tensor:
         """Run validation rollouts with one completion per prompt."""
