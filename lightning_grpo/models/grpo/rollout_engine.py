@@ -51,6 +51,7 @@ class TorchRolloutEngine(RolloutEngine):
     def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
         model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
         model = getattr(model, '_orig_mod', model)
+
         ctx = self.autocast_ctx if self.autocast_ctx else nullcontext()
         with torch.no_grad(), ctx:
             output_ids = model.generate(
@@ -64,6 +65,8 @@ class TorchRolloutEngine(RolloutEngine):
                 eos_token_id=self.tokenizer.eos_token_id,
                 output_router_logits=False,
             ).clone()
+
+        with torch.no_grad():
             prompt_len = prompt_ids.size(1)
             completion_ids = output_ids[:, prompt_len:]
             expanded_prompt_ids = prompt_ids.repeat_interleave(num_generations, dim=0)
@@ -71,9 +74,7 @@ class TorchRolloutEngine(RolloutEngine):
             completion_mask = (completion_ids != self.tokenizer.pad_token_id).long()
             per_token_logps = compute_per_token_logps(self.policy_model, expanded_prompt_ids, expanded_attention_mask, completion_ids, completion_mask)
         completions = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-        return RolloutResult(output_ids, completion_ids, per_token_logps, completions,
-                             prompt_ids.new_full((output_ids.size(0),), prompt_len),
-                             completion_mask)
+        return RolloutResult(output_ids, completion_ids, per_token_logps, completions, prompt_ids.new_full((output_ids.size(0),), prompt_len), completion_mask)
 
     def update_policy(self, model: torch.nn.Module):
         self.policy_model = model
