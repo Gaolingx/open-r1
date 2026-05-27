@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import inspect
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import lightning as L
 import torch
@@ -18,14 +18,6 @@ from lightning_grpo.models.common import resolve_torch_dtype
 from lightning_grpo.utils.config import load_json_config
 from lightning_grpo.utils.configs.base import ModelConfig, PrecisionConfig
 from lightning_grpo.utils.reflection import import_causal_lm_class
-
-
-def _load_generation_config(sampling_config_path: Optional[str], fallback: GenerationConfig) -> GenerationConfig:
-    """Load rollout sampling config, falling back to the model generation config."""
-
-    if sampling_config_path:
-        return GenerationConfig.from_pretrained(pretrained_model_name=sampling_config_path)
-    return GenerationConfig.from_dict(fallback.to_dict())
 
 
 def _freeze_embeddings_if_needed(model: PreTrainedModel, freeze_embeddings: bool) -> None:

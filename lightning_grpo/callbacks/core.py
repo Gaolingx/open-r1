@@ -18,7 +18,7 @@ from transformers.optimization import get_scheduler
 
 from lightning_grpo.models.common import save_pth_weights, load_tokenizer
 from lightning_grpo.utils.configs.base import LoggingConfig, ModelConfig, TrainingBaseConfig
-from lightning_grpo.utils.modeling import resolve_export_model, _load_generation_config
+from lightning_grpo.utils.modeling import resolve_export_model
 from lightning_grpo.utils.config import save_json_config
 
 
@@ -336,7 +336,6 @@ class PeriodicSampleGenerationCallback(Callback):
         completion_ids = generated_ids[:, prompt_length:]
         return tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
 
-    @rank_zero_only
     def on_train_batch_end(
         self,
         trainer: L.Trainer,
@@ -362,7 +361,6 @@ class PeriodicSampleGenerationCallback(Callback):
         attention_mask = tokenized["attention_mask"].to(device)
 
         model = resolve_export_model(pl_module)
-        generation_config = _load_generation_config(self.model_config.model_generation_config_path, model.generation_config)
         was_training = bool(model.training) if model is not None else bool(pl_module.training)
         if model is not None:
             model.eval()
@@ -374,7 +372,10 @@ class PeriodicSampleGenerationCallback(Callback):
                 generated_ids = model.generate(
                     input_ids=prompt_ids,
                     attention_mask=attention_mask,
-                    generation_config=generation_config,
+                    max_new_tokens=self.logging_config.sample_max_token,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
                     output_router_logits=False,
                 )
         finally:

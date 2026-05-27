@@ -170,6 +170,7 @@ class LoggingConfig:
     enable_csv: bool = True
     sample_prompts: list[str] = field(default_factory=list)
     sample_every_n_steps: int = 0
+    sample_max_token: int = 128
 
 
 @dataclass
