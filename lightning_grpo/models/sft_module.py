@@ -58,6 +58,8 @@ class SFTLightningModule(L.LightningModule):
         if self.config.liger_kernel.enabled:
             self._liger_loss_computer = LigerCELossComputer(
                 self.model,
+                ignore_index=self.config.data.ignore_index,
+                label_smoothing=self.config.label_smoothing,
                 loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
             )
 

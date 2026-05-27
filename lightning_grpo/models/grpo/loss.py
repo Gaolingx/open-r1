@@ -119,8 +119,6 @@ def compute_liger_cross_entropy_loss(
     return liger_loss_computer.compute_loss(
         batch=batch,
         labels=labels,
-        ignore_index=ignore_index,
-        label_smoothing=label_smoothing,
     )
 
 

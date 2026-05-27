@@ -81,15 +81,6 @@ def _get_last_hidden_state(
     return last_hidden_state, outputs
 
 
-def is_liger_kernel_available() -> bool:
-    """Check if liger-kernel is installed."""
-    try:
-        from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 class LigerDPOLossComputer:
     """Compute DPO loss using Liger Kernel's fused linear + DPOLoss kernel."""
 
@@ -198,6 +189,7 @@ class LigerDPOLossComputer:
             **moe_metrics,
         }
 
+
 class LigerCELossComputer:
     """Compute cross entropy loss using Liger Kernel's fused linear + CELoss kernel."""
 
@@ -205,24 +197,30 @@ class LigerCELossComputer:
         self,
         model: torch.nn.Module,
         *,
+        ignore_index: int = -100,
+        label_smoothing: float = 0.0,
         loss_parallel_enabled: bool = False,
     ) -> None:
-        if not is_liger_kernel_available():
+        try:
+            from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+        except ImportError as e:
             raise ImportError(
-                "Liger Kernel is required for fused cross entropy loss. "
+                "LigerFusedLinearCrossEntropyLoss requires liger-kernel. "
                 "Install it with: pip install liger-kernel"
-            )
+            ) from e
 
         self.model = model
         self.loss_parallel_enabled = loss_parallel_enabled
         self.aux_loss_computer = MoEAuxLossComputer(model)
+        self.loss_fn = LigerFusedLinearCrossEntropyLoss(
+            ignore_index=ignore_index,
+            label_smoothing=label_smoothing,
+        )
 
     def compute_loss(
         self,
         batch: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        ignore_index: int = -100,
-        label_smoothing: float = 0.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute CE loss using Liger Kernel's fused linear + cross-entropy.
 
@@ -239,8 +237,6 @@ class LigerCELossComputer:
         Returns:
             Tuple of scalar loss tensor and MoE metrics.
         """
-        from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-
         input_ids = batch["input_ids"]
         attention_mask = batch.get("attention_mask", torch.ones_like(input_ids))
         logits_to_keep = labels.shape[1] - 1
@@ -267,12 +263,7 @@ class LigerCELossComputer:
             loss_parallel_enabled=self.loss_parallel_enabled,
         )
 
-        # Use Liger fused kernel
-        loss_fn = LigerFusedLinearCrossEntropyLoss(
-            ignore_index=ignore_index,
-            label_smoothing=label_smoothing,
-        )
-        loss = loss_fn(weight, shift_hidden_2d, shift_labels_1d, bias)
+        loss = self.loss_fn(weight, shift_hidden_2d, shift_labels_1d, bias)
         metrics = collect_moe_metrics(moe_outputs)
         aux_loss, aux_metrics = self.aux_loss_computer.compute(moe_outputs, attention_mask)
         if aux_loss is not None:
@@ -300,13 +291,13 @@ class LigerGRPOLossComputer:
         rollout_temperature: float,
         loss_parallel_enabled: bool = False,
     ) -> None:
-        if not is_liger_kernel_available():
+        try:
+            from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
+        except ImportError as e:
             raise ImportError(
-                "Liger Kernel is required for fused GRPO loss. "
+                "LigerFusedLinearGRPOLoss requires liger-kernel. "
                 "Install it with: pip install liger-kernel"
-            )
-
-        from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
+            ) from e
 
         self.module = module
         self.reward_manager = reward_manager
