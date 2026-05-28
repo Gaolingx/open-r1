@@ -53,9 +53,6 @@ class GRPORolloutCollator:
             "attention_mask": tokenized["attention_mask"],
             "prompt_text": prompts,
             "metadata": metadata,
-            "messages": [item.get("messages") for item in batch],
-            "tools": [item.get("tools") for item in batch],
-            "mode": [item.get("mode") for item in batch],
             "sample_id": torch.tensor([int(item["sample_id"]) for item in batch], dtype=torch.long),
         }
 
@@ -125,14 +122,7 @@ class GRPODataModule(ChatTemplateDataModule):
                 if solution is not None:
                     reward_metadata.setdefault("solution", solution)
                 metadata.append(json.dumps(reward_metadata, ensure_ascii=False))
-            return {
-                "prompt_text": prompt_texts,
-                "metadata": metadata,
-                "messages": batch.get(getattr(self.data_config, "messages_column", "messages"), [None] * len(prompt_texts)),
-                "tools": batch.get("tools", [None] * len(prompt_texts)),
-                "mode": batch.get("mode", [self.data_config.mode] * len(prompt_texts)),
-                "sample_id": indices,
-            }
+            return {"prompt_text": prompt_texts, "metadata": metadata, "sample_id": indices}
 
         return self.map_dataset(
             dataset,

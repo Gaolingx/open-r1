@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import json
-import random
 from typing import Any
 
 import torch
 
 from lightning_grpo.models.common import compute_per_token_logps
 from lightning_grpo.models.grpo.rollout_engine import create_rollout_engine
-from lightning_grpo.models.grpo.tools import execute_tool, parse_tool_calls
 from lightning_grpo.data.base import apply_chat_template
 
 class LocalGenerateRolloutCoordinator:
@@ -158,87 +156,6 @@ class LocalGenerateRolloutCoordinator:
             num_generations=num_generations,
         )
 
-    def _rollout_agentic(self, batch: dict[str, list[Any]], *, num_generations: int) -> dict[str, Any]:
-        """Run multi-turn local tool-call rollouts and mask tool observations from loss."""
-
-        tokenizer = self.module.tokenizer
-        all_prompts: list[str] = []
-        response_ids_batch: list[list[int]] = []
-        response_masks_batch: list[list[int]] = []
-        completions: list[str] = []
-        metadata: list[dict[str, Any]] = []
-        batch_metadata = self._batch_metadata(batch)
-        batch_messages = batch.get("messages") or [None] * len(batch.get("prompt_text", []))
-
-        for sample_index, messages in enumerate(batch_messages):
-            base_metadata = batch_metadata[sample_index] if sample_index < len(batch_metadata) else {}
-            tools = base_metadata.get("tools") or (batch.get("tools", [None] * len(batch_messages))[sample_index] if batch.get("tools") else None)
-            if messages is None:
-                messages = base_metadata.get("messages")
-            if messages is None:
-                prompt_text = batch.get("prompt_text", [""] * len(batch_messages))[sample_index]
-                messages = [{"role": "user", "content": prompt_text}]
-            for _ in range(num_generations):
-                chat_state = [dict(message) for message in messages]
-                open_thinking = random.random() < self.module.config.data.thinking_ratio
-                initial_prompt = self._render_messages(chat_state, tools, add_generation_prompt=True, open_thinking=open_thinking)
-                response_ids: list[int] = []
-                response_mask: list[int] = []
-                turn_outputs: list[str] = []
-                unfinished = False
-
-                for turn in range(self.module.config.rollout.max_turns):
-                    context = self._render_messages(chat_state, tools, add_generation_prompt=True, open_thinking=open_thinking)
-                    turn_ids, _, turn_texts = self._generate_once([context])
-                    generated_ids = [token for token in turn_ids[0].tolist() if token != tokenizer.pad_token_id]
-                    turn_text = turn_texts[0]
-                    turn_outputs.append(turn_text)
-                    response_ids.extend(generated_ids)
-                    response_mask.extend([1] * len(generated_ids))
-
-                    calls = parse_tool_calls(turn_text)
-                    if not calls:
-                        break
-                    unfinished = turn == self.module.config.rollout.max_turns - 1
-                    chat_state.append({"role": "assistant", "content": turn_text})
-                    for call in calls:
-                        name = call.get("name", "")
-                        raw_args = call.get("arguments", {})
-                        if isinstance(raw_args, str):
-                            try:
-                                raw_args = json.loads(raw_args)
-                            except json.JSONDecodeError:
-                                raw_args = {}
-                        result = execute_tool(name, raw_args)
-                        result_str = (json.dumps(result, ensure_ascii=False) if result is not None else '{"error": "tool not found"}')[:2048]
-                        chat_state.append({"role": "tool", "content": result_str})
-                    observation = self._render_messages(chat_state, tools, add_generation_prompt=not unfinished, open_thinking=open_thinking)
-                    observation_ids = tokenizer(observation, add_special_tokens=False).input_ids
-                    current_len = len(tokenizer(initial_prompt, add_special_tokens=False).input_ids) + len(response_ids)
-                    obs_delta = observation_ids[current_len:]
-                    response_ids.extend(obs_delta)
-                    response_mask.extend([0] * len(obs_delta))
-
-                all_prompts.append(initial_prompt)
-                if not response_ids:
-                    fallback_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
-                    response_ids.append(fallback_token_id)
-                    response_mask.append(1)
-                response_ids_batch.append(response_ids)
-                response_masks_batch.append(response_mask)
-                completion = turn_outputs[-1] if turn_outputs else ""
-                completions.append(completion)
-                rollout_metadata = self._metadata_for_generation(base_metadata, completion, turn_outputs, unfinished)
-                if tools is not None:
-                    rollout_metadata["tools"] = tools
-                metadata.append(rollout_metadata)
-
-        padded_ids = [torch.tensor(ids, dtype=torch.long, device=self.module.device) for ids in response_ids_batch]
-        padded_masks = [torch.tensor(mask, dtype=torch.long, device=self.module.device) for mask in response_masks_batch]
-        completion_ids = torch.nn.utils.rnn.pad_sequence(padded_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
-        completion_mask = torch.nn.utils.rnn.pad_sequence(padded_masks, batch_first=True, padding_value=0)
-        return self._pack_rollout(all_prompts, completion_ids, completion_mask, completions, metadata, num_generations=num_generations)
-
     def _pack_rollout(
         self,
         prompts: list[str],
@@ -292,10 +209,5 @@ class LocalGenerateRolloutCoordinator:
         }
 
     def rollout(self, batch: dict[str, list[Any]], *, training: bool) -> dict[str, Any]:
-        """Dispatch to reasoning or agentic rollout mode."""
-
         num_generations = self.resolve_num_generations(training)
-        modes = set(batch.get("mode", [self.module.config.data.mode]))
-        if "agentic" in modes or self.module.config.data.mode == "agentic":
-            return self._rollout_agentic(batch, num_generations=num_generations)
         return self._rollout_reasoning(batch, num_generations=num_generations)

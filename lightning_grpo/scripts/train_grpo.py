@@ -51,8 +51,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory")
     parser.add_argument("--num_generations", type=int, default=None, help="Rollouts sampled per prompt")
     parser.add_argument("--max_gen_len", type=int, default=None, help="Maximum new tokens per rollout turn")
-    parser.add_argument("--thinking_ratio", type=float, default=None, help="Probability of enabling reasoning/thinking mode")
-    parser.add_argument("--mode", type=str, default=None, choices=["reasoning", "agentic"], help="GRPO data/rollout mode")
     parser.add_argument("--rollout_engine", type=str, default=None, choices=["torch", "sglang"], help="Rollout inference engine")
     parser.add_argument("--sglang_base_url", type=str, default=None, help="SGLang server URL")
     parser.add_argument("--sglang_model_path", type=str, default=None, help="Tokenizer/model path used by SGLang")
@@ -84,10 +82,6 @@ def main() -> None:
         config.rollout.num_generations = args.num_generations
     if args.max_gen_len is not None:
         config.rollout.max_completion_length = args.max_gen_len
-    if args.thinking_ratio is not None:
-        config.data.thinking_ratio = args.thinking_ratio
-    if args.mode is not None:
-        config.data.mode = args.mode
     if args.rollout_engine is not None:
         config.rollout.engine = args.rollout_engine
     if args.sglang_base_url is not None:

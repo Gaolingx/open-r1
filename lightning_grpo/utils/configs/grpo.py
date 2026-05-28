@@ -13,9 +13,6 @@ from lightning_grpo.utils.configs.sft import ChatDataConfig
 class GRPODataConfig(ChatDataConfig):
     """Dataset configuration for prompt-only RL and agentic tool-use RL."""
 
-    mode: Literal["reasoning", "agentic"] = "reasoning"
-    thinking_ratio: float = 0.5
-
 
 @dataclass
 class GRPORewardConfig:

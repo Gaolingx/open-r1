@@ -67,12 +67,10 @@ data:
   prompt_column: prompt
   response_column: response
   messages_column: conversations
-  gt_column: gt
   tools_column: tools
   dataset_format: auto
   add_generation_prompt: true
   add_system_ratio: 0.0
-  empty_think_ratio: 0.2
   thinking_ratio: 0.9
   max_seq_length: 2048
   num_workers: 0
