@@ -45,7 +45,6 @@ class GRPOLightningModule(L.LightningModule):
         self.rollout_coordinator = LocalGenerateRolloutCoordinator(self)
         self.metrics_aggregator = GRPOMetricsAggregator(self)
         self.reward_manager = GRPORewardManager(config, self.tokenizer, device=self.device)
-        self.reward_weights = torch.tensor(config.reward.active.weights, dtype=torch.float32)
         self._liger_loss_computer: LigerGRPOLossComputer | None = None
         self._standard_loss_computer: StandardGRPOLossComputer | None = None
 
@@ -97,7 +96,6 @@ class GRPOLightningModule(L.LightningModule):
 
         rollout_batch = self.rollout_coordinator.rollout(batch, training=stage == "train")
         self.reward_manager.device = self.device
-        self.reward_weights = self.reward_weights.to(self.device)
         if self.config.liger_kernel.enabled:
             if self._liger_loss_computer is None:
                 raise RuntimeError("GRPO loss computer is not initialized. Call configure_model() first.")

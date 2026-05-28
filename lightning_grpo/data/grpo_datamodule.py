@@ -53,6 +53,9 @@ class GRPORolloutCollator:
             "attention_mask": tokenized["attention_mask"],
             "prompt_text": prompts,
             "metadata": metadata,
+            "messages": [item.get("messages") for item in batch],
+            "tools": [item.get("tools") for item in batch],
+            "mode": [item.get("mode") for item in batch],
             "sample_id": torch.tensor([int(item["sample_id"]) for item in batch], dtype=torch.long),
         }
 
@@ -93,27 +96,12 @@ class GRPODataModule(ChatTemplateDataModule):
         """Build prompt text plus reward metadata for online optimization."""
 
         response_column = getattr(self.data_config, "response_column", "solution")
-        messages_column = getattr(self.data_config, "messages_column", "messages")
 
         def resolve_solution(sample: dict[str, Any]) -> Any:
-            for key in (response_column, "gt", "solution", "answer", "response", "output"):
+            for key in (response_column, "solution", "answer", "response", "output"):
                 if key in sample and sample[key] is not None:
-                    if key == "gt" and sample[key] == []:
-                        continue
                     return sample[key]
             return None
-
-        @staticmethod
-        def is_empty_assistant_turn(message: dict[str, Any]) -> bool:
-            content = message.get("content")
-            return message.get("role") == "assistant" and content in (None, "")
-
-        def build_generation_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            """Drop the dataset's empty assistant placeholder before rendering rollout prompts."""
-
-            if messages and is_empty_assistant_turn(messages[-1]):
-                return messages[:-1]
-            return messages
 
         def preprocess_batch(batch: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
             prompt_texts: list[str] = []
@@ -121,27 +109,30 @@ class GRPODataModule(ChatTemplateDataModule):
             for sample in self.iter_batch_samples(batch):
                 formatted = formatter(sample)
                 messages, tools = self.chat_processor.prepare_sample(formatted)
-                messages = build_generation_messages(messages)
                 prompt_texts.append(
                     self.chat_processor.render(
                         messages,
-                        add_generation_prompt=self.chat_processor.should_add_generation_prompt(
-                            messages,
-                            getattr(self.data_config, "add_generation_prompt", True),
-                        ),
+                        add_generation_prompt=getattr(self.data_config, "add_generation_prompt", True),
                         tools=tools,
                     )
                 )
                 reward_metadata = {
                     key: value
                     for key, value in sample.items()
-                    if key not in {messages_column, "messages", "conversations"}
+                    if key != getattr(self.data_config, "messages_column", "messages")
                 }
                 solution = resolve_solution(sample)
                 if solution is not None:
                     reward_metadata.setdefault("solution", solution)
                 metadata.append(json.dumps(reward_metadata, ensure_ascii=False))
-            return {"prompt_text": prompt_texts, "metadata": metadata, "sample_id": indices}
+            return {
+                "prompt_text": prompt_texts,
+                "metadata": metadata,
+                "messages": batch.get(getattr(self.data_config, "messages_column", "messages"), [None] * len(prompt_texts)),
+                "tools": batch.get("tools", [None] * len(prompt_texts)),
+                "mode": batch.get("mode", [self.data_config.mode] * len(prompt_texts)),
+                "sample_id": indices,
+            }
 
         return self.map_dataset(
             dataset,

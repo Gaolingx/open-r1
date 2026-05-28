@@ -139,15 +139,7 @@ class SFTDataModule(ChatTemplateDataModule):
 
         tokenizer = self.tokenizer
         chat_processor = self.chat_processor
-        max_seq_length = self.data_config.max_seq_length
-        completion_only_loss = self.data_config.completion_only_loss
-        assistant_only_loss = self.data_config.assistant_only_loss
-        ignore_index = self.data_config.ignore_index
-        add_generation_prompt_config = self.data_config.add_generation_prompt
-        assistant_response_template_ids_config = self.data_config.assistant_response_template_ids
-        assistant_response_template = self.data_config.assistant_response_template
-        instruction_template_ids_config = self.data_config.instruction_template_ids
-        instruction_template = self.data_config.instruction_template
+        data_config = self.data_config
 
         iter_batch_samples = self.iter_batch_samples
         extract_assistant_mask = self._extract_assistant_mask
@@ -156,21 +148,21 @@ class SFTDataModule(ChatTemplateDataModule):
         message_has_text = self._message_has_text
 
         def assistant_response_template_ids() -> list[int]:
-            if assistant_response_template_ids_config is not None:
-                return list(assistant_response_template_ids_config)
-            if assistant_response_template is None:
+            if data_config.assistant_response_template_ids is not None:
+                return list(data_config.assistant_response_template_ids)
+            if data_config.assistant_response_template is None:
                 return []
-            return list(tokenizer.encode(assistant_response_template, add_special_tokens=False))
+            return list(tokenizer.encode(data_config.assistant_response_template, add_special_tokens=False))
 
         def instruction_template_ids() -> list[int]:
-            if instruction_template_ids_config is not None:
-                return list(instruction_template_ids_config)
-            if instruction_template is None:
+            if data_config.instruction_template_ids is not None:
+                return list(data_config.instruction_template_ids)
+            if data_config.instruction_template is None:
                 return []
-            return list(tokenizer.encode(instruction_template, add_special_tokens=False))
+            return list(tokenizer.encode(data_config.instruction_template, add_special_tokens=False))
 
         def should_add_generation_prompt(messages: list[dict[str, Any]]) -> bool:
-            return chat_processor.should_add_generation_prompt(messages, add_generation_prompt_config)
+            return chat_processor.should_add_generation_prompt(messages, data_config.add_generation_prompt)
 
         def apply_chat_template_tokenize(
             messages: list[dict[str, Any]],
@@ -183,8 +175,9 @@ class SFTDataModule(ChatTemplateDataModule):
                 messages,
                 add_generation_prompt=add_generation_prompt,
                 tools=tools,
-                max_length=max_seq_length,
+                max_length=data_config.max_seq_length,
                 return_assistant_tokens_mask=return_assistant_tokens_mask,
+                empty_think_ratio=data_config.empty_think_ratio,
             )
 
         def split_prompt_and_completion(
@@ -244,7 +237,7 @@ class SFTDataModule(ChatTemplateDataModule):
                 )
 
             all_marker_starts = sorted({*response_starts, *instruction_starts})
-            labels = [ignore_index] * len(full_ids)
+            labels = [data_config.ignore_index] * len(full_ids)
             for response_start in response_starts:
                 label_start = response_start + len(response_template_ids)
                 label_end = next_marker_start(all_marker_starts, response_start, len(full_ids))
@@ -259,19 +252,19 @@ class SFTDataModule(ChatTemplateDataModule):
         ) -> list[int]:
             labels = list(full_ids)
 
-            if completion_only_loss:
+            if data_config.completion_only_loss:
                 completion_mask = completion_mask_from_prompt_len(full_ids, prompt_token_count(messages, tools))
-                labels = [token_id if mask else ignore_index for token_id, mask in zip(labels, completion_mask)]
+                labels = [token_id if mask else data_config.ignore_index for token_id, mask in zip(labels, completion_mask)]
 
-            if assistant_only_loss:
+            if data_config.assistant_only_loss:
                 assistant_mask = extract_assistant_mask(processed or {}) if processed is not None else []
                 if assistant_mask and any(assistant_mask):
                     if len(assistant_mask) != len(full_ids):
                         raise RuntimeError("Assistant token mask length does not match tokenized input length.")
-                    labels = [label if mask else ignore_index for label, mask in zip(labels, assistant_mask)]
+                    labels = [label if mask else data_config.ignore_index for label, mask in zip(labels, assistant_mask)]
                 elif assistant_response_template_ids():
                     assistant_labels = labels_from_response_template(full_ids)
-                    labels = [label if assistant_label != ignore_index else ignore_index for label, assistant_label in zip(labels, assistant_labels)]
+                    labels = [label if assistant_label != data_config.ignore_index else data_config.ignore_index for label, assistant_label in zip(labels, assistant_labels)]
                 else:
                     raise RuntimeError(
                         "assistant_only_loss=True requires tokenizer support for assistant token masks or a configured "
@@ -294,10 +287,10 @@ class SFTDataModule(ChatTemplateDataModule):
 
         def tokenize_sample(sample: dict[str, Any]) -> dict[str, list[int]]:
             messages, tools = chat_processor.prepare_sample(sample)
-            messages = preprocess_chat_messages(messages)
+            messages = preprocess_chat_messages(messages, data_config.add_system_ratio)
             validate_messages_for_training(messages)
             add_generation_prompt = should_add_generation_prompt(messages)
-            needs_assistant_mask = assistant_only_loss
+            needs_assistant_mask = data_config.assistant_only_loss
 
             processed = apply_chat_template_tokenize(
                 messages,
@@ -309,7 +302,7 @@ class SFTDataModule(ChatTemplateDataModule):
             input_ids = list(processed["input_ids"])
             attention_mask = list(processed.get("attention_mask", [1] * len(input_ids)))
             labels = build_labels(messages, tools, input_ids, processed)
-            if not any(label != ignore_index for label in labels):
+            if not any(label != data_config.ignore_index for label in labels):
                 raise SkipSFTSampleError("assistant mask produced no trainable labels")
             return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 

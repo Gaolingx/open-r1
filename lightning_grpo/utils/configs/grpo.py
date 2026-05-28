@@ -14,11 +14,31 @@ class GRPODataConfig(ChatDataConfig):
     """Dataset configuration for prompt-only RL and agentic tool-use RL."""
 
     mode: Literal["reasoning", "agentic"] = "reasoning"
-    gt_column: str = "gt"
-    tools_column: str = "tools"
-    add_system_ratio: float = 0.0
-    empty_think_ratio: float = 0.2
     thinking_ratio: float = 0.5
+
+
+@dataclass
+class GRPORewardConfig:
+    """Reward configuration for GRPO training paradigms."""
+
+    reward_funcs: list[str] = field(default_factory=lambda: ["accuracy", "format", "tag_count"])
+    reward_weights: list[float] | None = None
+    code_language: str = "python"
+    repetition_n_grams: int = 3
+    repetition_max_penalty: float = -1.0
+    cosine_min_value_wrong: float = 0.0
+    cosine_max_value_wrong: float = -0.5
+    cosine_min_value_correct: float = 0.5
+    cosine_max_value_correct: float = 1.0
+    cosine_max_len: int = 1000
+    parallel_code_exec_per_proc: int = 1
+    code_provider: str = "e2b"
+    enforce_same_language: bool = False
+    code_eval_test_batch_size: int = 1
+    code_eval_scoring_mode: str = "weighted_sum"
+    ioi_provider: str = "piston"
+    max_completion_len: int = 16384
+    soft_punish_cache: int = 0
 
 
 @dataclass
@@ -45,28 +65,6 @@ class GRPORolloutConfig:
     use_reference_model: bool = True
     debug_samples: bool = False
     debug_every_n_steps: int = 20
-
-
-@dataclass
-class GRPOActiveRewardConfig:
-    """Active reward function names and scalar weights."""
-
-    reward_funcs: list[str] = field(default_factory=lambda: ["format", "gt"])
-    weights: list[float] = field(default_factory=lambda: [1.0, 1.0])
-
-
-@dataclass
-class GRPORewardConfig:
-    """Reward configuration for reasoning RL and agentic RL."""
-
-    active: GRPOActiveRewardConfig = field(default_factory=GRPOActiveRewardConfig)
-    reward_model: Optional[ModelConfig] = None
-    repetition_ngram: int = 3
-    repetition_cap: float = 0.5
-    min_response_chars: int = 5
-    max_response_chars: int = 800
-    min_think_chars: int = 20
-    max_think_chars: int = 300
 
 
 @dataclass

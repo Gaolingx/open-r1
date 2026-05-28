@@ -15,14 +15,11 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoTokenizer
 
-from lightning_grpo.models.common import compute_per_token_logps
-
 
 @dataclass
 class RolloutResult:
     output_ids: Tensor
     completion_ids: Tensor
-    per_token_logps: Tensor
     completions: List[str]
     prompt_lens: Tensor
     completion_mask: Tensor
@@ -32,7 +29,7 @@ class RolloutEngine(ABC):
     tokenizer = None
 
     @abstractmethod
-    def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
+    def generate(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
         pass
 
     @abstractmethod
@@ -48,7 +45,7 @@ class TorchRolloutEngine(RolloutEngine):
         self.device = device
         self.autocast_ctx = autocast_ctx
 
-    def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
+    def generate(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
         model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
         model = getattr(model, '_orig_mod', model)
 
@@ -66,15 +63,11 @@ class TorchRolloutEngine(RolloutEngine):
                 output_router_logits=False,
             ).clone()
 
-        with torch.no_grad():
-            prompt_len = prompt_ids.size(1)
-            completion_ids = output_ids[:, prompt_len:]
-            expanded_prompt_ids = prompt_ids.repeat_interleave(num_generations, dim=0)
-            expanded_attention_mask = attention_mask.repeat_interleave(num_generations, dim=0)
-            completion_mask = (completion_ids != self.tokenizer.pad_token_id).long()
-            per_token_logps = compute_per_token_logps(self.policy_model, expanded_prompt_ids, expanded_attention_mask, completion_ids, completion_mask)
+        prompt_len = prompt_ids.size(1)
+        completion_ids = output_ids[:, prompt_len:]
+        completion_mask = (completion_ids != self.tokenizer.pad_token_id).long()
         completions = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-        return RolloutResult(output_ids, completion_ids, per_token_logps, completions, prompt_ids.new_full((output_ids.size(0),), prompt_len), completion_mask)
+        return RolloutResult(output_ids, completion_ids, completions, prompt_ids.new_full((output_ids.size(0),), prompt_len), completion_mask)
 
     def update_policy(self, model: torch.nn.Module):
         self.policy_model = model
@@ -89,7 +82,7 @@ class SGLangRolloutEngine(RolloutEngine):
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.http = requests
 
-    def rollout(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
+    def generate(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8) -> RolloutResult:
         input_ids_list = []
         for ids, mask in zip(prompt_ids, attention_mask):
             valid_ids = ids[mask.bool()].tolist()
@@ -103,7 +96,7 @@ class SGLangRolloutEngine(RolloutEngine):
                 "max_new_tokens": max_new_tokens,
                 "stop_token_ids": [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id else [],
             },
-            "return_logprob": True,
+            "return_logprob": False,
         }
 
         resp = self.http.post(f"{self.base_url}/generate", json=payload, timeout=self.timeout)
@@ -113,30 +106,16 @@ class SGLangRolloutEngine(RolloutEngine):
         if not isinstance(results, list):
             results = [results]
 
-        all_output_ids, all_completion_ids, all_logprobs = [], [], []
+        all_output_ids, all_completion_ids = [], []
         completions = []
 
         for i, result in enumerate(results):
             meta = result.get("meta_info", {})
             completion_ids = meta.get("output_ids", result.get("output_ids", []))
-            raw_logprobs = meta.get("output_token_logprobs", [])
-
-            logprobs = []
-            for item in raw_logprobs:
-                if isinstance(item, (list, tuple)) and len(item) >= 1:
-                    logprobs.append(item[0])
-                elif isinstance(item, (int, float)):
-                    logprobs.append(item)
-
-            if len(logprobs) < len(completion_ids):
-                logprobs = [0.0] * (len(completion_ids) - len(logprobs)) + logprobs
-            elif len(logprobs) > len(completion_ids):
-                logprobs = logprobs[-len(completion_ids):] if completion_ids else []
             prompt = all_input_ids[i]
             full_output = prompt + completion_ids
             all_output_ids.append(full_output)
             all_completion_ids.append(completion_ids)
-            all_logprobs.append(logprobs)
             completions.append(self.tokenizer.decode(completion_ids, skip_special_tokens=True))
 
         device = prompt_ids.device
@@ -150,7 +129,6 @@ class SGLangRolloutEngine(RolloutEngine):
         return RolloutResult(
             output_ids=pad_to_tensor(all_output_ids, max_out_len, pad_val=pad_id),
             completion_ids=pad_to_tensor(all_completion_ids, max_comp_len, pad_val=pad_id),
-            per_token_logps=pad_to_tensor(all_logprobs, max_comp_len, pad_val=0.0),
             completions=completions,
             prompt_lens=torch.tensor([len(ids) for ids in all_input_ids], device=device),
             completion_mask=torch.tensor([[1] * len(ids) + [0] * (max_comp_len - len(ids)) for ids in all_completion_ids], device=device),

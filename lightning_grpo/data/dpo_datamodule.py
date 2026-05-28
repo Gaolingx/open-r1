@@ -183,8 +183,8 @@ class DPODataModule(ChatTemplateDataModule):
                 rejected_sample = normalize_preference_sample(raw_sample, rejected_column)
                 chosen_messages, chosen_tools = chat_processor.prepare_sample(chosen_sample)
                 rejected_messages, rejected_tools = chat_processor.prepare_sample(rejected_sample)
-                chosen_messages = preprocess_chat_messages(chosen_messages)
-                rejected_messages = preprocess_chat_messages(rejected_messages)
+                chosen_messages = preprocess_chat_messages(chosen_messages, self.data_config.add_system_ratio)
+                rejected_messages = preprocess_chat_messages(rejected_messages, self.data_config.add_system_ratio)
 
                 prompt_messages, chosen_completion = split_messages_for_dpo(chosen_messages)
                 _, rejected_completion = split_messages_for_dpo(rejected_messages)

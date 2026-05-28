@@ -98,6 +98,8 @@ class DataConfig:
     streaming: bool = False
     preprocessing_use_cache: bool = True
     preprocessing_keep_in_memory: bool = False
+    add_system_ratio: float = 0.0
+    empty_think_ratio: float = 1.0
 
 
 @dataclass

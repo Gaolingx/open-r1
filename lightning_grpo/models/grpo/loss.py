@@ -519,7 +519,8 @@ class StandardGRPOLossComputer:
         global_rewards_per_func = self.metrics_aggregator.gather_tensor(rewards_per_func.detach())
         global_sample_ids = self.metrics_aggregator.gather_tensor(sample_ids.detach())
         num_generations = self.module.rollout_coordinator.resolve_num_generations(training)
-        global_rewards = (global_rewards_per_func * self.module.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
+        reward_weights = self.reward_manager.reward_weight_tensor.to(global_rewards_per_func.device)
+        global_rewards = (global_rewards_per_func * reward_weights.unsqueeze(0)).nansum(dim=-1)
         local_advantages, global_advantages = self.normalize_grouped_advantages(
             local_rewards=rewards.detach(),
             global_rewards=global_rewards,
@@ -548,11 +549,11 @@ class StandardGRPOLossComputer:
         metrics = build_standard_grpo_training_metrics(
             self.metrics_aggregator,
             rewards_per_func=rewards_per_func,
-            reward_weights=self.module.reward_weights,
+            reward_weights=reward_weights,
             num_generations=num_generations,
             local_metrics={**local_metrics, "completion_truncated": completion_truncated.to(torch.float32)},
             global_advantages=global_advantages,
-            reward_names=config.reward.active.reward_funcs,
+            reward_names=config.reward.reward_funcs,
             moe_outputs=local_metrics.get("_policy_outputs"),
         )
 

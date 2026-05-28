@@ -10,7 +10,7 @@ import torch
 
 from lightning_grpo.models.common import compute_per_token_logps
 from lightning_grpo.models.grpo.rollout_engine import create_rollout_engine
-from lightning_grpo.models.grpo.reward import execute_tool, parse_tool_calls
+from lightning_grpo.models.grpo.tools import execute_tool, parse_tool_calls
 from lightning_grpo.data.base import apply_chat_template
 
 class LocalGenerateRolloutCoordinator:
@@ -69,25 +69,54 @@ class LocalGenerateRolloutCoordinator:
             tokenizer.padding_side = old_padding_side
         return {key: value.to(self.module.device) for key, value in encoded.items()}
 
-    def _generate(self, prompts: list[str], *, num_generations: int = 1) -> tuple[torch.Tensor, torch.Tensor, list[str], torch.Tensor]:
+    def _generate(self, prompts: list[str], *, num_generations: int = 1) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
         """Generate completions with the configured rollout engine."""
 
         encoded = self._tokenize_prompts(prompts)
-        result = self.rollout_engine.rollout(
+        result = self.rollout_engine.generate(
             prompt_ids=encoded["input_ids"],
             attention_mask=encoded["attention_mask"],
             num_generations=num_generations,
             max_new_tokens=self.module.config.rollout.max_completion_length,
             temperature=self.module.config.rollout.temperature,
         )
-        return result.completion_ids, result.completion_mask, result.completions, result.per_token_logps
+        return result.completion_ids, result.completion_mask, result.completions
 
     @torch.no_grad()
     def _generate_once(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
         """Generate one completion for each prompt and return padded completion ids."""
 
-        completion_ids, completion_mask, completion_texts, _ = self._generate(prompts, num_generations=1)
+        completion_ids, completion_mask, completion_texts = self._generate(prompts, num_generations=1)
         return completion_ids, completion_mask, completion_texts
+
+    def _batch_metadata(self, batch: dict[str, list[Any]]) -> list[dict[str, Any]]:
+        """Return per-sample metadata dictionaries from the collated batch."""
+
+        raw_metadata = batch.get("metadata") or [{} for _ in batch.get("prompt_text", [])]
+        metadata: list[dict[str, Any]] = []
+        for item in raw_metadata:
+            if isinstance(item, str):
+                try:
+                    parsed = json.loads(item)
+                except json.JSONDecodeError:
+                    parsed = {}
+            else:
+                parsed = item or {}
+            metadata.append(dict(parsed) if isinstance(parsed, dict) else {})
+        return metadata
+
+    def _metadata_for_generation(self, base_metadata: dict[str, Any], completion: str, turn_outputs: list[str] | None = None, unfinished: bool = False) -> dict[str, Any]:
+        """Preserve dataset metadata and add rollout-specific fields."""
+
+        metadata = dict(base_metadata)
+        if "solution" not in metadata:
+            for alias in ("answer", "response", "output", "gold_answer", "gold_solution", "gt"):
+                if alias in metadata and metadata[alias] is not None:
+                    metadata["solution"] = metadata[alias]
+                    break
+        metadata.setdefault("turn_outputs", turn_outputs or [completion])
+        metadata["unfinished"] = unfinished
+        return metadata
 
     def _render_messages(self, messages: list[dict[str, Any]], tools: Any, *, add_generation_prompt: bool, open_thinking: bool) -> str:
         """Render a chat state while tolerating tokenizers without custom kwargs."""
@@ -113,18 +142,13 @@ class LocalGenerateRolloutCoordinator:
 
         prompts = list(batch["prompt_text"])
         expanded_prompts = [prompt for prompt in prompts for _ in range(num_generations)]
-        completion_ids, completion_mask, completions, old_logps = self._generate(prompts, num_generations=num_generations)
+        completion_ids, completion_mask, completions = self._generate(prompts, num_generations=num_generations)
+        batch_metadata = self._batch_metadata(batch)
         metadata = []
         for index, completion in enumerate(completions):
             sample_index = index // num_generations
-            metadata.append(
-                {
-                    "gt": batch.get("gt", [None] * len(prompts))[sample_index],
-                    "tools": batch.get("tools", [None] * len(prompts))[sample_index],
-                    "turn_outputs": [completion],
-                    "unfinished": False,
-                }
-            )
+            base_metadata = batch_metadata[sample_index] if sample_index < len(batch_metadata) else {}
+            metadata.append(self._metadata_for_generation(base_metadata, completion, [completion], unfinished=False))
         return self._pack_rollout(
             expanded_prompts,
             completion_ids,
@@ -132,7 +156,6 @@ class LocalGenerateRolloutCoordinator:
             completions,
             metadata,
             num_generations=num_generations,
-            old_per_token_logps=old_logps,
         )
 
     def _rollout_agentic(self, batch: dict[str, list[Any]], *, num_generations: int) -> dict[str, Any]:
@@ -144,10 +167,17 @@ class LocalGenerateRolloutCoordinator:
         response_masks_batch: list[list[int]] = []
         completions: list[str] = []
         metadata: list[dict[str, Any]] = []
+        batch_metadata = self._batch_metadata(batch)
+        batch_messages = batch.get("messages") or [None] * len(batch.get("prompt_text", []))
 
-        for sample_index, messages in enumerate(batch["messages"]):
-            tools = batch.get("tools", [None] * len(batch["messages"]))[sample_index]
-            gt = batch.get("gt", [None] * len(batch["messages"]))[sample_index]
+        for sample_index, messages in enumerate(batch_messages):
+            base_metadata = batch_metadata[sample_index] if sample_index < len(batch_metadata) else {}
+            tools = base_metadata.get("tools") or (batch.get("tools", [None] * len(batch_messages))[sample_index] if batch.get("tools") else None)
+            if messages is None:
+                messages = base_metadata.get("messages")
+            if messages is None:
+                prompt_text = batch.get("prompt_text", [""] * len(batch_messages))[sample_index]
+                messages = [{"role": "user", "content": prompt_text}]
             for _ in range(num_generations):
                 chat_state = [dict(message) for message in messages]
                 open_thinking = random.random() < self.module.config.data.thinking_ratio
@@ -196,8 +226,12 @@ class LocalGenerateRolloutCoordinator:
                     response_mask.append(1)
                 response_ids_batch.append(response_ids)
                 response_masks_batch.append(response_mask)
-                completions.append(turn_outputs[-1] if turn_outputs else "")
-                metadata.append({"gt": gt, "tools": tools, "turn_outputs": turn_outputs, "unfinished": unfinished})
+                completion = turn_outputs[-1] if turn_outputs else ""
+                completions.append(completion)
+                rollout_metadata = self._metadata_for_generation(base_metadata, completion, turn_outputs, unfinished)
+                if tools is not None:
+                    rollout_metadata["tools"] = tools
+                metadata.append(rollout_metadata)
 
         padded_ids = [torch.tensor(ids, dtype=torch.long, device=self.module.device) for ids in response_ids_batch]
         padded_masks = [torch.tensor(mask, dtype=torch.long, device=self.module.device) for mask in response_masks_batch]

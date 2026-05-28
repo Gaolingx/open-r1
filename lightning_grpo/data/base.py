@@ -153,6 +153,7 @@ class ChatTemplateProcessor:
         add_generation_prompt: bool = False,
         tools: Any = None,
         postprocess: bool = True,
+        empty_think_ratio: float = 1.0,
         **chat_template_kwargs: Any,
     ) -> str:
         """Render messages to text with optional shared postprocessing."""
@@ -164,7 +165,7 @@ class ChatTemplateProcessor:
             tools=tools,
             **chat_template_kwargs,
         )
-        return postprocess_chat_text(text) if postprocess else text
+        return postprocess_chat_text(text, empty_think_ratio) if postprocess else text
 
     def tokenize(
         self,
@@ -174,6 +175,7 @@ class ChatTemplateProcessor:
         tools: Any = None,
         max_length: int,
         return_assistant_tokens_mask: bool = False,
+        empty_think_ratio: float = 1.0,
     ) -> dict[str, Any]:
         """Tokenize chat messages through tokenizer templates with a text fallback."""
 
@@ -201,6 +203,7 @@ class ChatTemplateProcessor:
             messages,
             add_generation_prompt=add_generation_prompt,
             tools=tools,
+            empty_think_ratio=empty_think_ratio,
         )
         tokenized = self.tokenizer(
             text,

@@ -425,7 +425,8 @@ class LigerGRPOLossComputer:
         global_rewards_per_func = self.metrics_aggregator.gather_tensor(rewards_per_func.detach())
         global_sample_ids = self.metrics_aggregator.gather_tensor(sample_ids.detach())
         num_generations = self.module.rollout_coordinator.resolve_num_generations(training)
-        global_rewards = (global_rewards_per_func * self.module.reward_weights.to(global_rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
+        reward_weights = self.reward_manager.reward_weight_tensor.to(global_rewards_per_func.device)
+        global_rewards = (global_rewards_per_func * reward_weights.unsqueeze(0)).nansum(dim=-1)
         local_advantages, global_advantages = self.normalize_grouped_advantages(
             local_rewards=rewards.detach(),
             global_rewards=global_rewards,
@@ -484,7 +485,7 @@ class LigerGRPOLossComputer:
 
         metrics = self.metrics_aggregator.build_training_metrics(
             global_rewards_per_func=global_rewards_per_func,
-            reward_weights=self.module.reward_weights,
+            reward_weights=reward_weights,
             num_generations=num_generations,
             global_per_token_kl=global_per_token_kl,
             global_loss_mask=global_loss_mask,
@@ -496,7 +497,7 @@ class LigerGRPOLossComputer:
             global_is_region_clipped=global_is_region_clipped,
             global_is_cispo_clipped=global_is_cispo_clipped,
             global_advantages=global_advantages,
-            reward_names=self.module.config.reward.active.reward_funcs,
+            reward_names=self.module.config.reward.reward_funcs,
             moe_outputs=moe_outputs,
         )
         metrics.update(aux_metrics)

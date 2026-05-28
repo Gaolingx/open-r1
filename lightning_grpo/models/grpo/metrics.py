@@ -102,6 +102,6 @@ class GRPOMetricsAggregator:
             module.log(f"{prefix}/clip_ratio/low", metrics["clip_ratio_low"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
             module.log(f"{prefix}/clip_ratio/high", metrics["clip_ratio_high"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
             module.log(f"{prefix}/clip_ratio/region", metrics["clip_ratio_region"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        for reward_name in module.config.reward.active.reward_funcs:
+        for reward_name in module.config.reward.reward_funcs:
             module.log(f"{prefix}/rewards/{reward_name}/mean", metrics[f"reward/{reward_name}"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
             module.log(f"{prefix}/rewards/{reward_name}/std", metrics[f"reward_std/{reward_name}"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)

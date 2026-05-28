@@ -42,19 +42,14 @@ rollout:
   debug_every_n_steps: 20
 
 reward:
-  active:
-    # reasoning 数据可使用 [format, reward_model]；agentic 数据建议使用 [format, tool, gt]
-    reward_funcs: [format, gt]
-    weights: [1.0, 1.0]
-  repetition_ngram: 3
-  repetition_cap: 0.5
-  min_response_chars: 5
-  max_response_chars: 800
-  min_think_chars: 20
-  max_think_chars: 300
+  reward_funcs: [accuracy, format, tag_count]
+  cosine_min_value_wrong: 0.0
+  cosine_max_value_wrong: -0.5
+  cosine_min_value_correct: 0.5
+  cosine_max_value_correct: 1.0
+  cosine_max_len: 1000
 
 data:
-  # reasoning: prompt/response 或 messages 数据；agentic: conversations/messages + tools + gt 数据
   mode: reasoning
   dataset_list:
     - id: json
