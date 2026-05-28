@@ -190,7 +190,7 @@ class LocalGenerateRolloutCoordinator:
             old_logps = old_per_token_logps[:, :max_completion].to(self.module.device) * completion_mask.to(old_per_token_logps.dtype)
         else:
             with torch.no_grad():
-                old_logps = compute_per_token_logps(self.module, prompt_ids, prompt_mask, completion_ids, completion_mask)
+                old_logps = compute_per_token_logps(self.module, prompt_ids, prompt_mask, completion_ids, completion_mask, self.module.config.rollout.temperature)
         completion_truncated = (completion_mask.sum(dim=1) >= max_completion).to(torch.long)
         sample_ids = torch.arange(completion_ids.size(0), device=self.module.device) // num_generations
 

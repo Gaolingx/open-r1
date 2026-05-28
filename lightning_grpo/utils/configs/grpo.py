@@ -39,6 +39,17 @@ class GRPORewardConfig:
 
 
 @dataclass
+class ToolCallingConfig:
+    """Configuration for multi-turn tool calling during rollout."""
+
+    enabled: bool = False
+    max_iterations: int = 5
+    tools: list[str] = field(default_factory=list)
+    chat_template: Optional[str] = None
+    chat_template_kwargs: dict | None = None
+
+
+@dataclass
 class GRPORolloutConfig:
     """Rollout and policy-gradient hyperparameters for GRPO."""
 
@@ -54,6 +65,7 @@ class GRPORolloutConfig:
     max_turns: int = 3
     temperature: float = 0.8
     top_p: float = 1.0
+    tool_calling: ToolCallingConfig = field(default_factory=ToolCallingConfig)
     kl_beta: float = 0.1
     loss_type: Literal["grpo", "bnpo", "cispo"] = "cispo"
     epsilon: float = 0.2

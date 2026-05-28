@@ -22,13 +22,14 @@ from lightning_grpo.models.grpo.loss import StandardGRPOLossComputer
 from lightning_grpo.models.grpo.liger_loss import LigerGRPOLossComputer
 from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
+from lightning_grpo.models.grpo.tool_call import GRPOToolCallMixin
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.utils.modeling import load_causal_lm
 
 
-class GRPOLightningModule(L.LightningModule):
+class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
     """Lightning module for local-rollout GRPO, reasoning RL, and agentic RL."""
 
     def __init__(self, config: GRPOConfig) -> None:
@@ -47,6 +48,7 @@ class GRPOLightningModule(L.LightningModule):
         self.reward_manager = GRPORewardManager(config, self.tokenizer, device=self.device)
         self._liger_loss_computer: LigerGRPOLossComputer | None = None
         self._standard_loss_computer: StandardGRPOLossComputer | None = None
+        self._init_tool_executor()
 
     def _build_reference_model(self) -> torch.nn.Module | None:
         """Create the frozen reference model used for KL regularization."""
@@ -95,6 +97,11 @@ class GRPOLightningModule(L.LightningModule):
         """Generate rollouts, compute GRPO loss, and log metrics."""
 
         rollout_batch = self.rollout_coordinator.rollout(batch, training=stage == "train")
+
+        # Run tool calling loop if enabled and executor is initialized
+        if self.tool_executor is not None:
+            rollout_batch = self._run_tool_calling(rollout_batch)
+
         self.reward_manager.device = self.device
         if self.config.liger_kernel.enabled:
             if self._liger_loss_computer is None:
@@ -151,6 +158,10 @@ class GRPOLightningModule(L.LightningModule):
 
     def on_train_end(self) -> None:
         """Export a Hugging Face-compatible model directory after training."""
+
+        # Clean up tool executor resources
+        if self.tool_executor is not None and hasattr(self.tool_executor, "shutdown"):
+            self.tool_executor.shutdown()
 
         if not self.trainer.is_global_zero:
             return
