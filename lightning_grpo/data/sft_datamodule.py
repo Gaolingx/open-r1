@@ -16,6 +16,7 @@ from lightning_grpo.data.base import (
     ChatTemplateDataModule,
     preprocess_chat_messages,
     resolve_shuffle_state,
+    iter_batch_samples,
 )
 from lightning_grpo.models.common import load_tokenizer
 
@@ -141,7 +142,6 @@ class SFTDataModule(ChatTemplateDataModule):
         chat_processor = self.chat_processor
         data_config = self.data_config
 
-        iter_batch_samples = self.iter_batch_samples
         extract_assistant_mask = self._extract_assistant_mask
         find_subsequence_starts = self._find_subsequence_starts
         next_marker_start = self._next_marker_start

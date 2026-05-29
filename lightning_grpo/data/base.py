@@ -67,6 +67,16 @@ SYSTEM_PROMPTS = [
 ]
 
 
+def iter_batch_samples(batch: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    """Convert a dict-of-lists batch into a list of row dictionaries."""
+
+    batch_size = len(next(iter(batch.values())))
+    return [
+        {key: value[index] for key, value in batch.items()}
+        for index in range(batch_size)
+    ]
+
+
 def preprocess_chat_messages(
     messages: list[dict[str, Any]],
     add_system_ratio: float = 0.0,
@@ -493,13 +503,3 @@ class ChatTemplateDataModule(BaseDataModule):
             dataset_format=dataset_format,
             system_prompt=self.system_prompt,
         )
-
-    @staticmethod
-    def iter_batch_samples(batch: dict[str, list[Any]]) -> list[dict[str, Any]]:
-        """Convert a dict-of-lists batch into a list of row dictionaries."""
-
-        batch_size = len(next(iter(batch.values())))
-        return [
-            {key: value[index] for key, value in batch.items()}
-            for index in range(batch_size)
-        ]

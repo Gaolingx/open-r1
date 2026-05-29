@@ -16,6 +16,7 @@ from lightning_grpo.data.base import (
     ChatTemplateDataModule,
     preprocess_chat_messages,
     resolve_shuffle_state,
+    iter_batch_samples,
 )
 from lightning_grpo.data.converter import json_loads_if_needed
 from lightning_grpo.models.common import load_tokenizer
@@ -144,7 +145,6 @@ class DPODataModule(ChatTemplateDataModule):
         max_seq_length = self.data_config.max_seq_length
         chosen_column = self.data_config.chosen_column
         rejected_column = self.data_config.rejected_column
-        iter_batch_samples = self.iter_batch_samples
         split_messages_for_dpo = self._split_messages_for_dpo
 
         def tokenize_messages(messages: list[dict[str, Any]]) -> list[int]:

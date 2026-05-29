@@ -15,6 +15,7 @@ from lightning_grpo.data.base import (
     ChatTemplateProcessor,
     ChatTemplateDataModule,
     resolve_shuffle_state,
+    iter_batch_samples,
 )
 from lightning_grpo.models.common import load_tokenizer
 
@@ -103,7 +104,7 @@ class GRPODataModule(ChatTemplateDataModule):
         def preprocess_batch(batch: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
             prompt_texts: list[str] = []
             metadata: list[str] = []
-            for sample in self.iter_batch_samples(batch):
+            for sample in iter_batch_samples(batch):
                 formatted = formatter(sample)
                 messages, tools = self.chat_processor.prepare_sample(formatted)
                 prompt_texts.append(
