@@ -214,12 +214,11 @@ def compute_per_token_logps(
     logits_to_keep = completion_ids.size(1)
     outputs = policy(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     shift_logits = outputs.logits[:, :-1, :]
-    shift_labels = input_ids[:, 1:]
+    completion_logits = shift_logits[:, -logits_to_keep:, :]
     if temperature != 1.0:
         completion_logits = completion_logits / temperature
-    per_token_logps = torch.log_softmax(shift_logits, dim=-1).gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
-    start = prompt_ids.size(1) - 1
-    return per_token_logps[:, start: start + logits_to_keep] * completion_mask.to(per_token_logps.dtype)
+    per_token_logps = torch.log_softmax(completion_logits, dim=-1).gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
+    return per_token_logps * completion_mask.to(per_token_logps.dtype)
 
 
 def count_trainable_parameters(model: PreTrainedModel) -> tuple[int, int]:

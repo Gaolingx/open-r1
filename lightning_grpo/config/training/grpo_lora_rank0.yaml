@@ -50,7 +50,6 @@ reward:
   cosine_max_len: 1000
 
 data:
-  mode: reasoning
   dataset_list:
     - id: json
       split: train

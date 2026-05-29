@@ -22,3 +22,4 @@ class PretrainConfig(TrainingBaseConfig):
 
     task: Literal["pretrain"] = "pretrain"
     data: PretrainDataConfig = field(default_factory=PretrainDataConfig)
+    label_smoothing: float = 0.0
