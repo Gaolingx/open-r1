@@ -16,7 +16,6 @@ class ChatDataConfig(DataConfig):
     prompt_column: str = "prompt"
     response_column: str = "response"
     messages_column: str = "messages"
-    dataset_format: Literal["auto", "openai", "sharegpt", "alpaca"] = "auto"
     add_generation_prompt: bool = True
 
 

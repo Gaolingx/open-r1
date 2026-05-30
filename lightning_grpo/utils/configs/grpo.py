@@ -62,7 +62,6 @@ class GRPORolloutConfig:
     max_prompt_length: int = 1024
     max_completion_length: int = 1024
     max_total_length: int = 2048
-    max_turns: int = 3
     temperature: float = 0.8
     top_p: float = 1.0
     tool_calling: ToolCallingConfig = field(default_factory=ToolCallingConfig)

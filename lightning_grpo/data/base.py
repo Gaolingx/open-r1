@@ -20,7 +20,6 @@ from datasets import (
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader
 
-from lightning_grpo.data.converter import DatasetFormat, convert_sft_sample
 from lightning_grpo.utils.configs.base import DataConfig, DatasetConfig
 
 
@@ -32,25 +31,32 @@ class ConversationTemplate:
         prompt_column: str,
         response_column: str,
         messages_column: str = "messages",
-        dataset_format: DatasetFormat | str = "auto",
         system_prompt: Optional[str] = None,
     ) -> None:
         self.prompt_column = prompt_column
         self.response_column = response_column
         self.messages_column = messages_column
-        self.dataset_format = dataset_format
         self.system_prompt = system_prompt
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         """Create a canonical message list for one sample."""
 
-        converted = convert_sft_sample(sample, self.dataset_format)
-        if not converted.get("messages"):
-            raise KeyError(f"No chat messages could be built from sample using dataset_format='{self.dataset_format}'.")
-        if self.system_prompt and not any(message.get("role") == "system" for message in converted["messages"]):
-            converted = dict(converted)
-            converted["messages"] = [{"role": "system", "content": self.system_prompt}, *converted["messages"]]
-        return converted
+        if self.messages_column in sample and sample[self.messages_column] is not None:
+            return {"messages": sample[self.messages_column]}
+        if "conversations" in sample and sample["conversations"] is not None:
+            return {"messages": sample["conversations"]}
+
+        messages: list[dict[str, str]] = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+
+        if self.prompt_column not in sample:
+            raise KeyError(f"Prompt column '{self.prompt_column}' not found in sample.")
+
+        messages.append({"role": "user", "content": str(sample[self.prompt_column])})
+        if self.response_column in sample and sample[self.response_column] is not None:
+            messages.append({"role": "assistant", "content": str(sample[self.response_column])})
+        return {"messages": messages}
 
 
 SYSTEM_PROMPTS = [
@@ -495,11 +501,9 @@ class ChatTemplateDataModule(BaseDataModule):
         prompt_column = getattr(self.data_config, "prompt_column")
         response_column = getattr(self.data_config, "response_column")
         messages_column = getattr(self.data_config, "messages_column", "messages")
-        dataset_format = getattr(self.data_config, "dataset_format", "auto")
         return ConversationTemplate(
             prompt_column=prompt_column,
             response_column=response_column,
             messages_column=messages_column,
-            dataset_format=dataset_format,
             system_prompt=self.system_prompt,
         )

@@ -29,7 +29,6 @@ rollout:
   max_prompt_length: 1024
   max_completion_length: 768
   max_total_length: 2048
-  max_turns: 3
   temperature: 0.8
   top_p: 0.95
   kl_beta: 0.1
@@ -67,7 +66,6 @@ data:
   response_column: response
   messages_column: conversations
   tools_column: tools
-  dataset_format: auto
   add_generation_prompt: true
   add_system_ratio: 0.0
   thinking_ratio: 0.9
