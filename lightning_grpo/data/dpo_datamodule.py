@@ -17,8 +17,8 @@ from lightning_grpo.data.base import (
     preprocess_chat_messages,
     resolve_shuffle_state,
     iter_batch_samples,
+    json_loads_if_needed,
 )
-from lightning_grpo.data.converter import json_loads_if_needed
 from lightning_grpo.models.common import load_tokenizer
 
 

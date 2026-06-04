@@ -405,6 +405,20 @@ def dump_data_config(data_config: DataConfig) -> dict[str, Any]:
     return asdict(data_config)
 
 
+def json_loads_if_needed(value: Any) -> Any:
+    """Parse JSON-looking strings while preserving ordinary strings."""
+
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{\"":
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
 class BaseDataModule(LightningDataModule):
     """Reusable base class for dataset-driven Lightning data modules."""
 

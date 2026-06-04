@@ -114,6 +114,8 @@ def _apply_fsdp(
             reshard_after_forward=reshard_after_forward,
         )
 
+    # As an optimization, do not reshard_after_forward the last layers by default
+    # since FSDP would prefetch them immediately after the forward pass
     if norm is not None and lm_head is not None:
         fully_shard(
             [norm, lm_head],
@@ -123,12 +125,14 @@ def _apply_fsdp(
 
     fully_shard(model, **fsdp_config)
 
+    # forward
     if forward_prefetch and isinstance(layers, (list, nn.ModuleList)) and len(layers) > 0:
         transformer_blocks = list(layers)
         next_transformer_blocks = transformer_blocks[1:] + [None]
 
         if embed_tokens is not None:
             embed_tokens.set_modules_to_forward_prefetch([transformer_blocks[0]])
+
         for transformer_block, next_transformer_block in zip(
             transformer_blocks, next_transformer_blocks
         ):
@@ -141,6 +145,7 @@ def _apply_fsdp(
                     [norm, lm_head]
                 )
 
+    # backward
     if backward_prefetch and isinstance(layers, (list, nn.ModuleList)) and len(layers) > 0:
         reversed_transformer_blocks = list(reversed(layers))
         prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
