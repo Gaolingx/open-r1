@@ -11,7 +11,7 @@ from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.optimization import get_scheduler
 from lightning.pytorch.utilities import rank_zero_info
 
-from lightning_grpo.utils.configs.base import OptimizationConfig, PrecisionConfig, ModelConfig
+from lightning_grpo.utils.configs.base import OptimizationConfig, ModelConfig
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -21,10 +21,10 @@ DTYPE_MAP = {
 }
 
 
-def resolve_torch_dtype(precision_config: PrecisionConfig) -> torch.dtype:
+def resolve_torch_dtype(model_param_dtype: str) -> torch.dtype:
     """Resolve the parameter dtype from configuration."""
 
-    return DTYPE_MAP[precision_config.model_param_dtype]
+    return DTYPE_MAP[model_param_dtype]
 
 
 def compile_model_if_configured(model: torch.nn.Module, model_config: ModelConfig) -> torch.nn.Module:

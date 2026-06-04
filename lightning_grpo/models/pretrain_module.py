@@ -20,7 +20,6 @@ from lightning_grpo.models.common import (
 from lightning_grpo.models.grpo.loss import masked_token_stats, compute_cross_entropy_loss, compute_liger_cross_entropy_loss
 from lightning_grpo.models.grpo.liger_loss import LigerCELossComputer
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
-from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
 from lightning_grpo.utils.metrics import log_moe_metrics
 
@@ -50,7 +49,6 @@ class PretrainLightningModule(L.LightningModule):
     def configure_model(self) -> None:
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
-        configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
         self.model = compile_model_if_configured(self.model, self.config.model)
 
@@ -60,7 +58,6 @@ class PretrainLightningModule(L.LightningModule):
                 self.model,
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
-                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
             )
 
     def _model_forward(
@@ -94,15 +91,6 @@ class PretrainLightningModule(L.LightningModule):
                 labels=labels,
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
-            )
-        elif self.config.distributed.tensor_parallel.loss_parallel:
-            outputs = self._model_forward(batch)
-            loss = compute_cross_entropy_loss(
-                outputs.logits,
-                labels,
-                ignore_index=self.config.data.ignore_index,
-                label_smoothing=self.config.label_smoothing,
-                loss_parallel_enabled=True,
             )
         else:
             outputs = self._model_forward(batch, exclude_labels=False)

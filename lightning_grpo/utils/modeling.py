@@ -134,7 +134,7 @@ def _build_configured_model_class(model_config: ModelConfig, precision_config: P
 
     model_hf_config = config_class(**init_kwargs)
     model = model_class(model_hf_config)
-    model = model.to(dtype=resolve_torch_dtype(precision_config))
+    model = model.to(dtype=resolve_torch_dtype(precision_config.model_param_dtype))
 
     return _maybe_load_custom_weights(model, model_config)
 
@@ -150,7 +150,7 @@ def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig)
             revision=model_config.model_revision,
             trust_remote_code=model_config.trust_remote_code,
             attn_implementation=model_config.attn_implementation,
-            dtype=resolve_torch_dtype(precision_config),
+            dtype=resolve_torch_dtype(precision_config.model_param_dtype),
         )
 
     if model_config.model_generation_config_path:

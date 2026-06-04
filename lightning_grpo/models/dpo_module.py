@@ -29,7 +29,6 @@ from lightning_grpo.models.common import (
 from lightning_grpo.models.grpo.loss import compute_liger_dpo_loss, compute_standard_dpo_loss
 from lightning_grpo.models.grpo.liger_loss import LigerDPOLossComputer
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
-from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
 from lightning_grpo.utils.metrics import log_moe_metrics
 
@@ -85,12 +84,10 @@ class DPOLightningModule(L.LightningModule):
     def configure_model(self) -> None:
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
-        configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
         self.model = compile_model_if_configured(self.model, self.config.model)
 
         # Also shard the reference model
-        configure_tensor_parallel(self.ref_model, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.ref_model, self.config.distributed, self.config.precision, self.device_mesh)
 
         # Initialize Liger fused DPO loss if enabled
@@ -101,7 +98,6 @@ class DPOLightningModule(L.LightningModule):
                 beta=self.beta,
                 loss_type=self.loss_type,
                 nll_coeff=self.nll_coeff,
-                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
                 compiled=self.config.liger_kernel.compiled,
             )
 

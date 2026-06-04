@@ -187,6 +187,10 @@ class GradParamNormCallback(Callback):
 
             reference = tensor
             part = tensor.detach().float().pow(2).sum()
+
+            if hasattr(part, "to_local"):
+                part = part.to_local()
+
             total = part if total is None else total + part
 
         if total is None:
@@ -201,7 +205,7 @@ class GradParamNormCallback(Callback):
         if step == 0 or step % self.log_every_n_steps != 0:
             return
 
-        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
+        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach()
 
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
@@ -214,7 +218,7 @@ class GradParamNormCallback(Callback):
         if step == 0 or step % self.log_every_n_steps != 0:
             return
 
-        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach().cpu()
+        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach()
 
         pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 

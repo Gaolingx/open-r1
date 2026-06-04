@@ -204,17 +204,6 @@ class EarlyStoppingConfig:
 
 
 @dataclass
-class TensorParallelConfig:
-    """Tensor parallel plan configuration for PyTorch DTensor parallel APIs."""
-
-    enabled: bool = False
-    plan: Literal["auto", "none", "default", "config"] = "auto"
-    sequence_parallel: bool = False
-    loss_parallel: bool = False
-    plan_overrides: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
 class DistributedConfig:
     """Distributed strategy configuration for Lightning."""
 
@@ -232,7 +221,6 @@ class DistributedConfig:
     fsdp_forward_prefetch: bool = True
     fsdp_backward_prefetch: bool = True
     fsdp_fully_shard_kwargs: dict[str, Any] = field(default_factory=dict)
-    tensor_parallel: TensorParallelConfig = field(default_factory=TensorParallelConfig)
     model_parallel_kwargs: dict[str, Any] = field(default_factory=dict)
 
 

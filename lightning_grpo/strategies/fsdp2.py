@@ -34,10 +34,8 @@ def configure_fully_shard(
     if dp_mesh.size() <= 1:
         return
 
-    base_model = get_transformer_backbone_model(model)
-
     _apply_fsdp(
-        model=base_model,
+        model=model,
         dp_mesh=dp_mesh,
         param_dtype=resolve_torch_dtype(precision_config.fsdp_param_dtype),
         reduce_dtype=resolve_torch_dtype(precision_config.fsdp_reduce_dtype),
@@ -95,40 +93,42 @@ def _apply_fsdp(
         reshard_after_forward_policy, pp_enabled
     )
 
-    if model.tok_embeddings is not None:
+    base_model = get_transformer_backbone_model(model)
+
+    embed_tokens = getattr(base_model, "embed_tokens", None)
+    layers = getattr(base_model, "layers", [])
+    norm = getattr(base_model, "norm", None)
+    lm_head = getattr(model, "lm_head", None)
+
+    if embed_tokens is not None:
         fully_shard(
-            model.tok_embeddings,
+            embed_tokens,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
 
-    for transformer_block in model.layers:
-
+    for transformer_block in layers:
         fully_shard(
             transformer_block,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
 
-    # As an optimization, do not reshard_after_forward the last layers by default
-    # since FSDP would prefetch them immediately after the forward pass
-    if model.norm is not None and model.lm_head is not None:
+    if norm is not None and lm_head is not None:
         fully_shard(
-            [model.norm, model.lm_head],
+            [norm, lm_head],
             **fsdp_config,
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
 
     fully_shard(model, **fsdp_config)
 
-    # forward
-    if forward_prefetch:
-        transformer_blocks = list(model.layers.values())
+    if forward_prefetch and isinstance(layers, (list, nn.ModuleList)) and len(layers) > 0:
+        transformer_blocks = list(layers)
         next_transformer_blocks = transformer_blocks[1:] + [None]
 
-        if model.tok_embeddings is not None and model.layers is not None:
-            model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
-
+        if embed_tokens is not None:
+            embed_tokens.set_modules_to_forward_prefetch([transformer_blocks[0]])
         for transformer_block, next_transformer_block in zip(
             transformer_blocks, next_transformer_blocks
         ):
@@ -136,22 +136,17 @@ def _apply_fsdp(
                 transformer_block.set_modules_to_forward_prefetch(
                     [next_transformer_block]
                 )
-            elif model.norm is not None and model.lm_head is not None:
+            elif norm is not None and lm_head is not None:
                 transformer_block.set_modules_to_forward_prefetch(
-                    [model.norm, model.lm_head]
+                    [norm, lm_head]
                 )
 
-    # backward
-    if backward_prefetch:
-        reversed_transformer_blocks = list(reversed(model.layers.values()))
+    if backward_prefetch and isinstance(layers, (list, nn.ModuleList)) and len(layers) > 0:
+        reversed_transformer_blocks = list(reversed(layers))
         prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
-        if (
-            model.norm is not None
-            and model.lm_head is not None
-            and model.layers is not None
-        ):
-            model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+        if norm is not None and lm_head is not None:
+            lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
 
         for transformer_block, prev_transformer_block in zip(
             reversed_transformer_blocks, prev_transformer_blocks
@@ -160,5 +155,5 @@ def _apply_fsdp(
                 transformer_block.set_modules_to_backward_prefetch(
                     [prev_transformer_block]
                 )
-            elif model.tok_embeddings is not None:
-                transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
+            elif embed_tokens is not None:
+                transformer_block.set_modules_to_backward_prefetch([embed_tokens])

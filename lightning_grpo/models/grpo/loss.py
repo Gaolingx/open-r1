@@ -6,7 +6,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
-from torch.distributed.tensor.parallel import loss_parallel
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -36,12 +35,6 @@ def selective_log_softmax(logits: torch.Tensor, target_ids: torch.Tensor) -> tor
 
     log_probs = torch.log_softmax(logits, dim=-1)
     return torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-
-
-def tensor_parallel_loss_context(enabled: bool) -> Any:
-    """Return the PyTorch loss-parallel context when vocab logits are sharded."""
-
-    return loss_parallel() if enabled else nullcontext()
 
 
 def materialize_vocab_parallel_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -88,7 +81,6 @@ def compute_cross_entropy_loss(
     labels: torch.Tensor,
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
-    loss_parallel_enabled: bool = False,
 ) -> torch.Tensor:
     """Compute token-level next-token loss with optional label smoothing."""
 
@@ -96,13 +88,12 @@ def compute_cross_entropy_loss(
     shift_labels = labels[..., 1:].contiguous()
     vocab_size = shift_logits.size(-1)
 
-    with tensor_parallel_loss_context(loss_parallel_enabled):
-        return F.cross_entropy(
-            shift_logits.reshape(-1, vocab_size),
-            shift_labels.reshape(-1),
-            ignore_index=ignore_index,
-            label_smoothing=label_smoothing,
-        )
+    return F.cross_entropy(
+        shift_logits.reshape(-1, vocab_size),
+        shift_labels.reshape(-1),
+        ignore_index=ignore_index,
+        label_smoothing=label_smoothing,
+    )
 
 
 def compute_liger_cross_entropy_loss(
@@ -361,7 +352,6 @@ def compute_standard_grpo_loss(
     loss_type: str = "bnpo",
     temperature: float = 1.0,
     max_completion_length: int | None = None,
-    loss_parallel_enabled: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a plain PyTorch GRPO loss without the Liger fused kernel."""
 
@@ -446,14 +436,12 @@ class StandardGRPOLossComputer:
         metrics_aggregator: Any,
         *,
         rollout_temperature: float,
-        loss_parallel_enabled: bool = False,
     ) -> None:
 
         self.module = module
         self.reward_manager = reward_manager
         self.metrics_aggregator = metrics_aggregator
         self.rollout_temperature = rollout_temperature
-        self.loss_parallel_enabled = loss_parallel_enabled
 
     def compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
         return compute_grpo_advantages(
@@ -543,7 +531,6 @@ class StandardGRPOLossComputer:
             loss_type=loss_type,
             temperature=self.rollout_temperature,
             max_completion_length=config.rollout.max_completion_length,
-            loss_parallel_enabled=self.loss_parallel_enabled,
         )
 
         metrics = build_standard_grpo_training_metrics(
