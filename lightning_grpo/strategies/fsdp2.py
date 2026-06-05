@@ -148,7 +148,7 @@ def _apply_fsdp(
             embed_tokens.set_modules_to_forward_prefetch([transformer_blocks[0]])
 
         for transformer_block, next_transformer_block in zip(
-            transformer_blocks, next_transformer_blocks
+                transformer_blocks, next_transformer_blocks
         ):
             if next_transformer_block is not None:
                 transformer_block.set_modules_to_forward_prefetch(
@@ -168,7 +168,7 @@ def _apply_fsdp(
             lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
 
         for transformer_block, prev_transformer_block in zip(
-            reversed_transformer_blocks, prev_transformer_blocks
+                reversed_transformer_blocks, prev_transformer_blocks
         ):
             if prev_transformer_block is not None:
                 transformer_block.set_modules_to_backward_prefetch(

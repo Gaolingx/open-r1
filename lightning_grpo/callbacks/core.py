@@ -34,7 +34,7 @@ class CheckpointCallback(ModelCheckpoint):
 
         if not self.save_pt_format:
             return
-        
+
         lightning_module = trainer.lightning_module
         model = getattr(lightning_module, "model", lightning_module)
         full_state_dict = get_gathered_state_dict(model)

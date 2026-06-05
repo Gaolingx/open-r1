@@ -12,7 +12,7 @@ from lightning_grpo.utils.configs.base import DistributedConfig
 from lightning_grpo.utils.parallel.tp_utils import (
     ALL_PARALLEL_STYLES,
     _get_parameter_tp_plan,
-    add_tensor_parallel_hooks_to_module
+    add_tensor_parallel_hooks_to_module,
 )
 
 
@@ -37,10 +37,10 @@ def get_resolved_tp_plan(model: nn.Module, tp_config: Any) -> Dict[str, str]:
     if tp_config.plan_overrides:
         resolved_plan.update(tp_config.plan_overrides)
 
-    lm_head_key = "lm_head" 
+    lm_head_key = "lm_head"
     if tp_config.loss_parallel:
         if lm_head_key in resolved_plan:
-            resolved_plan[lm_head_key] = "colwise" 
+            resolved_plan[lm_head_key] = "colwise"
     else:
         if lm_head_key in resolved_plan:
             resolved_plan[lm_head_key] = "colwise_gather_output"
@@ -51,7 +51,7 @@ def get_resolved_tp_plan(model: nn.Module, tp_config: Any) -> Dict[str, str]:
 def wrap_module_parameters_as_dtensor(module, device_mesh, tp_plan_name):
     """Wrap the already sharded Parameter as a DTensor."""
     tp_mesh = device_mesh["tp"] if "tp" in device_mesh.mesh_dim_names else device_mesh
-    
+
     for param_name, param in module.named_parameters(recurse=False):
         # 1. Automatically determine shard dimensions
         # Linear.weight: [out_features, in_features]
@@ -61,15 +61,15 @@ def wrap_module_parameters_as_dtensor(module, device_mesh, tp_plan_name):
             sharding_dim = 0
         elif "rowwise" in tp_plan_name:
             # Rowwise: Weights are sharded along dim 1, biases are usually not sharded (Replicate)
-            sharding_dim = 1 if param.ndim > 1 else -1 
+            sharding_dim = 1 if param.ndim > 1 else -1
         else:
             continue
         dist_spec = [Shard(sharding_dim)] if sharding_dim != -1 else [Replicate()]
-        
+
         # 2. Use from_local to wrap, without copying memory.
         # Note: At this time, param.data must already be a local shard that has been split by shard tensor.
         dt_param = DTensor.from_local(param.data, tp_mesh, dist_spec)
-        
+
         new_param = nn.Parameter(dt_param, requires_grad=param.requires_grad)
         setattr(module, param_name, new_param)
 
@@ -96,12 +96,12 @@ def apply_custom_tensor_parallel(
         for param_name, param in module.named_parameters(recurse=False):
             full_param_name = f"{name}.{param_name}"
             param_plan = _get_parameter_tp_plan(full_param_name, final_plan)
-            
+
             if param_plan:
-                tp_layer.empty_param = param 
+                tp_layer.empty_param = param
                 sharded_data = tp_layer.shard_tensor(
-                    param.data, 
-                    device=param.device, 
+                    param.data,
+                    device=param.device,
                     dtype=param.dtype
                 )
                 new_param = nn.Parameter(sharded_data, requires_grad=param.requires_grad)
@@ -113,12 +113,12 @@ def apply_custom_tensor_parallel(
         if name == "lm_head" and tp_config.loss_parallel:
             # Wrap the locally segmented Tensor into a DTensor
             wrap_module_parameters_as_dtensor(module, tp_mesh, plan_name)
-            
+
             # Remove the old hook (ColwiseParallel will register all_reduce_backward)
             # because DTensor will handle these internally automatically.
             if hasattr(module, "_forward_pre_hooks"): module._forward_pre_hooks.clear()
             if hasattr(module, "_forward_hooks"): module._forward_hooks.clear()
-            
+
             # Input into the DTensor field
             module.register_forward_pre_hook(
                 lambda mod, inputs: (distribute_tensor(inputs[0], tp_mesh, [Replicate()]),)
@@ -141,7 +141,6 @@ def configure_tensor_parallel(
     distributed_config: DistributedConfig,
     device_mesh: torch.distributed.device_mesh.DeviceMesh,
 ) -> None:
-
     if not _tp_enabled(distributed_config):
         return
 
@@ -155,7 +154,7 @@ def configure_tensor_parallel(
     )
 
     apply_custom_tensor_parallel(
-        root_module, 
-        device_mesh, 
+        root_module,
+        device_mesh,
         distributed_config.tensor_parallel
     )
