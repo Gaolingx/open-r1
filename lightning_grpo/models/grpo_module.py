@@ -24,6 +24,7 @@ from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
 from lightning_grpo.models.grpo.tool_call import GRPOToolCallMixin
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
+from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.utils.modeling import load_causal_lm
 
@@ -67,10 +68,12 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
     def configure_model(self) -> None:
         """Apply tensor parallelism, FSDP2, compile, then initialize GRPO loss."""
 
+        configure_tensor_parallel(self.policy, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.policy, self.config.distributed, self.config.precision, self.device_mesh)
         self.policy = compile_model_if_configured(self.policy, self.config.model)
         self.rollout_coordinator.update_policy()
         if self.reference_model is not None:
+            configure_tensor_parallel(self.reference_model, self.config.distributed, self.device_mesh)
             configure_fully_shard(self.reference_model, self.config.distributed, self.config.precision, self.device_mesh)
 
         if self.config.liger_kernel.enabled:
@@ -79,6 +82,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
                 self.reward_manager,
                 self.metrics_aggregator,
                 rollout_temperature=self.config.rollout.temperature,
+                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
             )
         else:
             self._standard_loss_computer = StandardGRPOLossComputer(
@@ -86,6 +90,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
                 self.reward_manager,
                 self.metrics_aggregator,
                 rollout_temperature=self.config.rollout.temperature,
+                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
             )
 
     def _shared_step(self, batch: dict[str, list[Any]], stage: str) -> torch.Tensor:
@@ -160,7 +165,8 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
 
         if not self.trainer.is_global_zero:
             return
+
         export_dir = self.config.output_dir + "/hf_final"
-        exported_paths = export_configured_model(self.policy, self.config.model, export_dir, tokenizer=self.tokenizer)
+        exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
         if exported_paths:
             rank_zero_info(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")

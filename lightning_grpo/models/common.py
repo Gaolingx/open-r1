@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, Optional, Union
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 from peft import PeftModel
 from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.optimization import get_scheduler
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.base import OptimizationConfig, ModelConfig
+from lightning_grpo.utils.parallel.tp_utils import gather_state_dict_for_save
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -25,6 +29,38 @@ def resolve_torch_dtype(model_param_dtype: str) -> torch.dtype:
     """Resolve the parameter dtype from configuration."""
 
     return DTYPE_MAP[model_param_dtype]
+
+
+def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] | None:
+    """
+    Internal helper to gather sharded TP/FSDP weights.
+    Must be called on all ranks if TP is enabled.
+    """
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        raw_state_dict = model.state_dict()
+
+    tp_plan = getattr(model, "tp_plan", None)
+    device_mesh = getattr(model, "_device_mesh", None)
+    tp_size = getattr(model, "_tp_size", 1)
+
+    if tp_plan and device_mesh and tp_size > 1:
+        gathered_sd = gather_state_dict_for_save(
+            state_dict=raw_state_dict,
+            tp_plan=tp_plan,
+            device_mesh=device_mesh,
+            tp_size=tp_size
+        )
+    else:
+        gathered_sd = raw_state_dict
+
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            return gathered_sd
+        return None
+
+    return gathered_sd
 
 
 def compile_model_if_configured(model: torch.nn.Module, model_config: ModelConfig) -> torch.nn.Module:
@@ -234,78 +270,84 @@ def count_trainable_parameters(model: PreTrainedModel) -> tuple[int, int]:
     return trainable, total
 
 
-def save_pth_weights(model: PreTrainedModel, filepath: str) -> Path | None:
-    """Persist a plain PyTorch state dict next to the Lightning checkpoint."""
-
-    path = Path(filepath)
-    pth_path = path.with_suffix(".pth")
-    pth_path.parent.mkdir(parents=True, exist_ok=True)
-    state_dict = {key: value.detach().cpu() for key, value in model.state_dict().items()}
-    torch.save(state_dict, pth_path)
-    return pth_path
+PT_SUBDIR = "pt_checkpoint"
+HF_SUBDIR = "hf_checkpoint"
+PT_FILENAME = "pretrain_model.ckpt"
 
 
-def export_configured_model(
-    model: PreTrainedModel,
-    model_config: ModelConfig,
-    base_dir: str | Path,
-    *,
-    tokenizer: PreTrainedTokenizerBase | None = None,
-) -> dict[str, Path]:
-    """Export model artifacts according to config flags using standard directory names."""
+def ensure_dir(path: Union[str, Path]) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-    export_root = Path(base_dir)
-    export_root.mkdir(parents=True, exist_ok=True)
-    exported_paths: dict[str, Path] = {}
 
-    if model_config.save_pth_format:
-        pth_dir = export_root / "pt_checkpoint"
-        pth_stem = pth_dir / "pretrain_model.ckpt"
-        pth_path = save_pth_weights(model, pth_stem)
-        if pth_path is not None:
-            exported_paths["pth"] = pth_path
-
-    if model_config.save_safetensors_format:
-        hf_dir = export_root / "hf_checkpoint"
-        export_hf_model(
-            model,
-            model_config,
-            hf_dir,
-            tokenizer=tokenizer,
-            safe_serialization=True,
-        )
-        exported_paths["safetensors"] = hf_dir
-
-    return exported_paths
+def save_pth_weights_direct(state_dict: Dict[str, torch.Tensor], filepath: Path) -> Path:
+    """Helper to save a pre-gathered state dict."""
+    ensure_dir(filepath.parent)
+    cpu_state_dict = {k: v.detach().cpu() for k, v in state_dict.items()}
+    torch.save(cpu_state_dict, filepath)
+    return filepath
 
 
 def export_hf_model(
     model: PreTrainedModel,
     model_config: ModelConfig,
-    export_dir: str | Path,
+    export_dir: Path,
     *,
-    tokenizer: PreTrainedTokenizerBase | None = None,
-    state_dict: dict[str, torch.Tensor] | None = None,
-    safe_serialization: bool = False,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    safe_serialization: bool = True,
 ) -> Path:
-    export_path = Path(export_dir)
-    export_path.mkdir(parents=True, exist_ok=True)
+    """Helper to save a model and its configuration file to a directory."""
+    ensure_dir(export_dir)
+    save_model = model if isinstance(model, PeftModel) else get_peft_base_model(model)
+    
+    save_kwargs = {
+        "save_directory": str(export_dir),
+        "safe_serialization": safe_serialization,
+        "state_dict": state_dict
+    }
+    save_model.save_pretrained(**save_kwargs)
+    resolved_tokenizer = tokenizer or (load_tokenizer(model_config) if model_config.tokenizer_name_or_path else None)
+    if resolved_tokenizer:
+        resolved_tokenizer.save_pretrained(str(export_dir))
 
-    save_model = model
-    if isinstance(model, PeftModel):
-        save_model = model
-    else:
-        save_model = get_peft_base_model(model)
+    return export_dir
 
-    save_kwargs = {"safe_serialization": safe_serialization}
-    if state_dict is not None:
-        save_kwargs["state_dict"] = state_dict
-    save_model.save_pretrained(str(export_path), **save_kwargs)
 
-    resolved_tokenizer = tokenizer
-    if resolved_tokenizer is None and model_config.tokenizer_name_or_path:
-        resolved_tokenizer = load_tokenizer(model_config)
-    if resolved_tokenizer is not None:
-        resolved_tokenizer.save_pretrained(str(export_path))
+def export_configured_model(
+    model: PreTrainedModel,
+    model_config: ModelConfig,
+    base_dir: Union[str, Path],
+    *,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+) -> Dict[str, Path]:
+    """Export model artifacts according to config flags using standard directory names."""
+    root_path = ensure_dir(base_dir)
+    exported_paths: Dict[str, Path] = {}
 
-    return export_path
+    full_state_dict = get_gathered_state_dict(model)
+    if full_state_dict is None:
+        return exported_paths
+
+    if model_config.save_pth_format:
+        pth_output_dir = root_path / PT_SUBDIR
+        pth_file_path = pth_output_dir / PT_FILENAME
+        save_pth_weights_direct(full_state_dict, pth_file_path)
+        exported_paths["pth"] = pth_output_dir
+    if model_config.save_safetensors_format:
+        hf_output_dir = root_path / HF_SUBDIR
+        export_hf_model(
+            model=model,
+            model_config=model_config,
+            export_dir=hf_output_dir,
+            tokenizer=tokenizer,
+            state_dict=full_state_dict,
+            safe_serialization=True
+        )
+        exported_paths["safetensors"] = hf_output_dir
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    return exported_paths

@@ -20,6 +20,7 @@ from lightning_grpo.models.common import (
 from lightning_grpo.models.grpo.loss import masked_token_stats, compute_cross_entropy_loss, compute_liger_cross_entropy_loss
 from lightning_grpo.models.grpo.liger_loss import LigerCELossComputer
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
+from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
 from lightning_grpo.utils.metrics import log_moe_metrics
 
@@ -49,6 +50,7 @@ class SFTLightningModule(L.LightningModule):
     def configure_model(self) -> None:
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
+        configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
         self.model = compile_model_if_configured(self.model, self.config.model)
 
@@ -58,6 +60,7 @@ class SFTLightningModule(L.LightningModule):
                 self.model,
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
+                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
             )
 
     def _model_forward(
@@ -92,6 +95,15 @@ class SFTLightningModule(L.LightningModule):
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
             )
+        elif self.config.distributed.tensor_parallel.loss_parallel:
+            outputs = self._model_forward(batch)
+            loss = compute_cross_entropy_loss(
+                outputs.logits,
+                labels,
+                ignore_index=self.config.data.ignore_index,
+                label_smoothing=self.config.label_smoothing,
+                loss_parallel_enabled=True,
+            )
         else:
             outputs = self._model_forward(batch, exclude_labels=False)
             if hasattr(outputs, "loss") and outputs.loss is not None:
@@ -108,7 +120,7 @@ class SFTLightningModule(L.LightningModule):
         prog_bar = stage in {"train", "val"}
         self.log(f"{stage}/loss", loss, prog_bar=prog_bar, on_step=on_step, on_epoch=True, sync_dist=True)
 
-        if not use_liger:
+        if not use_liger and not self.config.distributed.tensor_parallel.loss_parallel:
             with torch.no_grad():
                 stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
             self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
@@ -158,11 +170,6 @@ class SFTLightningModule(L.LightningModule):
             return
 
         export_dir = self.config.output_dir + "/hf_final"
-        exported_paths = export_configured_model(
-            self.model,
-            self.config.model,
-            export_dir,
-            tokenizer=self.tokenizer,
-        )
+        exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
         if exported_paths:
             rank_zero_info(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")

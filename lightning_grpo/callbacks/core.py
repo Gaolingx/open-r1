@@ -16,7 +16,7 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 from transformers.optimization import get_scheduler
 
-from lightning_grpo.models.common import save_pth_weights, load_tokenizer
+from lightning_grpo.models.common import load_tokenizer, get_gathered_state_dict, save_pth_weights_direct
 from lightning_grpo.utils.configs.base import LoggingConfig, ModelConfig, TrainingBaseConfig
 from lightning_grpo.utils.modeling import resolve_export_model
 from lightning_grpo.utils.config import save_json_config
@@ -32,16 +32,21 @@ class CheckpointCallback(ModelCheckpoint):
     def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
         super()._save_checkpoint(trainer, filepath)
 
-        if not self.save_pt_format or not trainer.is_global_zero:
+        if not self.save_pt_format:
             return
+        
+        lightning_module = trainer.lightning_module
+        model = getattr(lightning_module, "model", lightning_module)
+        full_state_dict = get_gathered_state_dict(model)
 
-        model = resolve_export_model(trainer.lightning_module)
-        if model is None:
-            return
+        if trainer.is_global_zero and full_state_dict is not None:
+            checkpoint_dir = Path(filepath).parent
+            save_path = checkpoint_dir / "pt_checkpoint"
+            save_path.mkdir(parents=True, exist_ok=True)
 
-        save_path = Path(filepath).parent / "pt_checkpoint"
-        save_file = save_path / "pretrain_model"
-        save_pth_weights(model, save_file)
+            stem = Path(filepath).stem
+            save_file = save_path / f"{stem}.pth"
+            save_pth_weights_direct(full_state_dict, save_file)
 
 
 class EfficiencyMonitorCallback(Callback):

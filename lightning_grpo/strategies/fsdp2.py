@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from lightning_grpo.models.common import get_transformer_backbone_model, resolve_torch_dtype
 from lightning_grpo.utils.configs.base import DistributedConfig, PrecisionConfig
-from lightning_grpo.utils.fsdp_helper import get_fsdp_reshard_after_forward_policy
+from lightning_grpo.utils.parallel.fsdp_utils import get_fsdp_reshard_after_forward_policy
 
 
 def configure_fully_shard(
@@ -30,7 +30,7 @@ def configure_fully_shard(
     if distributed_config.strategy not in {"fsdp2", "model_parallel"}:
         return
 
-    dp_mesh = device_mesh["data_parallel"]
+    dp_mesh = device_mesh["dp"]
     if dp_mesh.size() <= 1:
         return
 
@@ -94,33 +94,47 @@ def _apply_fsdp(
     )
 
     base_model = get_transformer_backbone_model(model)
+    tie_embeddings = getattr(model.config, "tie_word_embeddings", False)
 
     embed_tokens = getattr(base_model, "embed_tokens", None)
     layers = getattr(base_model, "layers", [])
     norm = getattr(base_model, "norm", None)
     lm_head = getattr(model, "lm_head", None)
 
-    if embed_tokens is not None:
-        fully_shard(
-            embed_tokens,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
-        )
+    if tie_embeddings:
+        tied_modules = []
+        if embed_tokens is not None:
+            tied_modules.append(embed_tokens)
+        if norm is not None:
+            tied_modules.append(norm)
+        if lm_head is not None:
+            tied_modules.append(lm_head)
+
+        if tied_modules:
+            fully_shard(
+                tied_modules,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward_policy == "always",
+            )
+    else:
+        if embed_tokens is not None:
+            fully_shard(
+                embed_tokens,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+        if norm is not None and lm_head is not None:
+            fully_shard(
+                [norm, lm_head],
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward_policy == "always",
+            )
 
     for transformer_block in layers:
         fully_shard(
             transformer_block,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
-        )
-
-    # As an optimization, do not reshard_after_forward the last layers by default
-    # since FSDP would prefetch them immediately after the forward pass
-    if norm is not None and lm_head is not None:
-        fully_shard(
-            [norm, lm_head],
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward_policy == "always",
         )
 
     fully_shard(model, **fsdp_config)

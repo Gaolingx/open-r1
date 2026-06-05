@@ -19,35 +19,41 @@ from lightning_grpo.models.common import get_lm_head_model, get_transformer_back
 from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
 from lightning_grpo.utils.metrics import MoEAuxLossComputer, collect_moe_metrics
-
-
-def _materialize_liger_lm_head_parameter(
-    tensor: torch.Tensor | None,
-    *,
-    parameter_name: str,
-) -> torch.Tensor | None:
-    """Return a regular Tensor for Liger fused kernels, gathering TP shards when needed."""
-
-    if tensor is None:
-        return None
-    if not isinstance(tensor, DTensor):
-        return tensor
-    return tensor.redistribute(placements=[Replicate()]).to_local()
+from lightning_grpo.utils.parallel.tp_utils import gather_full_tensor, ALL_PARALLEL_STYLES
 
 
 def _materialize_liger_lm_head(
     lm_head: torch.nn.Module,
+    *,
+    loss_parallel_enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Gather DTensor lm_head parameters for Liger, or reject loss-parallel TP."""
+    """Gather lm_head parameters for Liger from either TP hooks or DTensors."""
+    if loss_parallel_enabled:
+        raise ValueError("Liger fused loss is incompatible with loss_parallel=True.")
+    weight = lm_head.weight
+    bias = getattr(lm_head, "bias", None)
 
-    weight = _materialize_liger_lm_head_parameter(
-        lm_head.weight,
-        parameter_name="lm_head.weight",
-    )
-    bias = _materialize_liger_lm_head_parameter(
-        getattr(lm_head, "bias", None),
-        parameter_name="lm_head.bias",
-    )
+    # 1. Check whether we used our hook-based Tensor Parallel (metadata on the module)
+    tp_plan = getattr(lm_head, "_hf_tp_plan", None)
+    if tp_plan is not None:
+        device_mesh = lm_head._hf_device_mesh
+
+        # revert weight
+        weight_shard_dim = ALL_PARALLEL_STYLES.plan_to_weight_dim.get(tp_plan)
+        if weight_shard_dim is not None:
+            weight = gather_full_tensor(weight, weight_shard_dim, device_mesh)
+
+        # revert bias
+        if bias is not None:
+            bias_shard_dim = ALL_PARALLEL_STYLES.plan_to_bias_dim.get(tp_plan)
+            if bias_shard_dim is not None:
+                bias = gather_full_tensor(bias, bias_shard_dim, device_mesh)
+
+    # 2. Compatible with torch native DTensor
+    elif isinstance(weight, DTensor):
+        weight = weight.redistribute(placements=[Replicate()]).to_local()
+        if bias is not None and isinstance(bias, DTensor):
+            bias = bias.redistribute(placements=[Replicate()]).to_local()
     return weight, bias
 
 
@@ -83,6 +89,7 @@ class LigerDPOLossComputer:
         loss_type: str,
         nll_coeff: float = 0.0,
         ignore_index: int = -100,
+        loss_parallel_enabled: bool = False,
         compiled: bool = True,
     ) -> None:
         try:
@@ -96,6 +103,7 @@ class LigerDPOLossComputer:
         self.model = model
         self.ref_model = ref_model
         self.nll_coeff = nll_coeff
+        self.loss_parallel_enabled = loss_parallel_enabled
         self.aux_loss_computer = MoEAuxLossComputer(model)
         self.loss_fn = LigerFusedLinearDPOLoss(
             beta=beta,
@@ -122,6 +130,7 @@ class LigerDPOLossComputer:
 
         weight, bias = _materialize_liger_lm_head(
             get_lm_head_model(self.model),
+            loss_parallel_enabled=self.loss_parallel_enabled,
         )
 
         with torch.no_grad():
@@ -134,6 +143,7 @@ class LigerDPOLossComputer:
 
         ref_weight, ref_bias = _materialize_liger_lm_head(
             get_lm_head_model(self.ref_model),
+            loss_parallel_enabled=self.loss_parallel_enabled,
         )
 
         shift_completion_mask = completion_mask[:, 1:].contiguous()
@@ -185,6 +195,7 @@ class LigerCELossComputer:
         *,
         ignore_index: int = -100,
         label_smoothing: float = 0.0,
+        loss_parallel_enabled: bool = False,
     ) -> None:
         try:
             from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
@@ -195,6 +206,7 @@ class LigerCELossComputer:
             ) from e
 
         self.model = model
+        self.loss_parallel_enabled = loss_parallel_enabled
         self.aux_loss_computer = MoEAuxLossComputer(model)
         self.loss_fn = LigerFusedLinearCrossEntropyLoss(
             ignore_index=ignore_index,
@@ -244,6 +256,7 @@ class LigerCELossComputer:
         # Get LM head weight (and optional bias)
         weight, bias = _materialize_liger_lm_head(
             get_lm_head_model(self.model),
+            loss_parallel_enabled=self.loss_parallel_enabled,
         )
 
         loss = self.loss_fn(weight, shift_hidden_2d, shift_labels_1d, bias)
@@ -272,6 +285,7 @@ class LigerGRPOLossComputer:
         metrics_aggregator: GRPOMetricsAggregator,
         *,
         rollout_temperature: float,
+        loss_parallel_enabled: bool = False,
     ) -> None:
         try:
             from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
@@ -285,6 +299,7 @@ class LigerGRPOLossComputer:
         self.reward_manager = reward_manager
         self.metrics_aggregator = metrics_aggregator
         self.rollout_temperature = rollout_temperature
+        self.loss_parallel_enabled = loss_parallel_enabled
         self.aux_loss_computer = MoEAuxLossComputer(module.policy)
 
         config = module.config
@@ -394,6 +409,7 @@ class LigerGRPOLossComputer:
             ref_hidden_state = ref_hidden_state.contiguous()
             ref_weight, ref_bias = _materialize_liger_lm_head(
                 get_lm_head_model(self.module.reference_model),
+                loss_parallel_enabled=self.loss_parallel_enabled,
             )
 
         rewards, rewards_per_func = self.reward_manager.compute_rewards(
@@ -423,6 +439,7 @@ class LigerGRPOLossComputer:
 
         weight, bias = _materialize_liger_lm_head(
             get_lm_head_model(self.module.policy),
+            loss_parallel_enabled=self.loss_parallel_enabled,
         )
         loss, liger_metrics = self.liger_grpo_loss(
             last_hidden_state,
