@@ -128,7 +128,6 @@ def apply_custom_tensor_parallel(
             add_tensor_parallel_hooks_to_module(
                 model=model,
                 module=module,
-                tp_plan=final_plan,
                 layer_name=name,
                 current_module_plan=plan_name,
                 device_mesh=tp_mesh
