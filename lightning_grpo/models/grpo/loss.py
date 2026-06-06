@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.parallel import loss_parallel
 
+from lightning_grpo.utils.metrics import MoEAuxLossComputer, collect_moe_metrics
+
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Compute a mask-aware mean."""
@@ -122,6 +124,48 @@ def compute_liger_cross_entropy_loss(
     )
 
 
+def compute_standard_cross_entropy_loss(
+    model: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+    loss_parallel_enabled: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute standard CE loss and manually add MoE auxiliary loss."""
+
+    input_ids = batch["input_ids"]
+    attention_mask = batch.get("attention_mask")
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        output_router_logits=True
+    )
+
+    ce_loss = compute_cross_entropy_loss(
+        outputs.logits,
+        labels,
+        ignore_index=ignore_index,
+        label_smoothing=label_smoothing,
+        loss_parallel_enabled=loss_parallel_enabled,
+    )
+    loss = ce_loss
+
+    aux_loss_computer = MoEAuxLossComputer(model)
+    aux_loss, aux_metrics = aux_loss_computer.compute(outputs, attention_mask)
+    if aux_loss is not None:
+        loss = loss + aux_loss.to(loss.device)
+
+    metrics = collect_moe_metrics(outputs)
+    metrics.update(aux_metrics)
+    metrics["ce_loss"] = ce_loss.detach()
+    metrics["_policy_outputs"] = outputs
+
+    return loss, metrics
+
+
 # DPO Loss
 def _dpo_loss(
     loss_type: str,
@@ -177,7 +221,7 @@ def compute_standard_dpo_loss(
     completion_mask = batch["completion_mask"]
 
     # Forward through policy model
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, output_router_logits=True)
     shift_logits = outputs.logits[..., :-1, :].contiguous()
     shift_labels = input_ids[..., 1:].contiguous()
     shift_completion_mask = completion_mask[..., 1:].contiguous()
@@ -224,6 +268,11 @@ def compute_standard_dpo_loss(
         )
         loss = loss + nll_coeff * nll_loss
 
+    aux_loss_computer = MoEAuxLossComputer(model)
+    aux_loss, aux_metrics = aux_loss_computer.compute(outputs, attention_mask)
+    if aux_loss is not None:
+        loss = loss + aux_loss.to(loss.device)
+
     # Compute rewards for logging
     chosen_rewards = beta * chosen_logratios.detach()
     rejected_rewards = beta * rejected_logratios.detach()
@@ -238,6 +287,9 @@ def compute_standard_dpo_loss(
         "rejected_rewards": rejected_rewards,
         "_policy_outputs": outputs,
     }
+
+    metrics_dict.update(collect_moe_metrics(outputs))
+    metrics_dict.update(aux_metrics)
 
     return loss, metrics_dict
 
@@ -416,6 +468,10 @@ def compute_standard_grpo_loss(
         loss_type=loss_type,
         max_completion_length=max_completion_length,
     )
+    aux_loss_computer = MoEAuxLossComputer(model)
+    aux_loss, aux_metrics = aux_loss_computer.compute(outputs, model_attention_mask)
+    if aux_loss is not None:
+        loss = loss + aux_loss.to(loss.device)
 
     with torch.no_grad():
         entropy = entropy_from_logits(completion_logits)
@@ -432,7 +488,11 @@ def compute_standard_grpo_loss(
             "is_region_clipped": loss_metrics["is_region_clipped"].detach(),
             "is_cispo_clipped": loss_metrics["is_cispo_clipped"].detach(),
         }
+
+    local_metrics.update(collect_moe_metrics(outputs))
+    local_metrics.update(aux_metrics)
     local_metrics["_policy_outputs"] = outputs
+
     return loss, local_metrics
 
 

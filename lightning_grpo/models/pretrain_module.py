@@ -17,7 +17,11 @@ from lightning_grpo.models.common import (
     export_configured_model,
     load_tokenizer,
 )
-from lightning_grpo.models.grpo.loss import masked_token_stats, compute_cross_entropy_loss, compute_liger_cross_entropy_loss
+from lightning_grpo.models.grpo.loss import (
+    masked_token_stats,
+    compute_standard_cross_entropy_loss,
+    compute_liger_cross_entropy_loss,
+)
 from lightning_grpo.models.grpo.liger_loss import LigerCELossComputer
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
@@ -95,26 +99,16 @@ class PretrainLightningModule(L.LightningModule):
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
             )
-        elif self.config.distributed.tensor_parallel.loss_parallel:
-            outputs = self._model_forward(batch)
-            loss = compute_cross_entropy_loss(
-                outputs.logits,
-                labels,
+        else:
+            loss, metrics = compute_standard_cross_entropy_loss(
+                self.model,
+                batch=batch,
+                labels=labels,
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
-                loss_parallel_enabled=True,
+                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
             )
-        else:
-            outputs = self._model_forward(batch, exclude_labels=False)
-            if hasattr(outputs, "loss") and outputs.loss is not None:
-                loss = outputs.loss
-            else:
-                loss = compute_cross_entropy_loss(
-                    outputs.logits,
-                    labels,
-                    ignore_index=self.config.data.ignore_index,
-                    label_smoothing=self.config.label_smoothing,
-                )
+            outputs = metrics.get("_policy_outputs")
 
         on_step = stage == "train"
         prog_bar = stage in {"train", "val"}

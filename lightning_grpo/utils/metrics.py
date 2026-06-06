@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 from typing import Any, Optional
 
 import lightning as L
@@ -155,34 +154,38 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
 
 def log_moe_metrics(
     module: L.LightningModule,
-    outputs_or_metrics: Any,
+    metrics: dict[str, Any],
     stage: str,
     *,
     on_step: bool,
     on_epoch: bool = True,
     sync_dist: bool = True,
 ) -> None:
-    """Log shared MoE diagnostics from raw outputs or a precomputed metric dict."""
+    """Log shared MoE diagnostics from a precomputed metric dict."""
 
-    metrics = collect_moe_metrics(outputs_or_metrics)
+    if not isinstance(metrics, dict):
+        raise ValueError(
+            f"log_moe_metrics expects a precomputed metrics dictionary, but got {type(metrics).__name__}. "
+            "Please call `collect_moe_metrics(outputs)` beforehand and pass the resulting dictionary."
+        )
 
-    if isinstance(outputs_or_metrics, dict):
-        get_metric = outputs_or_metrics.get
-        metrics.update({
-            "aux_loss": get_metric("aux_loss", metrics.get("aux_loss")),
-            "router_entropy": get_metric("router_entropy", metrics.get("router_entropy")),
-            "expert_load_std": get_metric("expert_load_std", metrics.get("expert_load_std")),
-            "top1_expert_occupancy": get_metric("top1_expert_occupancy", metrics.get("top1_expert_occupancy")),
-            "dead_expert_fraction": get_metric("dead_expert_fraction", metrics.get("dead_expert_fraction")),
-        })
-        metrics = {key: value for key, value in metrics.items() if value is not None}
+    moe_keys = [
+        "aux_loss",
+        "router_entropy",
+        "expert_load_std",
+        "top1_expert_occupancy",
+        "dead_expert_fraction",
+    ]
 
-    if not metrics:
+    # Extract only MoE-related metrics to prevent logging generic metrics (e.g. ce_loss) with a 'moe_' prefix
+    moe_metrics = {key: metrics[key] for key in moe_keys if metrics.get(key) is not None}
+
+    if not moe_metrics:
         return
 
     log_kwargs = {"prog_bar": False, "on_step": on_step, "on_epoch": on_epoch, "sync_dist": sync_dist}
 
-    for key, value in metrics.items():
+    for key, value in moe_metrics.items():
         formatted_value = format_metric_value(value)
         if formatted_value is not None:
             module.log(f"{stage}/moe_{key}", formatted_value, **log_kwargs)
