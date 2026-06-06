@@ -7,8 +7,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 from peft import PeftModel
 from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.optimization import get_scheduler
@@ -36,22 +35,29 @@ def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] |
     Internal helper to gather sharded TP/FSDP weights.
     Must be called on all ranks if TP is enabled.
     """
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
 
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-        raw_state_dict = model.state_dict()
+    raw_state_dict = get_model_state_dict(model, options=options)
 
     tp_plan = getattr(model, "tp_plan", None)
     device_mesh = getattr(model, "_device_mesh", None)
     tp_size = getattr(model, "_tp_size", 1)
 
     if tp_plan and device_mesh and tp_size > 1:
-        gathered_sd = gather_state_dict_for_save(
-            state_dict=raw_state_dict,
-            tp_plan=tp_plan,
-            device_mesh=device_mesh,
-            tp_size=tp_size
-        )
+        gathered_sd = {}
+        current_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+        for k, v in raw_state_dict.items():
+            temp_dict = {k: v.to(current_device)}
+            temp_gathered = gather_state_dict_for_save(
+                state_dict=temp_dict,
+                tp_plan=tp_plan,
+                device_mesh=device_mesh,
+                tp_size=tp_size
+            )
+            gathered_sd[k] = temp_gathered[k].cpu()
+
+        torch.cuda.empty_cache()
     else:
         gathered_sd = raw_state_dict
 

@@ -19,7 +19,6 @@ from lightning_grpo.models.common import get_lm_head_model, get_transformer_back
 from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
 from lightning_grpo.utils.metrics import MoEAuxLossComputer, collect_moe_metrics
-from lightning_grpo.utils.parallel.tp_utils import gather_full_tensor, ALL_PARALLEL_STYLES
 
 
 def _materialize_liger_lm_head(
@@ -27,33 +26,31 @@ def _materialize_liger_lm_head(
     *,
     loss_parallel_enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Gather lm_head parameters for Liger from either TP hooks or DTensors."""
+    """Gather lm_head parameters for Liger from DTensors (FSDP2 only)."""
+
     if loss_parallel_enabled:
-        raise ValueError("Liger fused loss is incompatible with loss_parallel=True.")
+        raise RuntimeError(
+            "Liger fused loss is incompatible with Tensor Parallelism (loss_parallel=True). "
+            "Please disable Tensor Parallelism when using Liger Kernel."
+        )
+
+    tp_plan = getattr(lm_head, "_hf_tp_plan", None)
+    if tp_plan is not None:
+        raise RuntimeError(
+            f"Liger fused loss is incompatible with Tensor Parallelism. "
+            f"You are currently using TP plan: {tp_plan}. "
+            f"Please disable Tensor Parallelism (set tensor_parallel_size=1) when using Liger Kernel, "
+            f"or disable Liger Kernel if you want to use TP."
+        )
+
     weight = lm_head.weight
     bias = getattr(lm_head, "bias", None)
 
-    # 1. Check whether we used our hook-based Tensor Parallel (metadata on the module)
-    tp_plan = getattr(lm_head, "_hf_tp_plan", None)
-    if tp_plan is not None:
-        device_mesh = lm_head._hf_device_mesh
-
-        # revert weight
-        weight_shard_dim = ALL_PARALLEL_STYLES.plan_to_weight_dim.get(tp_plan)
-        if weight_shard_dim is not None:
-            weight = gather_full_tensor(weight, weight_shard_dim, device_mesh)
-
-        # revert bias
-        if bias is not None:
-            bias_shard_dim = ALL_PARALLEL_STYLES.plan_to_bias_dim.get(tp_plan)
-            if bias_shard_dim is not None:
-                bias = gather_full_tensor(bias, bias_shard_dim, device_mesh)
-
-    # 2. Compatible with torch native DTensor
-    elif isinstance(weight, DTensor):
-        weight = weight.redistribute(placements=[Replicate()]).to_local()
+    if isinstance(weight, DTensor):
+        weight = weight.full_tensor()
         if bias is not None and isinstance(bias, DTensor):
-            bias = bias.redistribute(placements=[Replicate()]).to_local()
+            bias = bias.full_tensor()
+
     return weight, bias
 
 
