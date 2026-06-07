@@ -160,9 +160,6 @@ class SFTLightningModule(L.LightningModule):
     def on_train_end(self) -> None:
         """Export a Hugging Face-compatible model directory after training."""
 
-        if not self.trainer.is_global_zero:
-            return
-
         export_dir = self.config.output_dir + "/hf_final"
         exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
         if exported_paths:

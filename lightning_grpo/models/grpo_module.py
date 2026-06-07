@@ -163,9 +163,6 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         if self.tool_executor is not None and hasattr(self.tool_executor, "shutdown"):
             self.tool_executor.shutdown()
 
-        if not self.trainer.is_global_zero:
-            return
-
         export_dir = self.config.output_dir + "/hf_final"
         exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
         if exported_paths:
