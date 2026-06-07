@@ -50,7 +50,7 @@ def get_resolved_tp_plan(model: nn.Module, tp_config: Any) -> Dict[str, str]:
 
 def wrap_module_parameters_as_dtensor(module, device_mesh, tp_plan_name):
     """Wrap the already sharded Parameter as a DTensor."""
-    tp_mesh = device_mesh["tp"] if "tp" in device_mesh.mesh_dim_names else device_mesh
+    tp_mesh = device_mesh["tensor_parallel"] if "tensor_parallel" in device_mesh.mesh_dim_names else device_mesh
 
     for param_name, param in module.named_parameters(recurse=False):
         # 1. Automatically determine shard dimensions
@@ -81,7 +81,7 @@ def apply_custom_tensor_parallel(
 ):
     final_plan = get_resolved_tp_plan(model, tp_config)
 
-    tp_mesh = device_mesh["tp"] if "tp" in device_mesh.mesh_dim_names else device_mesh
+    tp_mesh = device_mesh["tensor_parallel"] if "tensor_parallel" in device_mesh.mesh_dim_names else device_mesh
     rank = tp_mesh.get_local_rank()
 
     for name, module in model.named_modules():
@@ -143,7 +143,7 @@ def configure_tensor_parallel(
     if not _tp_enabled(distributed_config):
         return
 
-    tp_mesh = device_mesh["tp"]
+    tp_mesh = device_mesh["tensor_parallel"]
     if tp_mesh.size() <= 1:
         return
 

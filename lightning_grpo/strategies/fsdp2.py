@@ -30,7 +30,7 @@ def configure_fully_shard(
     if distributed_config.strategy not in {"fsdp2", "model_parallel"}:
         return
 
-    dp_mesh = device_mesh["dp"]
+    dp_mesh = device_mesh["data_parallel"]
     if dp_mesh.size() <= 1:
         return
 
