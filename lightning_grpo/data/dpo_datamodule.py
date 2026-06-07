@@ -145,7 +145,8 @@ class DPODataModule(ChatTemplateDataModule):
         max_seq_length = self.data_config.max_seq_length
         chosen_column = self.data_config.chosen_column
         rejected_column = self.data_config.rejected_column
-        split_messages_for_dpo = self._split_messages_for_dpo
+        add_system_ratio = self.data_config.add_system_ratio
+        split_messages_for_dpo = DPODataModule._split_messages_for_dpo
 
         def tokenize_messages(messages: list[dict[str, Any]]) -> list[int]:
             """Tokenize a list of chat messages using the chat template."""
@@ -183,9 +184,8 @@ class DPODataModule(ChatTemplateDataModule):
                 rejected_sample = normalize_preference_sample(raw_sample, rejected_column)
                 chosen_messages, chosen_tools = chat_processor.prepare_sample(chosen_sample)
                 rejected_messages, rejected_tools = chat_processor.prepare_sample(rejected_sample)
-                chosen_messages = preprocess_chat_messages(chosen_messages, self.data_config.add_system_ratio)
-                rejected_messages = preprocess_chat_messages(rejected_messages, self.data_config.add_system_ratio)
-
+                chosen_messages = preprocess_chat_messages(chosen_messages, add_system_ratio)
+                rejected_messages = preprocess_chat_messages(rejected_messages, add_system_ratio)
                 prompt_messages, chosen_completion = split_messages_for_dpo(chosen_messages)
                 _, rejected_completion = split_messages_for_dpo(rejected_messages)
                 prompt_ids = tokenize_messages(prompt_messages) if prompt_messages else []

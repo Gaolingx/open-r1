@@ -94,6 +94,9 @@ class GRPODataModule(ChatTemplateDataModule):
         """Build prompt text plus reward metadata for online optimization."""
 
         response_column = getattr(self.data_config, "response_column", "solution")
+        messages_column = getattr(self.data_config, "messages_column", "messages")
+        chat_processor = self.chat_processor
+        add_generation_prompt = getattr(self.data_config, "add_generation_prompt", True)
 
         def resolve_solution(sample: dict[str, Any]) -> Any:
             for key in (response_column, "solution", "answer", "response", "output"):
@@ -106,18 +109,18 @@ class GRPODataModule(ChatTemplateDataModule):
             metadata: list[str] = []
             for sample in iter_batch_samples(batch):
                 formatted = formatter(sample)
-                messages, tools = self.chat_processor.prepare_sample(formatted)
+                messages, tools = chat_processor.prepare_sample(formatted)
                 prompt_texts.append(
-                    self.chat_processor.render(
+                    chat_processor.render(
                         messages,
-                        add_generation_prompt=getattr(self.data_config, "add_generation_prompt", True),
+                        add_generation_prompt=add_generation_prompt,
                         tools=tools,
                     )
                 )
                 reward_metadata = {
                     key: value
                     for key, value in sample.items()
-                    if key != getattr(self.data_config, "messages_column", "messages")
+                    if key != messages_column
                 }
                 solution = resolve_solution(sample)
                 if solution is not None:
