@@ -92,7 +92,7 @@ class SFTLightningModule(L.LightningModule):
         outputs = None
 
         if use_liger:
-            loss, outputs = compute_liger_cross_entropy_loss(
+            loss, metrics = compute_liger_cross_entropy_loss(
                 self._liger_loss_computer,
                 batch=batch,
                 labels=labels,
@@ -122,7 +122,7 @@ class SFTLightningModule(L.LightningModule):
             self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
 
-        log_moe_metrics(self, outputs, stage, on_step=on_step)
+        log_moe_metrics(self, metrics, stage, on_step=on_step)
 
         return loss
 
