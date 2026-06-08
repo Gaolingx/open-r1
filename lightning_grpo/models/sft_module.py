@@ -55,7 +55,7 @@ class SFTLightningModule(L.LightningModule):
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
         configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
-        configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh, use_liger=use_liger)
+        configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
         self.model = compile_model_if_configured(self.model, self.config.model)
 
         # Initialize Liger fused CE loss if enabled
@@ -121,9 +121,8 @@ class SFTLightningModule(L.LightningModule):
             self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-        if use_liger:
-            if "token_accuracy" in metrics:
-                self.log(f"{stage}/token_accuracy", metrics["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+        if use_liger and "token_accuracy" in metrics:
+            self.log(f"{stage}/token_accuracy", metrics["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
 
         log_moe_metrics(self, metrics, stage, on_step=on_step)
 

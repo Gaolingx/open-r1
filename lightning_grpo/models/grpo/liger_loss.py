@@ -16,8 +16,6 @@ import torch
 from torch.distributed.tensor import DTensor, Replicate
 
 from lightning_grpo.models.common import get_lm_head_model, get_transformer_backbone_model
-from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
-from lightning_grpo.models.grpo.reward import GRPORewardManager
 from lightning_grpo.utils.metrics import MoEAuxLossComputer, collect_moe_metrics
 
 
@@ -208,6 +206,7 @@ class LigerCELossComputer:
         self.loss_fn = LigerFusedLinearCrossEntropyLoss(
             ignore_index=ignore_index,
             label_smoothing=label_smoothing,
+            return_token_accuracy=True,
         )
 
     def compute_loss(
@@ -256,12 +255,16 @@ class LigerCELossComputer:
             loss_parallel_enabled=self.loss_parallel_enabled,
         )
 
-        loss = self.loss_fn(weight, shift_hidden_2d, shift_labels_1d, bias)
+        ce_output = self.loss_fn(weight, shift_hidden_2d, shift_labels_1d, bias)
+        loss = ce_output.loss
+
         metrics = collect_moe_metrics(moe_outputs)
+        metrics["token_accuracy"] = ce_output.token_accuracy
         aux_loss, aux_metrics = self.aux_loss_computer.compute(moe_outputs, attention_mask)
         if aux_loss is not None:
             loss = loss + aux_loss.to(loss.device)
         metrics.update(aux_metrics)
+
         return loss, metrics
 
 
@@ -274,6 +277,8 @@ class LigerGRPOLossComputer:
     recomputation, but the memory savings enable larger batch sizes or longer
     sequences.
     """
+    from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
+    from lightning_grpo.models.grpo.reward import GRPORewardManager
 
     def __init__(
         self,
