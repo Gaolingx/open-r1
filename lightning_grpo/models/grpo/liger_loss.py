@@ -234,6 +234,7 @@ class LigerGRPOLossComputer:
         *,
         rollout_temperature: float,
         loss_parallel_enabled: bool = False,
+        compiled: bool = True,
     ) -> None:
         try:
             from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
@@ -255,7 +256,7 @@ class LigerGRPOLossComputer:
         epsilon_high = config.rollout.epsilon_high if config.rollout.loss_type == "cispo" else config.rollout.epsilon
         self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
             beta=config.rollout.kl_beta,
-            compiled=config.liger_kernel.compiled,
+            compiled=compiled,
             epsilon_low=config.rollout.epsilon,
             epsilon_high=epsilon_high,
             temperature=rollout_temperature,

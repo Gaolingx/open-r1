@@ -70,8 +70,8 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         """Apply tensor parallelism, FSDP2, compile, then initialize GRPO loss."""
 
         # Apply liger kernel
-        if self.config.liger_kernel.enabled:
-            apply_liger_kernel(model=self.model, kernel_config=self.config.liger_kernel.kernel_config)
+        if self.config.liger_kernel.patch_model_enabled():
+            apply_liger_kernel(model=self.policy, kernel_config=self.config.liger_kernel.kernel_config)
 
         configure_tensor_parallel(self.policy, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.policy, self.config.distributed, self.config.precision, self.device_mesh)
@@ -81,13 +81,14 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
             configure_tensor_parallel(self.reference_model, self.config.distributed, self.device_mesh)
             configure_fully_shard(self.reference_model, self.config.distributed, self.config.precision, self.device_mesh)
 
-        if self.config.liger_kernel.enabled:
+        if self.config.liger_kernel.liger_grpo_enabled():
             self._liger_loss_computer = LigerGRPOLossComputer(
                 self,
                 self.reward_manager,
                 self.metrics_aggregator,
                 rollout_temperature=self.config.rollout.temperature,
                 loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
+                compiled=self.config.liger_kernel.compiled,
             )
         else:
             self._standard_loss_computer = StandardGRPOLossComputer(
@@ -108,7 +109,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
             rollout_batch = self._run_tool_calling(rollout_batch)
 
         self.reward_manager.device = self.device
-        if self.config.liger_kernel.enabled:
+        if self.config.liger_kernel.liger_grpo_enabled():
             if self._liger_loss_computer is None:
                 raise RuntimeError("GRPO loss computer is not initialized. Call configure_model() first.")
             loss, metrics = self._liger_loss_computer.compute_loss(rollout_batch, training=stage == "train")

@@ -87,7 +87,7 @@ class DPOLightningModule(L.LightningModule):
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
         # Apply liger kernel
-        if self.config.liger_kernel.enabled:
+        if self.config.liger_kernel.patch_model_enabled():
             apply_liger_kernel(model=self.model, kernel_config=self.config.liger_kernel.kernel_config)
 
         configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
@@ -99,7 +99,7 @@ class DPOLightningModule(L.LightningModule):
         configure_fully_shard(self.ref_model, self.config.distributed, self.config.precision, self.device_mesh)
 
         # Initialize Liger fused DPO loss if enabled
-        if self.config.liger_kernel.enabled:
+        if self.config.liger_kernel.liger_dpo_enabled():
             self._liger_loss_computer = LigerDPOLossComputer(
                 self.model,
                 self.ref_model,
@@ -113,7 +113,7 @@ class DPOLightningModule(L.LightningModule):
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         """Run one optimization/evaluation step and log metrics."""
 
-        use_liger = self.config.liger_kernel.enabled
+        use_liger = self.config.liger_kernel.liger_dpo_enabled()
 
         if use_liger:
             loss, metrics = compute_liger_dpo_loss(self._liger_loss_computer, batch)

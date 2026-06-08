@@ -49,7 +49,7 @@ class PretrainLightningModule(L.LightningModule):
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
         # Apply liger kernel
-        if self.config.liger_kernel.enabled:
+        if self.config.liger_kernel.patch_model_enabled():
             apply_liger_kernel(model=self.model, kernel_config=self.config.liger_kernel.kernel_config)
 
         configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
@@ -75,7 +75,7 @@ class PretrainLightningModule(L.LightningModule):
 
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         labels = batch["labels"]
-        use_liger = self.config.liger_kernel.enabled
+        use_liger = self.config.liger_kernel.liger_ce_enabled()
 
         if use_liger:
             loss, metrics = compute_liger_cross_entropy_loss(

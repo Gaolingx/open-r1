@@ -239,9 +239,26 @@ class DistributedConfig:
 @dataclass
 class LigerConfig:
     """Liger kernel configuration."""
+
     enabled: bool = False
+    enable_patch_model: bool = True
+    enable_liger_ce: bool = True
+    enable_liger_dpo: bool = True
+    enable_liger_grpo: bool = True
     compiled: bool = True
     kernel_config: dict[str, Any] = field(default_factory=dict)
+
+    def patch_model_enabled(self) -> bool:
+        return self.enabled and self.enable_patch_model
+
+    def liger_ce_enabled(self) -> bool:
+        return self.enabled and self.enable_liger_ce
+
+    def liger_dpo_enabled(self) -> bool:
+        return self.enabled and self.enable_liger_dpo
+
+    def liger_grpo_enabled(self) -> bool:
+        return self.enabled and self.enable_liger_grpo
 
 
 @dataclass
