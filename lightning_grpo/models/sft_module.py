@@ -55,7 +55,7 @@ class SFTLightningModule(L.LightningModule):
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
 
         configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
-        configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
+        configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh, use_liger=use_liger)
         self.model = compile_model_if_configured(self.model, self.config.model)
 
         # Initialize Liger fused CE loss if enabled
@@ -108,19 +108,22 @@ class SFTLightningModule(L.LightningModule):
                 label_smoothing=self.config.label_smoothing,
                 loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
             )
-            outputs = metrics.get("_policy_outputs")
 
         on_step = stage == "train"
         prog_bar = stage in {"train", "val"}
-        self.log(f"{stage}/loss", loss, prog_bar=prog_bar, on_step=on_step, on_epoch=True, sync_dist=True)
 
+        self.log(f"{stage}/loss", loss, prog_bar=prog_bar, on_step=on_step, on_epoch=True, sync_dist=True)
         if not use_liger and not self.config.distributed.tensor_parallel.loss_parallel:
+            outputs = metrics.get("_policy_outputs")
             with torch.no_grad():
                 stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index)
-            self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/entropy", stats["entropy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/mean_logprob", stats["mean_logprob"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/perplexity", stats["perplexity"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+            self.log(f"{stage}/token_accuracy", stats["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
+        if use_liger:
+            if "token_accuracy" in metrics:
+                self.log(f"{stage}/token_accuracy", metrics["token_accuracy"], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
 
         log_moe_metrics(self, metrics, stage, on_step=on_step)
 
