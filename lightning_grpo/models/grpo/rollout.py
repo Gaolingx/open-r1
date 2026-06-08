@@ -6,9 +6,11 @@ import json
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from lightning_grpo.models.common import compute_per_token_logps
-from lightning_grpo.models.grpo.rollout_engine import create_rollout_engine
+from lightning_grpo.models.grpo.rollout_module.rollout_engine import create_rollout_engine
+from lightning_grpo.models.grpo.rollout_module.utils import RolloutResult
 from lightning_grpo.data.base import apply_chat_template
 
 class LocalGenerateRolloutCoordinator:
@@ -17,16 +19,22 @@ class LocalGenerateRolloutCoordinator:
     def __init__(self, module: Any) -> None:
         self.module = module
         rollout_config = module.config.rollout
-        sglang_model_path = rollout_config.sglang_model_path or module.config.model.tokenizer_name_or_path or module.config.model.model_name_or_path
+        model_name_or_path = module.config.model.tokenizer_name_or_path or module.config.model.model_name_or_path
+        world_size = dist.get_world_size() if dist.is_initialized() else int(getattr(getattr(module, "trainer", None), "world_size", 1) or 1)
+        global_rank = dist.get_rank() if dist.is_initialized() else int(getattr(module, "global_rank", 0) or 0)
+        local_rank = int(getattr(module, "local_rank", 0) or 0)
         self.rollout_engine = create_rollout_engine(
             engine_type=rollout_config.engine,
             policy_model=module.policy,
             tokenizer=module.tokenizer,
             device=str(module.device),
-            sglang_base_url=rollout_config.sglang_base_url,
-            sglang_model_path=sglang_model_path,
-            sglang_shared_path=rollout_config.sglang_shared_path,
-            sglang_timeout=rollout_config.sglang_timeout,
+            vllm_config=rollout_config.vllm,
+            model_name_or_path=model_name_or_path,
+            sampling_config_path=rollout_config.vllm.sampling_config_path,
+            max_completion_length=rollout_config.max_completion_length,
+            world_size=world_size,
+            local_rank=local_rank,
+            global_rank=global_rank,
         )
 
     def update_policy(self) -> None:
@@ -67,25 +75,25 @@ class LocalGenerateRolloutCoordinator:
             tokenizer.padding_side = old_padding_side
         return {key: value.to(self.module.device) for key, value in encoded.items()}
 
-    def _generate(self, prompts: list[str], *, num_generations: int = 1) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    def _generate(self, prompts: list[str], *, num_generations: int = 1) -> RolloutResult:
         """Generate completions with the configured rollout engine."""
 
         encoded = self._tokenize_prompts(prompts)
-        result = self.rollout_engine.generate(
+        return self.rollout_engine.generate(
             prompt_ids=encoded["input_ids"],
             attention_mask=encoded["attention_mask"],
             num_generations=num_generations,
             max_new_tokens=self.module.config.rollout.max_completion_length,
             temperature=self.module.config.rollout.temperature,
+            top_p=self.module.config.rollout.top_p,
         )
-        return result.completion_ids, result.completion_mask, result.completions
 
     @torch.no_grad()
     def _generate_once(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
         """Generate one completion for each prompt and return padded completion ids."""
 
-        completion_ids, completion_mask, completion_texts = self._generate(prompts, num_generations=1)
-        return completion_ids, completion_mask, completion_texts
+        result = self._generate(prompts, num_generations=1)
+        return result.completion_ids, result.completion_mask, result.completions_text
 
     def _batch_metadata(self, batch: dict[str, list[Any]]) -> list[dict[str, Any]]:
         """Return per-sample metadata dictionaries from the collated batch."""
@@ -140,7 +148,11 @@ class LocalGenerateRolloutCoordinator:
 
         prompts = list(batch["prompt_text"])
         expanded_prompts = [prompt for prompt in prompts for _ in range(num_generations)]
-        completion_ids, completion_mask, completions = self._generate(prompts, num_generations=num_generations)
+        result = self._generate(prompts, num_generations=num_generations)
+        completion_ids = result.completion_ids
+        completion_mask = result.completion_mask
+        completions = result.completions_text
+        old_per_token_logps = result.per_token_logps if result.per_token_logps.numel() > 0 else None
         batch_metadata = self._batch_metadata(batch)
         metadata = []
         for index, completion in enumerate(completions):
@@ -154,6 +166,7 @@ class LocalGenerateRolloutCoordinator:
             completions,
             metadata,
             num_generations=num_generations,
+            old_per_token_logps=old_per_token_logps,
         )
 
     def _pack_rollout(

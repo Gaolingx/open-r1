@@ -3,8 +3,7 @@ seed: 42
 output_dir: outputs/lightning_grpo_qwen3_1_7b_fsdp
 
 liger_kernel:
-  enabled: true
-  compiled: true
+  enabled: false
 
 precision:
   model_param_dtype: bf16

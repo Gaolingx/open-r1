@@ -33,7 +33,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to checkpoint to resume from",
     )
-    parser.add_argument("--seed", type=int, default=None, help="Random seed (overrides config)")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed (overrides config)",
+    )
     parser.add_argument(
         "--precision",
         type=str,
@@ -41,21 +46,24 @@ def parse_args() -> argparse.Namespace:
         choices=["16", "32", "bf16", "16-mixed", "bf16-mixed"],
         help="Training precision",
     )
-    parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs to use")
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs to use",
+    )
     parser.add_argument(
         "--lora_init_path",
         type=str,
         default=None,
         help="Optional LoRA initialization path. When provided, LoRA is enabled and initialized from this path.",
     )
-    parser.add_argument("--output_dir", type=str, default=None, help="Output directory")
-    parser.add_argument("--num_generations", type=int, default=None, help="Rollouts sampled per prompt")
-    parser.add_argument("--max_gen_len", type=int, default=None, help="Maximum new tokens per rollout turn")
-    parser.add_argument("--rollout_engine", type=str, default=None, choices=["torch", "sglang"], help="Rollout inference engine")
-    parser.add_argument("--sglang_base_url", type=str, default=None, help="SGLang server URL")
-    parser.add_argument("--sglang_model_path", type=str, default=None, help="Tokenizer/model path used by SGLang")
-    parser.add_argument("--sglang_shared_path", type=str, default=None, help="Shared checkpoint path for SGLang weight updates")
-    parser.add_argument("--sglang_timeout", type=int, default=None, help="SGLang HTTP timeout in seconds")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory",
+    )
     return parser.parse_args()
 
 
@@ -78,20 +86,6 @@ def main() -> None:
         setattr(config.model.lora, "init_path", args.lora_init_path)
     if args.output_dir is not None:
         config.output_dir = args.output_dir
-    if args.num_generations is not None:
-        config.rollout.num_generations = args.num_generations
-    if args.max_gen_len is not None:
-        config.rollout.max_completion_length = args.max_gen_len
-    if args.rollout_engine is not None:
-        config.rollout.engine = args.rollout_engine
-    if args.sglang_base_url is not None:
-        config.rollout.sglang_base_url = args.sglang_base_url
-    if args.sglang_model_path is not None:
-        config.rollout.sglang_model_path = args.sglang_model_path
-    if args.sglang_shared_path is not None:
-        config.rollout.sglang_shared_path = args.sglang_shared_path
-    if args.sglang_timeout is not None:
-        config.rollout.sglang_timeout = args.sglang_timeout
 
     L.seed_everything(config.seed, workers=True)
     data_module = GRPODataModule(

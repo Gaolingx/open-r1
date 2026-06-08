@@ -50,14 +50,37 @@ class ToolCallingConfig:
 
 
 @dataclass
+class VLLMConfig:
+    """vLLM rollout backend configuration supporting server and colocate modes."""
+
+    mode: Literal["server", "colocate"] = "server"
+    sampling_config_path: Optional[str] = None
+    # Server mode configuration
+    server_base_url: Optional[str] = None
+    server_host: str = "0.0.0.0"
+    server_port: int = 8000
+    server_timeout: float = 240.0
+    group_port: int = 51216
+    # Colocate mode configuration
+    tensor_parallel_size: int = 1
+    gpu_memory_utilization: float = 0.9
+    max_model_length: Optional[int] = None
+    max_num_seqs: Optional[int] = None
+    enable_sleep_mode: bool = False
+    model_impl: str = "auto"
+    # Generation overrides
+    repetition_penalty: float = 1.0
+    structured_outputs_regex: Optional[str] = None
+    logprobs: int = 0
+    generation_kwargs: dict | None = None
+
+
+@dataclass
 class GRPORolloutConfig:
     """Rollout and policy-gradient hyperparameters for GRPO."""
 
-    engine: Literal["torch", "sglang"] = "torch"
-    sglang_base_url: str = "http://localhost:8998"
-    sglang_model_path: Optional[str] = None
-    sglang_shared_path: str = "./sglang_ckpt_grpo"
-    sglang_timeout: int = 120
+    engine: Literal["torch", "vllm"] = "torch"
+    vllm: VLLMConfig = field(default_factory=VLLMConfig)
     num_generations: int = 4
     max_prompt_length: int = 1024
     max_completion_length: int = 1024

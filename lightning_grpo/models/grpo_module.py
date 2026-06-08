@@ -147,7 +147,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         """Refresh external rollout-engine weights after optimizer updates."""
 
-        if self.config.rollout.engine == "sglang":
+        if self.config.rollout.engine == "vllm":
             self.rollout_coordinator.update_policy()
 
     def validation_step(self, batch: dict[str, list[Any]], batch_idx: int) -> torch.Tensor:
