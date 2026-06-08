@@ -16,6 +16,8 @@ import torch
 from torch.distributed.tensor import DTensor, Replicate
 
 from lightning_grpo.models.common import get_lm_head_model, get_transformer_backbone_model
+from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
+from lightning_grpo.models.grpo.reward import GRPORewardManager
 from lightning_grpo.utils.metrics import MoEAuxLossComputer, collect_moe_metrics
 
 
@@ -70,6 +72,39 @@ def _get_last_hidden_state(
     last_hidden_state = last_hidden_state[:, :-1, :]
     last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]
     return last_hidden_state, outputs
+
+
+def compute_liger_cross_entropy_loss(
+    model: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Compute token-level next-token loss using the patched Liger CE forward.
+    Also collects MoE metrics and Liger's token accuracy.
+    """
+    input_ids = batch["input_ids"]
+    attention_mask = batch.get("attention_mask")
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        use_cache=False,
+        output_router_logits=True,
+        ignore_index=ignore_index,
+        label_smoothing=label_smoothing,
+    )
+    loss = outputs.loss
+
+    metrics = collect_moe_metrics(outputs)
+
+    metrics["lm_loss"] = outputs.loss.detach()
+    metrics["_policy_outputs"] = outputs
+
+    return loss, metrics
 
 
 class LigerDPOLossComputer:
@@ -181,93 +216,6 @@ class LigerDPOLossComputer:
         }
 
 
-class LigerCELossComputer:
-    """Compute cross entropy loss using Liger Kernel's fused linear + CELoss kernel."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        *,
-        ignore_index: int = -100,
-        label_smoothing: float = 0.0,
-        loss_parallel_enabled: bool = False,
-    ) -> None:
-        try:
-            from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-        except ImportError as e:
-            raise ImportError(
-                "LigerFusedLinearCrossEntropyLoss requires liger-kernel. "
-                "Install it with: pip install liger-kernel"
-            ) from e
-
-        self.model = model
-        self.loss_parallel_enabled = loss_parallel_enabled
-        self.aux_loss_computer = MoEAuxLossComputer(model)
-        self.loss_fn = LigerFusedLinearCrossEntropyLoss(
-            ignore_index=ignore_index,
-            label_smoothing=label_smoothing,
-            return_token_accuracy=True,
-        )
-
-    def compute_loss(
-        self,
-        batch: dict[str, torch.Tensor],
-        labels: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute CE loss using Liger Kernel's fused linear + cross-entropy.
-
-        Instead of materializing the full [batch*seq, vocab] logits tensor, this
-        kernel fuses the LM head projection with the cross-entropy computation in
-        a chunked manner, reducing peak VRAM by ~30-50% for large vocabularies.
-
-        Args:
-            batch: Input batch containing `input_ids` and `attention_mask`.
-            labels: Target token IDs, shape [B, S]. Uses ignore_index for masked positions.
-            ignore_index: Label value to ignore in loss computation.
-            label_smoothing: Label smoothing factor.
-
-        Returns:
-            Tuple of scalar loss tensor and MoE metrics.
-        """
-        input_ids = batch["input_ids"]
-        attention_mask = batch.get("attention_mask", torch.ones_like(input_ids))
-        logits_to_keep = labels.shape[1] - 1
-
-        # Shift for next-token prediction: hidden_states[:-1] predicts labels[1:]
-        shift_hidden, moe_outputs = _get_last_hidden_state(
-            self.model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            logits_to_keep=logits_to_keep,
-        )
-        shift_hidden = shift_hidden.contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-
-        # Reshape to 2D for the fused kernel
-        batch_seq = shift_hidden.shape[0] * shift_hidden.shape[1]
-        hidden_dim = shift_hidden.shape[-1]
-        shift_hidden_2d = shift_hidden.reshape(batch_seq, hidden_dim)
-        shift_labels_1d = shift_labels.reshape(batch_seq)
-
-        # Get LM head weight (and optional bias)
-        weight, bias = _materialize_liger_lm_head(
-            get_lm_head_model(self.model),
-            loss_parallel_enabled=self.loss_parallel_enabled,
-        )
-
-        ce_output = self.loss_fn(weight, shift_hidden_2d, shift_labels_1d, bias)
-        loss = ce_output.loss
-
-        metrics = collect_moe_metrics(moe_outputs)
-        metrics["token_accuracy"] = ce_output.token_accuracy
-        aux_loss, aux_metrics = self.aux_loss_computer.compute(moe_outputs, attention_mask)
-        if aux_loss is not None:
-            loss = loss + aux_loss.to(loss.device)
-        metrics.update(aux_metrics)
-
-        return loss, metrics
-
-
 class LigerGRPOLossComputer:
     """Compute GRPO loss using Liger Kernel's fused linear + GRPO kernel.
 
@@ -277,8 +225,6 @@ class LigerGRPOLossComputer:
     recomputation, but the memory savings enable larger batch sizes or longer
     sequences.
     """
-    from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
-    from lightning_grpo.models.grpo.reward import GRPORewardManager
 
     def __init__(
         self,

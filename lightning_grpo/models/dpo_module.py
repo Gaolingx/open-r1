@@ -32,6 +32,7 @@ from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
 from lightning_grpo.utils.metrics import log_moe_metrics
+from lightning_grpo.utils.liger_kernel.warpper import apply_liger_kernel
 
 
 class DPOLightningModule(L.LightningModule):
@@ -84,6 +85,10 @@ class DPOLightningModule(L.LightningModule):
 
     def configure_model(self) -> None:
         """Apply tensor parallelism, then composable FSDP2 after Lightning creates the device mesh."""
+
+        # Apply liger kernel
+        if self.config.liger_kernel.enabled:
+            apply_liger_kernel(model=self.model, kernel_config=self.config.liger_kernel.kernel_config)
 
         configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)

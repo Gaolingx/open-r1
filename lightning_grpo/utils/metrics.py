@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 import lightning as L
 import torch
+from transformers.trainer_utils import unwrap_peft_model
 from transformers.models.mixtral.modeling_mixtral import load_balancing_loss_func
 from lightning.pytorch.utilities import rank_zero_warn
 
@@ -16,19 +17,11 @@ def _get_output_value(outputs: Any, key: str) -> Any:
     return getattr(outputs, key, None)
 
 
-def _unwrap_model(model: Any) -> Any:
-    if hasattr(model, "module"):
-        model = model.module
-    if hasattr(model, "get_base_model"):
-        return model.get_base_model()
-    return model
-
-
 class MoEAuxLossComputer:
     """Compute MoE router auxiliary loss from captured router logits."""
 
     def __init__(self, model: Any) -> None:
-        self.model = _unwrap_model(model)
+        self.model = unwrap_peft_model(model)
         self.config = getattr(self.model, "config", None)
         self.aux_loss_enabled = getattr(self.config, "output_router_logits", False)
         self.aux_loss_coef = getattr(self.config, "router_aux_loss_coef", 0.0)

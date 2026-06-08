@@ -11,6 +11,7 @@ from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateD
 from peft import PeftModel
 from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.optimization import get_scheduler
+from transformers.trainer_utils import unwrap_peft_model
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.base import OptimizationConfig, ModelConfig
@@ -78,23 +79,10 @@ def compile_model_if_configured(model: torch.nn.Module, model_config: ModelConfi
     return model
 
 
-def unwrap_parallel_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Remove Lightning/Distributed wrappers while preserving model internals."""
-
-    return model.module if hasattr(model, "module") else model
-
-
-def get_peft_base_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Return the underlying Hugging Face model from a PEFT wrapper."""
-
-    model = unwrap_parallel_model(model)
-    return model.get_base_model() if isinstance(model, PeftModel) else model
-
-
 def get_transformer_backbone_model(model: torch.nn.Module) -> torch.nn.Module:
     """Return the module that owns decoder layers for PEFT/Hugging Face CausalLM wrappers."""
 
-    model = get_peft_base_model(model)
+    model = unwrap_peft_model(model)
 
     base_model_prefix = getattr(model, "base_model_prefix", None)
     if isinstance(base_model_prefix, str) and hasattr(model, base_model_prefix):
@@ -111,7 +99,7 @@ def get_transformer_backbone_model(model: torch.nn.Module) -> torch.nn.Module:
 def get_lm_head_model(model: torch.nn.Module) -> torch.nn.Module:
     """Return the LM head from a possibly wrapped PEFT/CausalLM model."""
 
-    model = get_peft_base_model(model)
+    model = unwrap_peft_model(model)
     return model.lm_head
 
 
@@ -306,7 +294,7 @@ def export_hf_model(
 ) -> Path:
     """Helper to save a model and its configuration file to a directory."""
     ensure_dir(export_dir)
-    save_model = model if isinstance(model, PeftModel) else get_peft_base_model(model)
+    save_model = model if isinstance(model, PeftModel) else unwrap_peft_model(model)
 
     save_kwargs = {
         "save_directory": str(export_dir),

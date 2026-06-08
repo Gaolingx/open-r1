@@ -107,23 +107,6 @@ def compute_cross_entropy_loss(
         )
 
 
-def compute_liger_cross_entropy_loss(
-    liger_loss_computer: Any,
-    batch: dict[str, torch.Tensor],
-    labels: torch.Tensor,
-    ignore_index: int = -100,
-    label_smoothing: float = 0.0,
-) -> tuple[torch.Tensor, Any]:
-    """Compute token-level next-token loss using the shared Liger CE loss computer."""
-
-    if liger_loss_computer is None:
-        raise RuntimeError("Liger CE loss computer is not initialized. Call configure_model() first.")
-    return liger_loss_computer.compute_loss(
-        batch=batch,
-        labels=labels,
-    )
-
-
 def compute_standard_cross_entropy_loss(
     model: torch.nn.Module,
     batch: dict[str, torch.Tensor],
@@ -133,7 +116,6 @@ def compute_standard_cross_entropy_loss(
     loss_parallel_enabled: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute standard CE loss and manually add MoE auxiliary loss."""
-
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
 
@@ -160,7 +142,7 @@ def compute_standard_cross_entropy_loss(
 
     metrics = collect_moe_metrics(outputs)
     metrics.update(aux_metrics)
-    metrics["ce_loss"] = ce_loss.detach()
+    metrics["lm_loss"] = ce_loss.detach()
     metrics["_policy_outputs"] = outputs
 
     return loss, metrics

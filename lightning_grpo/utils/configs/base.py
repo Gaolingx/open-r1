@@ -241,6 +241,7 @@ class LigerConfig:
     """Liger kernel configuration."""
     enabled: bool = False
     compiled: bool = True
+    kernel_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
