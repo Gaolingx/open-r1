@@ -58,7 +58,7 @@ class TorchRolloutEngine(RolloutEngine):
             prompt_mask=repeated_prompt_mask,
             completion_ids=completion_ids,
             completion_mask=completion_mask,
-            per_token_logps=torch.zeros(completion_ids.shape, dtype=torch.float32, device=completion_ids.device),
+            per_token_logps=torch.empty((completion_ids.size(0), 0), dtype=torch.float32, device=completion_ids.device),
             completions_text=completions_text,
             completion_id_lists=completion_id_lists,
             completion_truncated=completion_truncated,
