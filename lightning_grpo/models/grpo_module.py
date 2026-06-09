@@ -47,9 +47,9 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         self.rollout_coordinator = LocalGenerateRolloutCoordinator(self)
         self.metrics_aggregator = GRPOMetricsAggregator(self)
         self.reward_manager = GRPORewardManager(config, self.tokenizer, device=self.device)
+        self.setup_tool_calling()
         self._liger_loss_computer: LigerGRPOLossComputer | None = None
         self._standard_loss_computer: StandardGRPOLossComputer | None = None
-        self._init_tool_executor()
 
     def _build_reference_model(self) -> torch.nn.Module | None:
         """Create the frozen reference model used for KL regularization."""
@@ -166,8 +166,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         """Export a Hugging Face-compatible model directory after training."""
 
         # Clean up tool executor resources
-        if self.tool_executor is not None and hasattr(self.tool_executor, "shutdown"):
-            self.tool_executor.shutdown()
+        self.shutdown_tool_calling()
 
         export_dir = self.config.output_dir + "/hf_final"
         exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)

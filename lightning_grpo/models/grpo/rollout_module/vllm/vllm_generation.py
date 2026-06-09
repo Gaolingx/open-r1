@@ -32,9 +32,9 @@ from transformers.utils import (
     is_torch_xpu_available,
 )
 
-from .profiling import ProfilingContext
-from .import_utils import is_vllm_available
-from .utils import ensure_master_addr_port
+from ..extras.profiling import ProfilingContext
+from ..import_utils import is_vllm_available
+from ..utils import ensure_master_addr_port
 from .vllm_client import VLLMClient
 
 

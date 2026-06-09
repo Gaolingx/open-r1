@@ -29,7 +29,7 @@ from transformers import is_torch_xpu_available
 from transformers.utils import get_json_schema
 from urllib3.util.retry import Retry
 
-from .import_utils import is_requests_available, is_vllm_ascend_available, is_vllm_available
+from ..import_utils import is_requests_available, is_vllm_ascend_available, is_vllm_available
 
 
 if is_requests_available():

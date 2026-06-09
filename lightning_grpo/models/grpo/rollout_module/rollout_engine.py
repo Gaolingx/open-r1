@@ -95,7 +95,7 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
         local_rank: int = 0,
         global_rank: int = 0,
     ) -> None:
-        from lightning_grpo.models.grpo.rollout_module.vllm_generation import VLLMGeneration
+        from lightning_grpo.models.grpo.rollout_module.vllm.vllm_generation import VLLMGeneration
 
         self.tokenizer = tokenizer
         self.device = torch.device(device) if isinstance(device, str) else device
@@ -169,7 +169,7 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
     def update_policy(self, model: torch.nn.Module):
         self._policy_model = model
         self.engine.model = self._prepare_model_for_vllm(model)
-        return self.engine.sync_weights()        
+        return self.engine.sync_weights()
 
     def shutdown(self) -> None:
         llm = getattr(self.engine, "llm", None)
