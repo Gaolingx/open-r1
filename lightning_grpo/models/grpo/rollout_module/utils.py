@@ -2,11 +2,25 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
+import socket
 from typing import List, Optional, Sequence
 
 import torch
 from torch import Tensor
 from transformers import GenerationConfig
+
+
+def ensure_master_addr_port() -> None:
+    """Ensure torch distributed rendezvous environment variables are set."""
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    if "MASTER_PORT" in os.environ:
+        return
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        os.environ["MASTER_PORT"] = str(sock.getsockname()[1])
 
 
 @dataclass
@@ -36,12 +50,44 @@ class RolloutEngine(ABC):
         pass
 
 
-def _load_generation_config(sampling_config_path: Optional[str], fallback: GenerationConfig) -> GenerationConfig:
+def load_generation_config(sampling_config_path: Optional[str], fallback: GenerationConfig) -> GenerationConfig:
     """Load rollout sampling config, falling back to the model generation config."""
 
     if sampling_config_path:
         return GenerationConfig.from_pretrained(pretrained_model_name=sampling_config_path)
     return GenerationConfig.from_dict(fallback.to_dict())
+
+
+def looks_like_fsdp_enabled(model: torch.nn.Module) -> bool:
+    if model is None:
+        return False
+    for module in model.modules():
+        if module.__class__.__name__ in {"FullyShardedDataParallel", "FSDPModule"}:
+            return True
+    return any(hasattr(param, "full_tensor") for param in model.state_dict().values())
+
+
+def sampled_token_logprobs(
+    logprobs: list | None,
+    completion_ids: list[list[int]],
+    logprob_token_ids: list | None,
+) -> list[list[float]] | None:
+    if logprobs is None:
+        return None
+    if logprob_token_ids is None:
+        raise ValueError("vLLM logprobs were returned without logprob_token_ids; cannot align sampled token logprobs.")
+    sampled_logprobs: list[list[float]] = []
+    for sequence_ids, sequence_logprobs, sequence_logprob_token_ids in zip(completion_ids, logprobs, logprob_token_ids, strict=True):
+        sequence_sampled_logprobs: list[float] = []
+        for token_id, position_logprobs, position_token_ids in zip(sequence_ids, sequence_logprobs, sequence_logprob_token_ids, strict=True):
+            try:
+                token_index = position_token_ids.index(token_id)
+            except ValueError as exc:
+                raise ValueError(f"Sampled token id {token_id} is missing from vLLM logprob_token_ids {position_token_ids}.") from exc
+            value = position_logprobs[token_index]
+            sequence_sampled_logprobs.append(float(value) if value is not None else 0.0)
+        sampled_logprobs.append(sequence_sampled_logprobs)
+    return sampled_logprobs
 
 
 def pad_sequences(sequences: list[list[int]], pad_value: int, device: torch.device) -> torch.Tensor:
