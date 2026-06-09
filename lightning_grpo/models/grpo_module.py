@@ -22,6 +22,7 @@ from lightning_grpo.models.grpo.loss import StandardGRPOLossComputer
 from lightning_grpo.models.grpo.liger_loss import LigerGRPOLossComputer
 from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
+from lightning_grpo.models.grpo.tool_call import GRPOToolCallMixin
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.configs.grpo import GRPOConfig
@@ -29,7 +30,7 @@ from lightning_grpo.utils.modeling import load_causal_lm
 from lightning_grpo.utils.liger_kernel.warpper import apply_liger_kernel
 
 
-class GRPOLightningModule(L.LightningModule):
+class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
     """Lightning module for local-rollout GRPO, reasoning RL, and agentic RL."""
 
     def __init__(self, config: GRPOConfig) -> None:
@@ -43,6 +44,7 @@ class GRPOLightningModule(L.LightningModule):
         self.total_parameter_count = total
         self.tokenizer = load_tokenizer(config.model)
         self.reference_model = self._build_reference_model()
+        self.setup_tool_calling()
         self.rollout_coordinator = LocalGenerateRolloutCoordinator(self)
         self.metrics_aggregator = GRPOMetricsAggregator(self)
         self.reward_manager = GRPORewardManager(config, self.tokenizer, device=self.device)
@@ -102,6 +104,10 @@ class GRPOLightningModule(L.LightningModule):
 
         rollout_batch = self.rollout_coordinator.rollout(batch, training=stage == "train")
 
+        # Run tool calling loop if enabled and executor is initialized
+        if self.tool_executor is not None:
+            rollout_batch = self._run_tool_calling(rollout_batch)
+
         self.reward_manager.device = self.device
         if self.config.liger_kernel.liger_grpo_enabled():
             if self._liger_loss_computer is None:
@@ -158,6 +164,9 @@ class GRPOLightningModule(L.LightningModule):
 
     def on_train_end(self) -> None:
         """Export a Hugging Face-compatible model directory after training."""
+
+        # Clean up tool executor resources
+        self.shutdown_tool_calling()
 
         export_dir = self.config.output_dir + "/hf_final"
         exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)

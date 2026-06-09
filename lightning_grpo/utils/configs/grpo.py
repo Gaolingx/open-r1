@@ -39,6 +39,17 @@ class GRPORewardConfig:
 
 
 @dataclass
+class ToolCallingConfig:
+    """Configuration for multi-turn tool calling during rollout."""
+
+    enabled: bool = False
+    max_iterations: int = 5
+    tools: list[str] = field(default_factory=list)
+    chat_template: Optional[str] = None
+    chat_template_kwargs: dict | None = None
+
+
+@dataclass
 class VLLMConfig:
     """vLLM rollout backend configuration supporting server and colocate modes."""
 
@@ -70,6 +81,7 @@ class GRPORolloutConfig:
 
     engine: Literal["torch", "vllm"] = "torch"
     vllm: VLLMConfig = field(default_factory=VLLMConfig)
+    tool_calling: ToolCallingConfig = field(default_factory=ToolCallingConfig)
     num_generations: int = 4
     num_generations_eval: int = 1
     max_prompt_length: int = 1024

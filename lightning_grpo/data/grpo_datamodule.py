@@ -122,6 +122,9 @@ class GRPODataModule(ChatTemplateDataModule):
                     for key, value in sample.items()
                     if key != messages_column
                 }
+                reward_metadata.setdefault("prompt_messages", messages)
+                if tools is not None:
+                    reward_metadata.setdefault("tools", tools)
                 solution = resolve_solution(sample)
                 if solution is not None:
                     reward_metadata.setdefault("solution", solution)
