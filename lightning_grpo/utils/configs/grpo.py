@@ -71,6 +71,7 @@ class GRPORolloutConfig:
     engine: Literal["torch", "vllm"] = "torch"
     vllm: VLLMConfig = field(default_factory=VLLMConfig)
     num_generations: int = 4
+    num_generations_eval: int = 1
     max_prompt_length: int = 1024
     max_completion_length: int = 1024
     max_total_length: int = 2048

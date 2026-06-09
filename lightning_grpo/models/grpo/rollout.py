@@ -45,7 +45,7 @@ class LocalGenerateRolloutCoordinator:
     def resolve_num_generations(self, training: bool) -> int:
         """Return the number of completions sampled per prompt."""
 
-        return self.module.config.rollout.num_generations if training else 1
+        return self.module.config.rollout.num_generations if training else self.module.config.rollout.num_generations_eval
 
     def _max_prompt_length(self) -> int:
         """Return a prompt window that leaves room for at least one completion token."""
