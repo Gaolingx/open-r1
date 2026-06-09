@@ -8,6 +8,7 @@ tool calling when vLLM chat generation is not available.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import asyncio
@@ -16,73 +17,21 @@ import inspect
 import threading
 
 import torch
-from transformers import PreTrainedTokenizerBase
 
+from lightning_grpo.utils.chat_template.chat_template_utils import (
+    add_response_schema,
+    get_training_chat_template,
+    is_chat_template_prefix_preserving,
+    parse_response,
+    supports_tool_calling,
+)
 from lightning_grpo.models.common import compute_per_token_logps
 from lightning_grpo.models.grpo.rollout_module.utils import pad_sequences
 
 
 # ---------------------------------------------------------------------------
-# Tensor utility helpers
+# Utility helpers
 # ---------------------------------------------------------------------------
-
-
-def _validate_tool_calls(tool_calls: list | None) -> None:
-    """
-    Validate tool_calls to ensure all required fields exist with valid values.
-
-    Raises ValueError when the model generates malformed tool calls (e.g., missing 'arguments' field) that are
-    partially parsed.
-
-    Args:
-        tool_calls: List of tool call dictionaries, or None.
-    """
-    if tool_calls is None:
-        return None
-    if not isinstance(tool_calls, list):
-        raise ValueError("tool_calls must be a list or None.")
-
-    for idx, tool_call in enumerate(tool_calls):
-        if not isinstance(tool_call, dict):
-            raise ValueError(f"tool_calls[{idx}] must be a dict.")
-
-        # Handle nested function structure: {"type": "function", "function": {"name": ..., "arguments": ...}}
-        if "function" in tool_call:
-            func = tool_call["function"]
-            if not isinstance(func, dict):
-                raise ValueError(f"tool_calls[{idx}]['function'] must be a dict.")
-            if not isinstance(func.get("name"), str):
-                raise ValueError(f"tool_calls[{idx}]['function']['name'] must be a string.")
-            # Some templates (e.g. Qwen3.5) omit arguments for valid no-arg calls; normalize to {}.
-            if "arguments" not in func or func["arguments"] is None:
-                func["arguments"] = {}
-        else:
-            # Handle flat structure: {"name": ..., "arguments": ...}
-            if not isinstance(tool_call.get("name"), str):
-                raise ValueError(f"tool_calls[{idx}]['name'] must be a string.")
-            # Some templates (e.g. Qwen3.5) omit arguments for valid no-arg calls; normalize to {}.
-            if "arguments" not in tool_call or tool_call["arguments"] is None:
-                tool_call["arguments"] = {}
-
-
-def _normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
-    """Normalize flat or nested tool-call payloads to OpenAI-style function calls."""
-
-    if "function" in tool_call:
-        normalized = dict(tool_call)
-        normalized.setdefault("type", "function")
-        function = dict(normalized["function"])
-        function.setdefault("arguments", {})
-        normalized["function"] = function
-        return normalized
-
-    return {
-        "type": tool_call.get("type", "function"),
-        "function": {
-            "name": tool_call["name"],
-            "arguments": tool_call.get("arguments") or {},
-        },
-    }
 
 
 def _resolve_callable(path: str) -> Any:
@@ -96,61 +45,6 @@ def _resolve_callable(path: str) -> Any:
     if not callable(value):
         raise TypeError(f"Configured tool is not callable: {path}")
     return value
-
-
-def parse_response(tokenizer: PreTrainedTokenizerBase, ids: list[int]) -> dict:
-    r"""
-    Parse a token sequence into structured response dictionaries with fallback handling.
-
-    Attempts to parse the sequence using `tokenizer.parse_response()`. If parsing fails (e.g., due to malformed tool
-    calls like `<tool_call>{"type":"function"</tool_call>`), falls back to decoding as plain text.
-
-    Also removes incorrectly appended EOS tokens from tool call content when present, and validates tool_calls to
-    ensure all required fields exist.
-
-    Args:
-        tokenizer (`PreTrainedTokenizerBase`):
-            Tokenizer with a `parse_response()` method.
-        ids (`list[int]`):
-            List of token sequences.
-
-    Returns:
-        `dict`:
-            Response dictionary.
-
-    Example:
-    ```python
-    >>> from trl.chat_template_utils import parse_response, add_response_schema
-    >>> from transformers import AutoTokenizer
-
-    >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-    >>> tokenizer = add_response_schema(tokenizer)  # temporary until built-in support
-    >>> text = '<tool_call>\n{"name": "multiply", "arguments": {"a": 3, "b": 4}}\n</tool_call><|im_end|>'
-    >>> ids = tokenizer(text)["input_ids"]
-    >>> parse_response(tokenizer, ids)
-    {'role': 'assistant', 'content': '', 'tool_calls': [{'type': 'function', 'function': {'name': 'multiply', 'arguments': {'a': 3, 'b': 4}}}]}
-    ```
-    """
-    try:
-        parsed = tokenizer.parse_response(ids)
-        if parsed is None:  # this can happen if the response is heavily truncated and even the content is lost
-            raise ValueError("parse_response returned None")
-        # Hotfix: remove incorrectly appended EOS token from tool calls
-        # See https://github.com/huggingface/transformers/issues/42249
-        if isinstance(parsed.get("content"), str) and tokenizer.eos_token:
-            parsed["content"] = parsed["content"].removesuffix(tokenizer.eos_token)
-        # Normalize: ensure content is always a string (some models omit it or set it to None)
-        if not parsed.get("content"):
-            parsed["content"] = ""
-        # Validate tool_calls to prevent Jinja2 Undefined errors when fields are missing
-        if "tool_calls" in parsed:
-            _validate_tool_calls(parsed["tool_calls"])
-            parsed["tool_calls"] = [_normalize_tool_call(tool_call) for tool_call in parsed["tool_calls"]]
-    except (AttributeError, ValueError, TypeError):
-        # Fallback: decode as plain text if parsing fails. This happens if the model outputs malformed tool calls.
-        content = tokenizer.decode(ids, skip_special_tokens=True)
-        parsed = {"role": "assistant", "content": content}
-    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -185,26 +79,46 @@ class GRPOToolCallMixin:
         self.max_tool_calling_iterations = int(tool_config.max_iterations)
         self.processing_class = self.tokenizer
         self._tokenizer = self.tokenizer
-        self.chat_template_kwargs = tool_config.chat_template_kwargs or {}
         self._sync_tools: dict[str, Any] = {}
         self._async_tools: dict[str, Any] = {}
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_thread: threading.Thread | None = None
+        self.chat_template = tool_config.chat_template or getattr(self.tokenizer, "chat_template", None)
+        self.chat_template_kwargs = tool_config.chat_template_kwargs or {}
 
         if not tool_config.enabled:
             return
 
-        try:
-            from trl.chat_template_utils import add_response_schema
-            self.tokenizer = add_response_schema(self.tokenizer)
-            self.processing_class = self.tokenizer
-            self._tokenizer = self.tokenizer
-        except Exception as exc:
+        if tool_config.chat_template is not None:
+            self.tokenizer.chat_template = tool_config.chat_template
+
+        if not supports_tool_calling(self.processing_class):
             raise ValueError(
-                "Tool calling is enabled, but response schema could not be added. "
-                "Please configure tokenizer.response_schema manually."
-            ) from exc
-        self.chat_template = tool_config.chat_template or getattr(self.tokenizer, "chat_template", None)
+                "Tool calling is enabled, but the tokenizer chat template does not support tool-calling "
+                "conversations. Please provide a tool-calling chat template via rollout.tool_calling.chat_template."
+            )
+
+        if getattr(self._tokenizer, "response_schema", None) is None:
+            try:
+                self.processing_class = add_response_schema(self.processing_class)
+                self.tokenizer = self.processing_class
+                self._tokenizer = self.tokenizer
+            except Exception as exc:
+                raise ValueError(
+                    "Tool calling is enabled, but response schema could not be added. "
+                    "Please configure tokenizer.response_schema manually."
+                ) from exc
+
+        if not is_chat_template_prefix_preserving(self.processing_class):
+            self.chat_template = get_training_chat_template(self.processing_class)
+            if self.chat_template is None:
+                self.chat_template = self.processing_class.chat_template
+            else:
+                self.processing_class.chat_template = self.chat_template
+                self.tokenizer = self.processing_class
+                self._tokenizer = self.tokenizer
+        else:
+            self.chat_template = self.processing_class.chat_template
 
         for tool_path in tool_config.tools:
             tool = _resolve_callable(tool_path)
@@ -495,6 +409,57 @@ class GRPOToolCallMixin:
 
         return tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count
 
+    @staticmethod
+    def _coerce_prompt_messages(prompt: Any) -> list[dict[str, Any]]:
+        """Return a mutable chat-message list, preserving structured prompts when available."""
+
+        if isinstance(prompt, list):
+            messages: list[dict[str, Any]] = []
+            for message in prompt:
+                if isinstance(message, dict):
+                    current = copy.deepcopy(message)
+                    current.setdefault("content", "")
+                    messages.append(current)
+                else:
+                    messages.append({"role": "user", "content": str(message)})
+            return messages
+        if isinstance(prompt, dict):
+            current = copy.deepcopy(prompt)
+            current.setdefault("content", "")
+            return [current]
+        return [{"role": "user", "content": "" if prompt is None else str(prompt)}]
+
+    def _prompt_messages_for_tool_loop(self, rollout_batch: dict[str, Any], completion_count: int) -> list[list[dict[str, Any]]]:
+        """Reconstruct per-completion prompts for tool calling without losing chat structure."""
+
+        metadata = rollout_batch.get("metadata") or []
+        prompt_texts = rollout_batch.get("prompts") or [""] * completion_count
+        sample_ids = rollout_batch.get("sample_ids")
+        prompts: list[list[dict[str, Any]]] = []
+
+        for index in range(completion_count):
+            prompt_index = int(sample_ids[index].item()) if isinstance(sample_ids, torch.Tensor) else index
+            prompt_source: Any = None
+
+            # Prefer the original structured prompt captured by GRPODataModule. This mirrors TRL's
+            # `prompts = [x["prompt"] for x in inputs]` behavior and preserves system messages,
+            # multi-turn history, and structured chat content during post-tool regeneration.
+            metadata_candidates = []
+            if index < len(metadata):
+                metadata_candidates.append(metadata[index])
+            if prompt_index < len(metadata):
+                metadata_candidates.append(metadata[prompt_index])
+            for item in metadata_candidates:
+                if isinstance(item, dict) and item.get("prompt_messages") is not None:
+                    prompt_source = item["prompt_messages"]
+                    break
+
+            if prompt_source is None:
+                prompt_source = prompt_texts[prompt_index] if prompt_index < len(prompt_texts) else ""
+            prompts.append(self._coerce_prompt_messages(prompt_source))
+
+        return prompts
+
     def _run_tool_calling(self, rollout_batch: dict[str, Any]) -> dict[str, Any]:
         """Execute model-requested tools and rebuild rollout tensors for GRPO loss."""
 
@@ -506,14 +471,7 @@ class GRPOToolCallMixin:
         prompt_ids = [ids[mask.bool()].detach().cpu().tolist() for ids, mask in zip(prompt_ids_tensor, prompt_mask_tensor, strict=True)]
         completion_ids = [list(ids) for ids in rollout_batch["completion_id_lists"]]
         completions = [[parse_response(self.tokenizer, ids)] for ids in completion_ids]
-
-        prompt_texts = rollout_batch.get("prompts") or [""] * len(completion_ids)
-        sample_ids = rollout_batch.get("sample_ids")
-        prompts: list[list[dict[str, Any]]] = []
-        for index in range(len(completion_ids)):
-            prompt_index = int(sample_ids[index].item()) if isinstance(sample_ids, torch.Tensor) else index
-            prompt_text = prompt_texts[prompt_index] if prompt_index < len(prompt_texts) else ""
-            prompts.append([{"role": "user", "content": prompt_text}])
+        prompts = self._prompt_messages_for_tool_loop(rollout_batch, len(completion_ids))
 
         self._sync_tool_dicts = [self._sync_tools for _ in completion_ids]
         self._async_tool_dicts = [self._async_tools for _ in completion_ids]
