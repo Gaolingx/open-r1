@@ -15,7 +15,6 @@ from typing import Any
 
 import lightning as L
 import torch
-from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.dpo import DPOConfig
 from lightning_grpo.models.common import (
@@ -185,4 +184,4 @@ class DPOLightningModule(L.LightningModule):
         export_dir = self.config.output_dir + "/hf_final"
         exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
         if exported_paths:
-            rank_zero_info(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")
+            self.print(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")

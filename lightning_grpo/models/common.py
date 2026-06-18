@@ -266,7 +266,7 @@ def count_trainable_parameters(model: PreTrainedModel) -> tuple[int, int]:
 
 PT_SUBDIR = "pt_checkpoint"
 HF_SUBDIR = "hf_checkpoint"
-PT_FILENAME = "pretrain_model.ckpt"
+PT_FILENAME = "pretrain_model.pth"
 
 
 def ensure_dir(path: Union[str, Path]) -> Path:

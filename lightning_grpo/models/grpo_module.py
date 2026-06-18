@@ -7,7 +7,6 @@ from typing import Any
 
 import lightning as L
 import torch
-from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.models.common import (
     build_optimizer,
@@ -122,8 +121,8 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         if self.config.rollout.debug_samples and self.trainer.is_global_zero:
             every = max(1, self.config.rollout.debug_every_n_steps)
             if self.global_step % every == 0:
-                rank_zero_info(f"[GRPO DEBUG] prompt={rollout_batch['prompts'][0]!r}")
-                rank_zero_info(f"[GRPO DEBUG] completion={rollout_batch['completions'][0]!r}")
+                self.print(f"[GRPO DEBUG] prompt={rollout_batch['prompts'][0]!r}")
+                self.print(f"[GRPO DEBUG] completion={rollout_batch['completions'][0]!r}")
         return loss
 
     def on_fit_start(self) -> None:
@@ -171,4 +170,4 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         export_dir = self.config.output_dir + "/hf_final"
         exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
         if exported_paths:
-            rank_zero_info(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")
+            self.print(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")
