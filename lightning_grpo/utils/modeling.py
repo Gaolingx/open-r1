@@ -81,6 +81,7 @@ def _build_configured_model_class(model_config: ModelConfig, precision_config: P
     model = AutoModelForCausalLM.from_config(
         base_config,
         trust_remote_code=model_config.trust_remote_code,
+        attn_implementation=model_config.attn_implementation,
         dtype=resolve_torch_dtype(precision_config.model_param_dtype),
     )
 
