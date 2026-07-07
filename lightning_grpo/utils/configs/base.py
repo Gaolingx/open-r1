@@ -217,7 +217,7 @@ class DistributedConfig:
     """Distributed strategy configuration for Lightning."""
 
     strategy: Literal["auto", "ddp", "fsdp2", "model_parallel"] = "auto"
-    devices: int | str = "auto"
+    devices: list[int] | str | int = "auto"
     num_nodes: int = 1
     accelerator: Literal["auto", "gpu", "cpu"] = "auto"
     sync_batchnorm: bool = False
