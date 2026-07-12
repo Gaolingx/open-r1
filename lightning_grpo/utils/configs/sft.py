@@ -41,4 +41,5 @@ class SFTConfig(TrainingBaseConfig):
     data: SFTDataConfig = field(default_factory=SFTDataConfig)
     label_smoothing: float = 0.0
     eval_generation_max_new_tokens: int = 256
+    loss_type: Literal["nll", "dft"] = "nll"
     validation_prompts: list[str] = field(default_factory=list)

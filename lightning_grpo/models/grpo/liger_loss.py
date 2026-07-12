@@ -74,8 +74,9 @@ def _get_last_hidden_state(
     return last_hidden_state, outputs
 
 
-def compute_liger_cross_entropy_loss(
+def compute_liger_sft_loss(
     model: torch.nn.Module,
+    loss_type: str,
     batch: dict[str, torch.Tensor],
     labels: torch.Tensor,
     ignore_index: int = -100,
@@ -88,6 +89,9 @@ def compute_liger_cross_entropy_loss(
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
 
+    # liger supports dft loss by just passing use_token_scaling=True
+    use_token_scaling = (loss_type == "dft")
+
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -96,12 +100,11 @@ def compute_liger_cross_entropy_loss(
         output_router_logits=True,
         ignore_index=ignore_index,
         label_smoothing=label_smoothing,
+        use_token_scaling=use_token_scaling,
     )
     loss = outputs.loss
 
     metrics = collect_moe_metrics(outputs)
-
-    metrics["lm_loss"] = outputs.loss.detach()
     metrics["_policy_outputs"] = outputs
 
     return loss, metrics

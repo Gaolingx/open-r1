@@ -84,7 +84,7 @@ def masked_token_stats(logits: torch.Tensor, labels: torch.Tensor, ignore_index:
     }
 
 
-# CE Loss
+# SFT Loss
 def compute_cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -146,6 +146,135 @@ def compute_standard_cross_entropy_loss(
     metrics["_policy_outputs"] = outputs
 
     return loss, metrics
+
+
+def selective_log_softmax(logits, index) -> torch.Tensor:
+    """
+    A memory-efficient implementation of the common `log_softmax -> gather` operation.
+
+    This function is equivalent to the following naive implementation:
+    ```python
+    # for index with shape (...):
+    logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+    # for index with shape (..., K):
+    logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index)
+    ```
+
+    Args:
+        logits (`torch.Tensor`):
+            Logits tensor of shape `(..., num_classes)`.
+        index (`torch.Tensor`):
+            Index tensor of shape `(..., K)` or `(...)`, specifying the positions to gather from the log-softmax
+            output. When the last case is used, `K` log-probabilities are gathered per position (e.g. for top-K)
+
+    Returns:
+        `torch.Tensor`:
+            Gathered log probabilities with the same shape as `index`.
+    """
+    squeeze = index.ndim == logits.ndim - 1
+    if squeeze:
+        index = index.unsqueeze(-1)
+
+    if logits.dtype in [torch.float32, torch.float64]:
+        selected_logits = torch.gather(logits, dim=-1, index=index)
+        # loop to reduce peak mem consumption
+        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+        per_token_logps = selected_logits - logsumexp_values.unsqueeze(-1)  # log_softmax(x_i) = x_i - logsumexp(x)
+    else:
+        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
+        per_token_logps = []
+        for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
+            row_logps = F.log_softmax(row_logits, dim=-1)
+            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels)
+            per_token_logps.append(row_per_token_logps)
+        per_token_logps = torch.stack(per_token_logps)
+
+    if squeeze:
+        per_token_logps = per_token_logps.squeeze(-1)
+
+    return per_token_logps
+
+
+def dft_loss(outputs, labels, num_items_in_batch=None):
+    """
+    DFT loss function, as presented in [On the Generalization of SFT: A Reinforcement Learning Perspective with Reward
+    Rectification](https://huggingface.co/papers/2508.05629)
+    """
+    labels = torch.nn.functional.pad(labels, (0, 1), value=-100)
+    shift_labels = labels[..., 1:]
+    loss_mask = shift_labels != -100
+    shift_labels[~loss_mask] = 0
+    logprobs = selective_log_softmax(outputs.logits, shift_labels)
+    per_token_loss = -logprobs.exp().detach() * logprobs
+    if num_items_in_batch is None:
+        num_items_in_batch = loss_mask.sum()
+    loss = (per_token_loss * loss_mask).sum() / num_items_in_batch
+    return loss
+
+
+def compute_standard_sft_loss(
+    model: torch.nn.Module,
+    loss_type: str,
+    batch: dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+    loss_parallel_enabled: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute SFT/DFT loss based on the specified loss type.
+    
+    Args:
+        loss_type: Type of loss to compute. Options:
+            - "nll": Standard cross-entropy loss
+            - "dft": DFT loss from paper "On the Generalization of SFT"
+        model: The policy model
+        batch: Input batch containing at minimum 'input_ids'
+        labels: Target labels for next-token prediction
+        ignore_index: Token id to ignore in loss computation
+        label_smoothing: Label smoothing factor for CE loss
+        loss_parallel_enabled: Whether to use loss parallelism for tensor parallel
+        
+    Returns:
+        Tuple of (loss, metrics_dict)
+    """
+    if loss_type == "nll":
+        return compute_standard_cross_entropy_loss(
+            model=model,
+            batch=batch,
+            labels=labels,
+            ignore_index=ignore_index,
+            label_smoothing=label_smoothing,
+            loss_parallel_enabled=loss_parallel_enabled,
+        )
+    elif loss_type == "dft":
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask")
+        
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_router_logits=True
+        )
+
+        # Compute DFT loss
+        loss = dft_loss(outputs, labels)
+
+        # Compute MoE auxiliary loss if applicable
+        aux_loss_computer = MoEAuxLossComputer(model)
+        aux_loss, aux_metrics = aux_loss_computer.compute(outputs, attention_mask)
+        if aux_loss is not None:
+            loss = loss + aux_loss.to(loss.device)
+
+        # Gather metrics
+        metrics = collect_moe_metrics(outputs)
+        metrics.update(aux_metrics)
+        metrics["lm_loss"] = loss.detach()
+        metrics["_policy_outputs"] = outputs
+
+        return loss, metrics
+    else:
+        raise ValueError(f"Unknown SFT loss_type: {loss_type}. Expected 'nll' or 'dft'.")
 
 
 # DPO Loss
@@ -276,7 +405,7 @@ def compute_standard_dpo_loss(
     return loss, metrics_dict
 
 
-## GRPO
+# GRPO
 def compute_grpo_advantages(
     rewards: torch.Tensor,
     num_generations: int,

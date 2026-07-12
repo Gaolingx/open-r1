@@ -214,19 +214,6 @@ class GradParamNormCallback(Callback):
 
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
-    def on_before_zero_grad(
-        self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
-        optimizer: torch.optim.Optimizer) -> None:
-        step = int(trainer.global_step)
-        if step == 0 or step % self.log_every_n_steps != 0:
-            return
-
-        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach()
-
-        pl_module.log("train/grad_norm_clip", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-
 
 class LRandSchedulerOverrideCallback(Callback):
     """Override optimizer LR and optionally reset scheduler state after ckpt resume."""

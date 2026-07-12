@@ -16,8 +16,8 @@ from lightning_grpo.models.common import (
     export_configured_model,
     load_tokenizer,
 )
-from lightning_grpo.models.grpo.loss import masked_token_stats, compute_standard_cross_entropy_loss
-from lightning_grpo.models.grpo.liger_loss import compute_liger_cross_entropy_loss
+from lightning_grpo.models.grpo.loss import masked_token_stats, compute_standard_sft_loss
+from lightning_grpo.models.grpo.liger_loss import compute_liger_sft_loss
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
@@ -77,16 +77,18 @@ class PretrainLightningModule(L.LightningModule):
         use_liger = self.config.liger_kernel.liger_ce_enabled()
 
         if use_liger:
-            loss, metrics = compute_liger_cross_entropy_loss(
-                self.model,
+            loss, metrics = compute_liger_sft_loss(
+                model=self.model,
+                loss_type=self.config.loss_type,
                 batch=batch,
                 labels=labels,
                 ignore_index=self.config.data.ignore_index,
                 label_smoothing=self.config.label_smoothing,
             )
         else:
-            loss, metrics = compute_standard_cross_entropy_loss(
-                self.model,
+            loss, metrics = compute_standard_sft_loss(
+                model=self.model,
+                loss_type=self.config.loss_type,
                 batch=batch,
                 labels=labels,
                 ignore_index=self.config.data.ignore_index,
