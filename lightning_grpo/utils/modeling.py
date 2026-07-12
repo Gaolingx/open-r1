@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, GenerationConfig, PreTrainedModel
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.models.common import resolve_torch_dtype
-from lightning_grpo.utils.config import load_json_config
+from lightning_grpo.utils.models.loader import build_configured_model_class
 from lightning_grpo.utils.configs.base import ModelConfig, PrecisionConfig
 
 
@@ -66,48 +66,11 @@ def _apply_lora_if_needed(model: PreTrainedModel, model_config: ModelConfig) -> 
     return model
 
 
-def _build_configured_model_class(model_config: ModelConfig, precision_config: PrecisionConfig) -> PreTrainedModel:
-    """Build a model using AutoConfig.from_pretrained with custom overrides."""
-
-    base_config = AutoConfig.from_pretrained(
-        model_config.model_name_or_path,
-        revision=model_config.model_revision,
-        trust_remote_code=model_config.trust_remote_code,
-    )
-
-    for key, value in model_config.model_init_kwargs.items():
-        setattr(base_config, key, value)
-
-    model = AutoModelForCausalLM.from_config(
-        base_config,
-        trust_remote_code=model_config.trust_remote_code,
-        attn_implementation=model_config.attn_implementation,
-        dtype=resolve_torch_dtype(precision_config.model_param_dtype),
-    )
-
-    model = model.cpu()
-
-    if Path(model_config.model_name_or_path).is_dir():
-        checkpoint_path = Path(model_config.model_name_or_path)
-        import safetensors.torch
-        checkpoint_files = list(checkpoint_path.glob("*.safetensors"))
-        if checkpoint_files:
-            state_dict = {}
-            for cf in checkpoint_files:
-                state_dict.update(safetensors.torch.load_file(str(cf)))
-            model.load_state_dict(state_dict, strict=True)
-        else:
-            ckpt = torch.load(checkpoint_path / "pytorch_model.bin", map_location='cpu')
-            model.load_state_dict(ckpt, strict=True)
-
-    return model
-
-
 def load_causal_lm(model_config: ModelConfig, precision_config: PrecisionConfig) -> PreTrainedModel:
     """Load a decoder-only language model with optional LoRA support."""
 
     if model_config.custom_model:
-        model = _build_configured_model_class(model_config, precision_config)
+        model = build_configured_model_class(model_config, precision_config)
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
