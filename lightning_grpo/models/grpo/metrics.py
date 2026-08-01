@@ -44,6 +44,7 @@ class GRPOMetricsAggregator:
         global_advantages: torch.Tensor,
         reward_names: list[str],
         moe_outputs: Any | None = None,
+        top_k: int | None = None,
     ) -> dict[str, torch.Tensor]:
         global_rewards = (global_rewards_per_func * reward_weights.to(global_rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
         global_reward_group_std = global_rewards.view(-1, num_generations).std(dim=1)
@@ -75,7 +76,7 @@ class GRPOMetricsAggregator:
         for index, reward_name in enumerate(reward_names):
             metrics[f"reward/{reward_name}"] = global_rewards_per_func[:, index].mean()
             metrics[f"reward_std/{reward_name}"] = global_rewards_per_func[:, index].std(unbiased=False)
-        metrics.update(collect_moe_metrics(moe_outputs))
+        metrics.update(collect_moe_metrics(moe_outputs, top_k=top_k))
         return metrics
 
     def log_metrics(self, prefix: str, loss: torch.Tensor, metrics: dict[str, torch.Tensor], *, on_step: bool, on_epoch: bool) -> None:

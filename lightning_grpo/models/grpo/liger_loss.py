@@ -104,7 +104,7 @@ def compute_liger_sft_loss(
     )
     loss = outputs.loss
 
-    metrics = collect_moe_metrics(outputs)
+    metrics = collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok)
     metrics["_policy_outputs"] = outputs
 
     return loss, metrics
@@ -200,7 +200,7 @@ class LigerDPOLossComputer:
 
         # Compute MoE auxiliary loss from router logits
         attention_mask = batch.get("attention_mask")
-        moe_metrics = collect_moe_metrics(outputs)
+        moe_metrics = collect_moe_metrics(outputs, top_k=self.aux_loss_computer.num_experts_per_tok)
         aux_loss, aux_metrics = self.aux_loss_computer.compute(outputs, attention_mask)
         if aux_loss is not None:
             loss = loss + aux_loss.to(loss.device)
@@ -447,6 +447,7 @@ class LigerGRPOLossComputer:
             global_advantages=global_advantages,
             reward_names=self.module.config.reward.reward_funcs,
             moe_outputs=moe_outputs,
+            top_k=self.module.policy.config.num_experts_per_tok,
         )
         metrics.update(aux_metrics)
 

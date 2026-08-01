@@ -61,7 +61,6 @@ class MoEAuxLossComputer:
         return self.aux_loss_coef * aux_loss, metrics
 
 
-@staticmethod
 def format_metric_value(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -72,8 +71,13 @@ def format_metric_value(value: Any) -> Optional[float]:
     return float(value)
 
 
-def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
-    """Extract aggregate MoE routing diagnostics from model outputs."""
+def collect_moe_metrics(outputs: Any, top_k: int = 1) -> dict[str, torch.Tensor]:
+    """Extract aggregate MoE routing diagnostics from model outputs.
+
+    Args:
+        outputs: Model forward outputs containing ``router_logits``.
+        top_k: Number of top experts selected per token (``num_experts_per_tok``).
+    """
 
     metrics: dict[str, torch.Tensor] = {}
 
@@ -123,16 +127,21 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
             probs = torch.softmax(probs, dim=-1)
 
         entropy = -(probs * torch.log(probs.clamp_min(1.0e-8))).sum(dim=-1).mean()
-        top1_experts = probs.argmax(dim=-1)
         num_experts = probs.shape[-1]
-        top1_counts = torch.bincount(top1_experts, minlength=num_experts).to(dtype=torch.float32)
+        num_tokens = probs.shape[0]
+
+        # Compute top-k: count each token's k selected experts via one-hot → sum
+        _, selected_experts = torch.topk(probs, top_k, dim=-1)  # [tokens, top_k]
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)  # [tokens, top_k, num_experts]
+        expert_counts = expert_mask.sum(dim=(0, 1)).to(dtype=torch.float32)  # [num_experts]
+        # Each token contributes top_k assignments; ideal = tokens * top_k / num_experts
+        ideal_load = (num_tokens * top_k) / max(num_experts, 1)
 
         # Load imbalance: ratio of actual tokens per expert vs ideal uniform load
-        ideal_load = top1_experts.numel() / max(num_experts, 1)
-        load_ratios = top1_counts / max(ideal_load, 1.0)
+        load_ratios = expert_counts / max(ideal_load, 1.0)
         load_imbalance_mean = (load_ratios - 1.0).abs().mean()
         load_imbalance_max = load_ratios.max()
-        dead_expert_fraction = (top1_counts == 0).to(dtype=torch.float32).mean()
+        dead_expert_fraction = (expert_counts == 0).to(dtype=torch.float32).mean()
 
         layer_entropies.append(entropy)
         layer_dead_expert_fractions.append(dead_expert_fraction)

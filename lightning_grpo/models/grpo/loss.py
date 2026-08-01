@@ -140,7 +140,7 @@ def compute_standard_cross_entropy_loss(
     if aux_loss is not None:
         loss = loss + aux_loss.to(loss.device)
 
-    metrics = collect_moe_metrics(outputs)
+    metrics = collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok)
     metrics.update(aux_metrics)
     metrics["lm_loss"] = ce_loss.detach()
     metrics["_policy_outputs"] = outputs
@@ -267,7 +267,7 @@ def compute_standard_sft_loss(
             loss = loss + aux_loss.to(loss.device)
 
         # Gather metrics
-        metrics = collect_moe_metrics(outputs)
+        metrics = collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok)
         metrics.update(aux_metrics)
         metrics["lm_loss"] = loss.detach()
         metrics["_policy_outputs"] = outputs
@@ -399,7 +399,7 @@ def compute_standard_dpo_loss(
         "_policy_outputs": outputs,
     }
 
-    metrics_dict.update(collect_moe_metrics(outputs))
+    metrics_dict.update(collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok))
     metrics_dict.update(aux_metrics)
 
     return loss, metrics_dict
@@ -600,7 +600,7 @@ def compute_standard_grpo_loss(
             "is_cispo_clipped": loss_metrics["is_cispo_clipped"].detach(),
         }
 
-    local_metrics.update(collect_moe_metrics(outputs))
+    local_metrics.update(collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok))
     local_metrics.update(aux_metrics)
     local_metrics["_policy_outputs"] = outputs
 
@@ -726,6 +726,7 @@ class StandardGRPOLossComputer:
             global_advantages=global_advantages,
             reward_names=config.reward.reward_funcs,
             moe_outputs=local_metrics.get("_policy_outputs"),
+            top_k=self.module.policy.config.num_experts_per_tok,
         )
 
         return loss, metrics
@@ -741,6 +742,7 @@ def build_standard_grpo_training_metrics(
     global_advantages: torch.Tensor,
     reward_names: list[str],
     moe_outputs: Any | None = None,
+    top_k: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Gather local standard-GRPO diagnostics and build the logged metrics dict."""
 
@@ -771,4 +773,5 @@ def build_standard_grpo_training_metrics(
         global_advantages=global_advantages,
         reward_names=reward_names,
         moe_outputs=moe_outputs,
+        top_k=top_k,
     )
