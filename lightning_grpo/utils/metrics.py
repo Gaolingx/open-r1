@@ -99,9 +99,9 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
         return metrics
 
     layer_entropies: list[torch.Tensor] = []
-    layer_load_std: list[torch.Tensor] = []
-    layer_top1_occupancies: list[torch.Tensor] = []
     layer_dead_expert_fractions: list[torch.Tensor] = []
+    layer_load_imbalance_means: list[torch.Tensor] = []
+    layer_load_imbalance_maxs: list[torch.Tensor] = []
 
     for layer_logits in valid_router_logits:
         probs = layer_logits.detach().to(dtype=torch.float32)
@@ -122,25 +122,28 @@ def collect_moe_metrics(outputs: Any) -> dict[str, torch.Tensor]:
         if not is_probability_distribution:
             probs = torch.softmax(probs, dim=-1)
 
-        mean_probs = probs.mean(dim=0)
         entropy = -(probs * torch.log(probs.clamp_min(1.0e-8))).sum(dim=-1).mean()
-        load_std = mean_probs.std(unbiased=False)
         top1_experts = probs.argmax(dim=-1)
         num_experts = probs.shape[-1]
         top1_counts = torch.bincount(top1_experts, minlength=num_experts).to(dtype=torch.float32)
-        top1_occupancy = (top1_counts / max(top1_experts.numel(), 1)).max()
+
+        # Load imbalance: ratio of actual tokens per expert vs ideal uniform load
+        ideal_load = top1_experts.numel() / max(num_experts, 1)
+        load_ratios = top1_counts / max(ideal_load, 1.0)
+        load_imbalance_mean = (load_ratios - 1.0).abs().mean()
+        load_imbalance_max = load_ratios.max()
         dead_expert_fraction = (top1_counts == 0).to(dtype=torch.float32).mean()
 
         layer_entropies.append(entropy)
-        layer_load_std.append(load_std)
-        layer_top1_occupancies.append(top1_occupancy)
         layer_dead_expert_fractions.append(dead_expert_fraction)
+        layer_load_imbalance_means.append(load_imbalance_mean)
+        layer_load_imbalance_maxs.append(load_imbalance_max)
 
     if layer_entropies:
         metrics["router_entropy"] = torch.stack(layer_entropies).mean()
-        metrics["expert_load_std"] = torch.stack(layer_load_std).mean()
-        metrics["top1_expert_occupancy"] = torch.stack(layer_top1_occupancies).mean()
         metrics["dead_expert_fraction"] = torch.stack(layer_dead_expert_fractions).mean()
+        metrics["load_imbalance_mean"] = torch.stack(layer_load_imbalance_means).mean()
+        metrics["load_imbalance_max"] = torch.stack(layer_load_imbalance_maxs).mean()
 
     return metrics
 
@@ -165,9 +168,9 @@ def log_moe_metrics(
     moe_keys = [
         "aux_loss",
         "router_entropy",
-        "expert_load_std",
-        "top1_expert_occupancy",
         "dead_expert_fraction",
+        "load_imbalance_mean",
+        "load_imbalance_max",
     ]
 
     # Extract only MoE-related metrics to prevent logging generic metrics (e.g. ce_loss) with a 'moe_' prefix
