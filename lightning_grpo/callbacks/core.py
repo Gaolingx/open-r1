@@ -177,42 +177,20 @@ class GradParamNormCallback(Callback):
         super().__init__()
         self.log_every_n_steps = max(1, int(log_every_n_steps))
 
-    @staticmethod
-    def _compute_global_norm(pl_module: L.LightningModule, *, use_grad: bool) -> torch.Tensor:
-        reference = None
-        total = None
-
-        for param in pl_module.parameters():
-            if not param.requires_grad:
-                continue
-
-            tensor = param.grad if use_grad else param.detach()
-            if tensor is None:
-                continue
-
-            reference = tensor
-            part = tensor.detach().float().pow(2).sum()
-
-            if hasattr(part, "to_local"):
-                part = part.to_local()
-
-            total = part if total is None else total + part
-
-        if total is None:
-            if reference is not None:
-                return torch.tensor(0.0, device=reference.device)
-            return torch.tensor(0.0, device=pl_module.device)
-
-        return total.sqrt()
-
     def on_after_backward(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         step = int(trainer.global_step)
         if step == 0 or step % self.log_every_n_steps != 0:
             return
 
-        grad_norm = self._compute_global_norm(pl_module, use_grad=True).detach()
+        # Use ``max_norm=float('inf')`` to compute (but not alter) the global
+        # gradient norm.  Lightning applies its own ``gradient_clip_val`` later
+        # in the training loop, so we deliberately avoid double‑clipping here.
+        total_norm: float = torch.nn.utils.clip_grad_norm_(
+            pl_module.parameters(), max_norm=float('inf'), error_if_nonfinite=False,
+        )
 
-        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        grad_norm = torch.tensor(total_norm, device=pl_module.device)
+        pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
 
 
 class LRandSchedulerOverrideCallback(Callback):
