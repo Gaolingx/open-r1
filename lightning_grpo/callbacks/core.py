@@ -185,11 +185,11 @@ class GradParamNormCallback(Callback):
         # Use ``max_norm=float('inf')`` to compute (but not alter) the global
         # gradient norm.  Lightning applies its own ``gradient_clip_val`` later
         # in the training loop, so we deliberately avoid double‑clipping here.
-        total_norm: float = torch.nn.utils.clip_grad_norm_(
+        total_norm = torch.nn.utils.clip_grad_norm_(
             pl_module.parameters(), max_norm=float('inf'), error_if_nonfinite=False,
         )
 
-        grad_norm = torch.tensor(total_norm, device=pl_module.device)
+        grad_norm = total_norm.detach().to(pl_module.device)
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
 
 
