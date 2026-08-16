@@ -321,25 +321,20 @@ def export_configured_model(
     exported_paths: Dict[str, Path] = {}
 
     full_state_dict = get_gathered_state_dict(model)
-    if full_state_dict is None:
-        return exported_paths
-
-    if model_config.save_pth_format:
-        pth_output_dir = root_path / PT_SUBDIR
-        pth_file_path = pth_output_dir / PT_FILENAME
-        save_pth_weights_direct(full_state_dict, pth_file_path)
-        exported_paths["pth"] = pth_output_dir
-    if model_config.save_safetensors_format:
-        hf_output_dir = root_path / HF_SUBDIR
-        export_hf_model(
-            model=model,
-            model_config=model_config,
-            export_dir=hf_output_dir,
-            tokenizer=tokenizer,
-            state_dict=full_state_dict,
-            safe_serialization=True
-        )
-        exported_paths["safetensors"] = hf_output_dir
+    if full_state_dict is not None:
+        if model_config.save_pth_format:
+            pth_output_dir = root_path / PT_SUBDIR
+            pth_file_path = pth_output_dir / PT_FILENAME
+            save_pth_weights_direct(full_state_dict, pth_file_path)
+            exported_paths["pth"] = pth_output_dir
+        if model_config.save_safetensors_format:
+            hf_output_dir = root_path / HF_SUBDIR
+            export_hf_model(
+                model=model, model_config=model_config,
+                export_dir=hf_output_dir, tokenizer=tokenizer,
+                state_dict=full_state_dict, safe_serialization=True,
+            )
+            exported_paths["safetensors"] = hf_output_dir
 
     if dist.is_initialized():
         dist.barrier()

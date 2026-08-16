@@ -184,4 +184,4 @@ class DPOLightningModule(L.LightningModule):
         export_dir = self.config.output_dir + "/hf_final"
         exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
         if exported_paths:
-            self.print(f"Exported model artifacts to {export_dir}: {sorted(exported_paths)}")
+            self.print(f"Exported model artifacts to: {', '.join(sorted(str(p) for p in exported_paths.values()))}")
