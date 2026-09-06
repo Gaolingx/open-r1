@@ -849,7 +849,6 @@ class NekoMindMoePreTrainedModel(PreTrainedModel):
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, NekoMindMoeTopKRouter):
             init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            init.zeros_(module.e_score_correction_bias)
         elif isinstance(module, NekoMindMoeRMSNormGated):
             init.ones_(module.weight)
 
@@ -1010,6 +1009,9 @@ class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
         self.model = NekoMindMoeModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.router_aux_loss_coef = config.router_aux_loss_coef
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1025,6 +1027,7 @@ class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
+        output_router_logits: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
