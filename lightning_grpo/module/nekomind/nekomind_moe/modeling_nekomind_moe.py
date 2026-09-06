@@ -17,8 +17,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from collections.abc import Callable
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -31,58 +31,20 @@ from transformers.generation import GenerationMixin
 from transformers.integrations import (
     use_experts_implementation,
     use_kernel_forward_from_hub,
-    use_kernel_func_from_hub,
+    use_kernel_func_from_hub_with_fallback,
     use_kernelized_func,
 )
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.integrations.accelerate import force_accelerate_hooks
+from transformers.masking_utils import create_causal_mask, create_recurrent_attention_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import (
-    GenericForQuestionAnswering,
-    GenericForSequenceClassification,
-    GenericForTokenClassification,
-    GradientCheckpointingLayer,
-)
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
-from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
-from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
+from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 from .configuration_nekomind_moe import NekoMindMoeConfig
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-@use_kernel_func_from_hub("rotary_pos_emb")
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -122,58 +84,111 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-@use_kernelized_func(apply_rotary_pos_emb)
 class NekoMindMoeAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed Latent Attention (MLA) from Deepseek V2 with NoPE, but the part of the keys where RoPE is applied is
+    still shared."""
 
     def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+
+        self.q_lora_rank = config.q_lora_rank
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+        self.v_head_dim = config.v_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+
         self.is_causal = True
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        self.q_proj = (
+            nn.Linear(self.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
+            if self.q_lora_rank is None
+            else None
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        self.q_a_proj = (
+            nn.Linear(self.hidden_size, config.q_lora_rank, bias=config.attention_bias)
+            if self.q_lora_rank is not None
+            else None
         )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        self.q_a_layernorm = NekoMindMoeRMSNorm(config.q_lora_rank) if self.q_lora_rank is not None else None
+        self.q_b_proj = (
+            nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
+            if self.q_lora_rank is not None
+            else None
         )
+
+        self.kv_a_proj_with_mqa = nn.Linear(
+            self.hidden_size,
+            config.kv_lora_rank + config.qk_rope_head_dim,
+            bias=config.attention_bias,
+        )
+        self.kv_a_layernorm = NekoMindMoeRMSNorm(config.kv_lora_rank)
+        self.kv_b_proj = nn.Linear(
+            config.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+        )
+
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=config.attention_bias,
         )
-        self.q_norm = NekoMindMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = NekoMindMoeRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # thus post q_norm does not need reshape
-        self.sliding_window = getattr(config, "sliding_window", None)
+        self.scaling = self.qk_head_dim ** (-0.5)
+
+    def expand_kv(self, kv_nope: torch.Tensor, k_rot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expands the compressed latents into key and value states. Args:
+            - kv_nope: key + value without positional encoding, shape [batch_size, 1, seqlen, self.kv_lora_rank]
+            - k_rot: shared key with positional encoding, shape [batch_size, 1, seqlen, self.qk_rope_head_dim]
+        Returns the key and value states, two tensors of shape [batch, num_heads, seq, (k or v)_head_dim].
+        """
+        batch_size, _, seq_length, _ = kv_nope.shape
+        key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
+
+        kv_nope = self.kv_b_proj(kv_nope).view(key_shape).transpose(1, 2)
+        k_nope, value_states = torch.split(kv_nope, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k_rot = k_rot.expand(-1, k_nope.shape[1], -1, -1)  # does not affect the underlying storage
+
+        # Concatenate k_nope and k_rot in a new tensor
+        key_states = kv_nope.new_empty(*kv_nope.shape[:-1], self.qk_nope_head_dim + self.qk_rope_head_dim)
+        key_states[..., : self.qk_nope_head_dim].copy_(k_nope)
+        key_states[..., self.qk_nope_head_dim :].copy_(k_rot)
+        return key_states, value_states
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+        batch_size, seq_length = hidden_states.shape[:-1]
+        query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        if self.q_lora_rank is None:
+            q_states = self.q_proj(hidden_states)
+        else:
+            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        query_states = q_states.view(query_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        kv_nope, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_nope = self.kv_a_layernorm(kv_nope)
+        # Both latents are viewed as single-head, 4D tensors so all cache layers handle them correctly
+        kv_nope = kv_nope.view(batch_size, 1, seq_length, self.kv_lora_rank)
+        k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
+        # Cache read / write is performed while latent KV is still compressed
         if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+            kv_nope, k_rot = past_key_values.update(kv_nope, k_rot, self.layer_idx)
+
+        key_states, value_states = self.expand_kv(kv_nope, k_rot)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -187,13 +202,416 @@ class NekoMindMoeAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+
+class NekoMindMoeForgetGate(nn.Module):
+    def __init__(self, config: NekoMindMoeConfig):
+        super().__init__()
+        self.head_dim = config.linear_head_dim
+        self.num_heads = config.linear_num_heads
+        self.qkv_dim = self.head_dim * self.num_heads
+
+        self.f_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.f_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
+        self.dt_bias = nn.Parameter(torch.empty(self.qkv_dim))
+        self.A_log = nn.Parameter(torch.empty(self.num_heads))
+
+        self.safe_gate_lower_bound = config.linear_lower_bound
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_shape = (*hidden_states.shape[:2], -1, self.head_dim)
+
+        forget_gate = self.f_b_proj(self.f_a_proj(hidden_states))
+        g = (forget_gate.float() + self.dt_bias.float().view(1, 1, -1)).view(hidden_shape)
+        A_log = self.A_log.float().view(1, 1, self.num_heads, 1)
+        decay_rate = torch.exp(A_log)
+
+        # Safe lower bound decay
+        if self.safe_gate_lower_bound is not None:
+            return self.safe_gate_lower_bound * torch.sigmoid(decay_rate * g)
+
+        # Softplus "log(1 + exp(x))" with uper bound restraint to avoid overflows
+        # NOTE: Softplus for larger values (e.g. 20+), Softplus(x) == x
+        g_softplus = torch.where(g > 20.0, g, torch.log(1.0 + torch.exp(g)))
+
+        return -decay_rate * g_softplus
+
+
+def apply_mask_to_padding_states(hidden_states, attention_mask):
+    """
+    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
+    """
+    # NOTE: attention mask is a 2D boolean tensor
+    if attention_mask is not None:
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+    return hidden_states
+
+
+@use_kernel_func_from_hub_with_fallback("causal_conv1d_update", "causal_conv1d")
+def causal_conv1d_update(
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: nn.Parameter,
+    bias: nn.Parameter | None = None,
+    activation: str | None = None,
+):
+    _, hidden_size, seq_len = hidden_states.shape
+    state_len = conv_state.shape[-1]
+
+    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
+    conv_state.copy_(hidden_states_new[:, :, -state_len:])
+    out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
+    out = out[:, :, -seq_len:]
+    if activation is not None:
+        out = ACT2FN[activation](out)
+    return out.to(hidden_states.dtype)
+
+
+@use_kernel_func_from_hub_with_fallback("causal_conv1d_fn", "causal_conv1d")
+def causal_conv1d_fn(
+    hidden_states: torch.Tensor,
+    weight: nn.Parameter,
+    bias: nn.Parameter | None = None,
+    activation: str | None = None,
+    **kwargs,
+):
+    _, hidden_size, seq_len = hidden_states.shape
+    padding = weight.shape[-1] - 1
+
+    out = F.conv1d(
+        hidden_states.to(weight.dtype),
+        weight=weight.unsqueeze(1),
+        bias=bias,
+        padding=padding,
+        groups=hidden_size,
+    )[:, :, :seq_len]
+    if activation is not None:
+        out = ACT2FN[activation](out)
+    return out.to(hidden_states.dtype)
+
+
+def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
+    """
+    This function is intended to align with the l2norm implementation in the FLA library.
+
+    # NOTE: FLA compares against `F.normalize` but does + eps instead of max(..., eps) leading to a slight differences
+    """
+    # main difference to qwen's gdn variation: intentionally use sqrt and / to match original triton
+    inv_norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x / inv_norm
+
+
+@use_kernel_func_from_hub_with_fallback("fused_recurrent_kda", "fla")
+def recurrent_kimi_delta_attention(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel=False,
+    **kwargs,
+):
+    # calculations happen in float as states are more susceptible to rounding errors
+    initial_dtype = query.dtype
+    query, key, value, g, beta = [x.to(torch.float32) for x in (query, key, value, g, beta)]
+
+    # important: FLA calculates these in fp32 so we do this after the float casts
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+
+    # shapes and other metadata
+    batch_size, sequence_length, num_heads, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    core_attn_out = torch.zeros(
+        batch_size, sequence_length, num_heads, v_head_dim, dtype=value.dtype, device=value.device
+    )
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+
+    # recurrent iteration
+    for i in range(sequence_length):
+        q_i = query[:, i]
+        k_i = key[:, i]
+        v_i = value[:, i]
+        g_i = g[:, i][..., None].exp()
+        b_i = beta[:, i][..., None]
+
+        last_recurrent_state = last_recurrent_state * g_i
+        kv_mem = (last_recurrent_state * k_i[..., None]).sum(dim=-2)
+        delta = (v_i - kv_mem) * b_i
+
+        last_recurrent_state = last_recurrent_state + k_i.unsqueeze(-1) * delta.unsqueeze(-2)
+        core_attn_out[:, i] = (last_recurrent_state * q_i.unsqueeze(-1)).sum(dim=-2)
+
+    return core_attn_out.to(initial_dtype), last_recurrent_state if output_final_state else None
+
+
+@use_kernel_func_from_hub_with_fallback("chunk_kda", "fla")
+def chunk_kimi_delta_attention(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    **kwargs,
+):
+    # calculations happen in float as states are more susceptible to rounding errors
+    initial_dtype = query.dtype
+
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+
+    # important: FLA calculates these in fp32 so we do this after the float casts
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+
+    # shapes and other metadata
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    total_sequence_length = sequence_length + pad_size
+
+    # prepare all the relevant input
+    query = F.pad(query, (0, 0, 0, pad_size)) * scale
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    g = F.pad(g, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+
+    # reshape to chunks
+    query, key, value, g, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, g, k_beta, v_beta)
+    ]
+    beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
+
+    # Intra chunk
+    # Main difference to GDN is the per head application of `g` which was broadcasted across heads instead
+    g = g.cumsum(dim=-2)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
+    decay_mask = (g.unsqueeze(-2) - g.unsqueeze(-3)).exp().float()
+    attn = -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask).sum(dim=-1).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp())
+
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    core_attn_out = torch.zeros_like(value)
+
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
+    for i in range(total_sequence_length // chunk_size):
+        q_i = query[:, :, i]
+        k_i = key[:, :, i]
+        v_i = value[:, :, i]
+        g_i = g[:, :, i]
+
+        # Inter chunk
+        attn_inter = (q_i * g_i.exp()) @ last_recurrent_state
+        # Intra chunk
+        attn_intra = (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i]).sum(dim=-1).masked_fill(mask, 0)
+        # New update rule
+        v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+        v_new = v_i - v_prime
+
+        core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1)
+            + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
+        )
+
+    if not output_final_state:
+        last_recurrent_state = None
+
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+
+    return core_attn_out, last_recurrent_state
+
+
+@use_kernelized_func(
+    [chunk_kimi_delta_attention, recurrent_kimi_delta_attention, causal_conv1d_fn, causal_conv1d_update]
+)
+class NekoMindMoeDeltaAttention(nn.Module):
+    """Kimi Linear Attention: this is essentialy the same a gated delta net (GDN) but decay is per-channel instead of
+    per-token."""
+
+    def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.linear_num_heads
+        self.head_dim = config.linear_head_dim
+        self.qkv_dim = self.head_dim * self.num_heads
+
+        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.layer_idx = layer_idx
+        self.activation = config.hidden_act
+        self.layer_norm_epsilon = config.rms_norm_eps
+
+        self.q_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False)
+
+        self.conv_dim = self.qkv_dim * 3
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=False,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
+        )
+        self.forget_gate = NekoMindMoeForgetGate(config)
+        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+
+        self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
+        self.g_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
+        self.o_norm = NekoMindMoeRMSNormGated(self.head_dim, eps=self.layer_norm_epsilon)
+        self.o_proj = nn.Linear(self.qkv_dim, self.hidden_size, bias=False)
+
+        self.layer_type = config.layer_types[layer_idx]
+
+    @force_accelerate_hooks("conv1d")
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_params: Cache | None = None,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ):
+        # Zero out padding
+        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+
+        # Set up dimensions for reshapes later
+        batch_size, seq_len = hidden_states.shape[:2]
+        hidden_shape = (batch_size, seq_len, -1, self.head_dim)
+
+        mixed_qkv = torch.cat(
+            [
+                self.q_proj(hidden_states),
+                self.k_proj(hidden_states),
+                self.v_proj(hidden_states),
+            ],
+            dim=-1,
+        ).transpose(1, 2)
+
+        # Acts for normal prefill but also for multi-token prefill continue
+        use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx)
+        if use_precomputed_states:
+            conv_state = cache_params.layers[self.layer_idx].conv_states[0]
+            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0]
+
+        # Single token decode path
+        if use_precomputed_states and seq_len == 1:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+            )
+        # Multi token prefill or simple "full" prefill
+        else:
+            # Concatenated state for prefill
+            if cache_params is not None:
+                mixed_qkv = cache_params.update_conv_state(
+                    mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size
+                )
+
+            mixed_qkv = causal_conv1d_fn(
+                mixed_qkv,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                **kwargs,
+            )
+
+            # Cut out any tail
+            mixed_qkv = mixed_qkv[:, :, -seq_len:]
+
+        query, key, value = torch.split(
+            mixed_qkv.transpose(1, 2),
+            [self.qkv_dim] * 3,
+            dim=-1,
+        )
+
+        query = query.view(hidden_shape)
+        key = key.view(hidden_shape)
+        value = value.view(hidden_shape)
+
+        # Forget gate and input gate
+        g = self.forget_gate(hidden_states)
+        beta = torch.sigmoid(self.b_proj(hidden_states))
+
+        # KDA
+        if use_precomputed_states and seq_len == 1:
+            core_attn_out, last_recurrent_state = recurrent_kimi_delta_attention(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True,
+                **kwargs,
+            )
+        else:
+            core_attn_out, last_recurrent_state = chunk_kimi_delta_attention(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state if use_precomputed_states else None,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True,
+                **kwargs,
+            )
+
+        if cache_params is not None:
+            cache_params.update_recurrent_state(last_recurrent_state.to(torch.float32), self.layer_idx)
+
+        # Final gated norm and proj
+        gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(hidden_shape)
+        output = self.o_norm(core_attn_out, gate).reshape(batch_size, seq_len, -1)
+        output = self.o_proj(output)
+
+        return output
 
 
 class NekoMindMoeMLP(nn.Module):
@@ -315,19 +733,50 @@ class NekoMindMoeRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# NOTE: the FLA package does not re-cast to `input_dtype` in its implementation, maybe we should do the same
+@use_kernel_forward_from_hub("RMSNormGated")
+class NekoMindMoeRMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, **kwargs) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        self.activation = "sigmoid"
+
+    def forward(self, hidden_states, gate=None) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+
+        # Strict FP32 norm (do not downcast on the weights)
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight.to(torch.float32) * hidden_states
+
+        # Apply gating
+        hidden_states = hidden_states * ACT2FN[self.activation](gate.to(torch.float32))
+
+        return hidden_states.to(input_dtype)
+
+
 class NekoMindMoeDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: NekoMindMoeConfig, layer_idx: int):
         super().__init__()
-        self.self_attn = NekoMindMoeAttention(config, layer_idx)
-        if (layer_idx not in config.mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
-        ):
-            self.mlp = NekoMindMoeSparseMoeBlock(config)
-        else:
-            self.mlp = NekoMindMoeMLP(config, intermediate_size=config.intermediate_size)
-        self.input_layernorm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_size = config.hidden_size
+        self.self_attn = (
+            # CODEPATH: TODO: remove this once the mlinter rule is relaxed
+            NekoMindMoeAttention(config, layer_idx)
+            if config.layer_types[layer_idx] == "full_attention"
+            else NekoMindMoeDeltaAttention(config, layer_idx)
+        )
+
+        self.mlp = (
+            NekoMindMoeSparseMoeBlock(config)
+            if config.mlp_layer_types[layer_idx] == "sparse"
+            else NekoMindMoeMLP(config)
+        )
+
+        self.input_layernorm = NekoMindMoeRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = NekoMindMoeRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.block_type = config.layer_types[layer_idx]
 
     def forward(
         self,
@@ -336,21 +785,27 @@ class NekoMindMoeDecoderLayer(GradientCheckpointingLayer):
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
+        # Self attn
         hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+        if self.block_type == "linear_attention":
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                cache_params=past_key_values,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        else:
+            hidden_states, _ = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                **kwargs,
+            )
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -366,111 +821,49 @@ class NekoMindMoePreTrainedModel(PreTrainedModel):
     config: NekoMindMoeConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["NekoMindMoeDecoderLayer"]
+    _no_split_modules = ["KimiLinearDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
-    _supports_flex_attn = True
-
-    _can_compile_fullgraph = True
-    _supports_attention_backend = True
+    _keys_to_ignore_on_load_unexpected = None
     _can_record_outputs = {
         "router_logits": OutputRecorder(NekoMindMoeTopKRouter, index=0),
         "hidden_states": NekoMindMoeDecoderLayer,
         "attentions": NekoMindMoeAttention,
     }
+    _is_stateful = True
+    _can_compile_fullgraph = True
 
     @torch.no_grad()
     def _init_weights(self, module):
         super()._init_weights(module)
-        std = self.config.initializer_range
-        if isinstance(module, NekoMindMoeExperts):
-            init.normal_(module.gate_up_proj, mean=0.0, std=std)
-            init.normal_(module.down_proj, mean=0.0, std=std)
+        if isinstance(module, NekoMindMoeForgetGate):  # following FLA initialization
+            # A_log
+            init.copy_(module.A_log, init.uniform_(module.A_log, a=1.0, b=16.0).log())
+            # dt_bias
+            init.uniform_(module.dt_bias, a=math.log(1e-3), b=math.log(1e-1))
+            dt = module.dt_bias.exp().clamp_min(1e-4)
+            init.copy_(module.dt_bias, dt + torch.log(-torch.expm1(-dt)))  # (stable) inverse softplus
+        elif isinstance(module, NekoMindMoeExperts):
+            init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
+            init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, NekoMindMoeTopKRouter):
-            init.normal_(module.weight, mean=0.0, std=std)
-
-
-class NekoMindMoeRotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor  # fix linting for `register_buffer`
-
-    def __init__(self, config: NekoMindMoeConfig, device=None):
-        super().__init__()
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-
-        self.config = config
-
-        self.rope_type = self.config.rope_parameters["rope_type"]
-        rope_init_fn: Callable = self.compute_default_rope_parameters
-        if self.rope_type != "default":
-            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
-
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
-
-    @staticmethod
-    def compute_default_rope_parameters(
-        config: NekoMindMoeConfig | None = None,
-        device: Optional["torch.device"] = None,
-        seq_len: int | None = None,
-    ) -> tuple["torch.Tensor", float]:
-        """
-        Computes the inverse frequencies according to the original RoPE implementation
-        Args:
-            config ([`~transformers.PreTrainedConfig`]):
-                The model configuration.
-            device (`torch.device`):
-                The device to use for initialization of the inverse frequencies.
-            seq_len (`int`, *optional*):
-                The current sequence length. Unused for this type of RoPE.
-        Returns:
-            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
-            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
-        """
-        base = config.rope_parameters["rope_theta"]
-        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-
-        attention_factor = 1.0  # Unused in this type of RoPE
-
-        # Compute the inverse frequencies
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
-        return inv_freq, attention_factor
-
-    @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
-    def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-        position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with maybe_autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+            init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            init.zeros_(module.e_score_correction_bias)
+        elif isinstance(module, NekoMindMoeRMSNormGated):
+            init.ones_(module.weight)
 
 
 @auto_docstring
 class NekoMindMoeModel(NekoMindMoePreTrainedModel):
     def __init__(self, config: NekoMindMoeConfig):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList(
             [NekoMindMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = NekoMindMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = NekoMindMoeRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -490,43 +883,47 @@ class NekoMindMoeModel(NekoMindMoePreTrainedModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
         if position_ids is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            position_ids = position_ids.unsqueeze(0)
+            position_ids: torch.LongTensor = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+            position_ids = (position_ids + past_seen_tokens).unsqueeze(0)
 
-        mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
-        causal_mask = mask_function(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # Prepare mask arguments
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            # Create the masks
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
+            }
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=causal_mask_mapping[self.config.layer_types[i]],
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
-                position_embeddings=position_embeddings,
                 **kwargs,
             )
 
         hidden_states = self.norm(hidden_states)
 
-        return MoeModelOutputWithPast(  # only diff with Mistral is the output type, we need MoE
+        return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
@@ -564,51 +961,38 @@ def load_balancing_loss_func(
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0
 
-    if isinstance(gate_logits, tuple):
-        compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+    # Accumulate assignment counts and probability sums layer by layer, normalizing at the end,
+    # so peak memory stays O(seq_len * num_experts) regardless of the number of layers.
+    compute_device = gate_logits[0].device
+    tokens_per_expert_sum = torch.zeros(num_experts, dtype=torch.float32, device=compute_device)
+    router_prob_sum = torch.zeros(num_experts, dtype=torch.float32, device=compute_device)
+    total_rows = 0.0
 
-    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+    if attention_mask is not None:
+        # The same flat mask applies to every layer's [batch_size * sequence_length] rows.
+        flat_mask = attention_mask.reshape(-1).to(device=compute_device, dtype=torch.float32)
 
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    for layer_gate in gate_logits:
+        routing_weights = torch.nn.functional.softmax(layer_gate.to(compute_device), dim=-1)
+        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+        if attention_mask is None:
+            # Count of top-k assignments per expert
+            tokens_per_expert_sum = (
+                tokens_per_expert_sum + torch.bincount(selected_experts.reshape(-1), minlength=num_experts).float()
+            )
+            # Sum of routing probabilities per expert
+            router_prob_sum = router_prob_sum + routing_weights.float().sum(dim=0)
+            total_rows = total_rows + routing_weights.shape[0]
+        else:
+            # Same reductions, weighted by the attention mask to exclude padding tokens
+            tokens_per_expert_sum = tokens_per_expert_sum + torch.zeros(
+                num_experts, dtype=torch.float32, device=compute_device
+            ).scatter_add_(0, selected_experts.reshape(-1), flat_mask.repeat_interleave(top_k))
+            router_prob_sum = router_prob_sum + (routing_weights.float() * flat_mask.unsqueeze(-1)).sum(dim=0)
+            total_rows = total_rows + flat_mask.sum()
 
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
-
-    if attention_mask is None:
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.mean(routing_weights, dim=0)
-    else:
-        batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
-
-        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-        expert_attention_mask = (
-            attention_mask[None, :, :, None, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-            .reshape(-1, top_k, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
-        )
-
-        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
-        router_per_expert_attention_mask = (
-            attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-            .reshape(-1, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-            router_per_expert_attention_mask, dim=0
-        )
+    tokens_per_expert = tokens_per_expert_sum / total_rows
+    router_prob_per_expert = router_prob_sum / total_rows
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
@@ -616,18 +1000,16 @@ def load_balancing_loss_func(
 
 @auto_docstring
 class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tied_weights_keys = {}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _fsdp_plan = {"lm_head": "keep_full_weight"}
 
     def __init__(self, config):
         super().__init__(config)
         self.model = NekoMindMoeModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.router_aux_loss_coef = config.router_aux_loss_coef
-        self.num_experts = config.num_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -643,10 +1025,9 @@ class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        output_router_logits: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoeCausalLMOutputWithPast:
+    ) -> MoeModelOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -717,23 +1098,4 @@ class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
         )
 
 
-class NekoMindMoeForSequenceClassification(GenericForSequenceClassification, NekoMindMoePreTrainedModel):
-    pass
-
-
-class NekoMindMoeForTokenClassification(GenericForTokenClassification, NekoMindMoePreTrainedModel):
-    pass
-
-
-class NekoMindMoeForQuestionAnswering(GenericForQuestionAnswering, NekoMindMoePreTrainedModel):
-    base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
-
-
-__all__ = [
-    "NekoMindMoeForCausalLM",
-    "NekoMindMoeForQuestionAnswering",
-    "NekoMindMoeModel",
-    "NekoMindMoePreTrainedModel",
-    "NekoMindMoeForSequenceClassification",
-    "NekoMindMoeForTokenClassification",
-]
+__all__ = ["NekoMindMoeForCausalLM", "NekoMindMoeModel", "NekoMindMoePreTrainedModel"]
