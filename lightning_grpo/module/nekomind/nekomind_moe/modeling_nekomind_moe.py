@@ -821,7 +821,7 @@ class NekoMindMoePreTrainedModel(PreTrainedModel):
     config: NekoMindMoeConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["KimiLinearDecoderLayer"]
+    _no_split_modules = ["NekoMindMoeDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -999,7 +999,7 @@ def load_balancing_loss_func(
 
 @auto_docstring
 class NekoMindMoeForCausalLM(NekoMindMoePreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {}
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     _fsdp_plan = {"lm_head": "keep_full_weight"}
