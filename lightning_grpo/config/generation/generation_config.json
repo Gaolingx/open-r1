@@ -1,7 +1,9 @@
 {
-    "do_sample": true,
-    "max_new_tokens": 1024,
-    "temperature": 0.6,
-    "top_k": 20,
-    "top_p": 0.95
+  "bos_token_id": 0,
+  "do_sample": true,
+  "eos_token_id": 1,
+  "temperature": 0.6,
+  "top_k": 20,
+  "top_p": 0.95,
+  "transformers_version": "5.17.0.dev0"
 }
