@@ -1,6 +1,6 @@
 {
   "architectures": [
-    "NekoMindMoeForCausalLM"
+    "NekoMindMoe2ForCausalLM"
   ],
   "attention_bias": false,
   "attention_dropout": 0.0,
@@ -54,7 +54,7 @@
   "intermediate_size": 3072,
   "max_position_embeddings": 32768,
   "first_k_dense_replace": 1,
-  "model_type": "nekomind_moe",
+  "model_type": "nekomind_moe2",
   "moe_intermediate_size": 768,
   "shared_expert_intermediate_size": 768,
   "norm_topk_prob": true,
