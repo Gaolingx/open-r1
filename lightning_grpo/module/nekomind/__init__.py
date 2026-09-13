@@ -1,13 +1,13 @@
-from .nekomind_moe.configuration_nekomind_moe import NekoMindMoeConfig
+from .nekomind_moe.configuration_nekomind_moe import NekoMindMoe2Config
 from .nekomind_moe.modeling_nekomind_moe import (
-    NekoMindMoeForCausalLM,
-    NekoMindMoeModel,
-    NekoMindMoePreTrainedModel,
+    NekoMindMoe2ForCausalLM,
+    NekoMindMoe2Model,
+    NekoMindMoe2PreTrainedModel,
 )
 
 __all__ = [
-    "NekoMindMoeConfig",
-    "NekoMindMoeForCausalLM",
-    "NekoMindMoeModel",
-    "NekoMindMoePreTrainedModel",
+    "NekoMindMoe2Config",
+    "NekoMindMoe2ForCausalLM",
+    "NekoMindMoe2Model",
+    "NekoMindMoe2PreTrainedModel",
 ]

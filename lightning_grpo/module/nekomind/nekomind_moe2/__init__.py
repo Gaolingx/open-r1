@@ -18,8 +18,8 @@ from transformers.utils.import_utils import define_import_structure
 
 
 if TYPE_CHECKING:
-    from .configuration_nekomind_moe import *
-    from .modeling_nekomind_moe import *
+    from .configuration_nekomind_moe2 import *
+    from .modeling_nekomind_moe2 import *
 else:
     import sys
 
