@@ -41,7 +41,7 @@ class NekoMindMoeConfig(PreTrainedConfig):
     >>> # Initializing a NekoMindMoE style configuration
     >>> configuration = NekoMindMoeConfig()
 
-    >>> # Initializing a model from the NekoMind1.5-Base" style configuration
+    >>> # Initializing a model from the NekoMind1.5-Base style configuration
     >>> model = NekoMindMoeModel(configuration)
 
     >>> # Accessing the model configuration
