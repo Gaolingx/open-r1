@@ -1752,6 +1752,72 @@ def apply_liger_kernel_to_nekomind_moe(
                 _patch_rms_norm_module(decoder_layer.post_attention_layernorm)
 
 
+def apply_liger_kernel_to_nekomind_moe2(
+    rope: bool = True,
+    cross_entropy: bool = False,
+    fused_linear_cross_entropy: bool = True,
+    rms_norm: bool = True,
+    swiglu: bool = True,
+    model: PreTrainedModel = None,
+) -> None:
+    """
+    Apply Liger kernels to replace original implementation in HuggingFace NekoMindMoe models.
+    """
+    assert not (cross_entropy and fused_linear_cross_entropy), (
+        "cross_entropy and fused_linear_cross_entropy cannot both be True."
+    )
+
+    from lightning_grpo.module.nekomind.nekomind_moe2 import modeling_nekomind_moe2
+    from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2Model
+
+    from lightning_grpo.utils.liger_kernel.model.nekomind_moe2 import lce_forward as nekomind2_lce_forward
+    from liger_kernel.transformers.swiglu import LigerQwen3MoeSwiGLUMLP
+
+    if rms_norm:
+        modeling_nekomind_moe2.NekoMindMoe2RMSNorm = LigerRMSNorm
+
+    if cross_entropy:
+        from transformers.loss.loss_utils import nn
+
+        nn.functional.cross_entropy = liger_cross_entropy
+
+    if fused_linear_cross_entropy:
+        if model is not None:
+            model.forward = MethodType(nekomind2_lce_forward, model)
+        else:
+            modeling_nekomind_moe2.NekoMindMoe2ForCausalLM.forward = nekomind2_lce_forward
+
+    if swiglu:
+        if IS_TRANSFORMERS_V5_OR_LATER:
+            modeling_nekomind_moe2.NekoMindMoe2Experts = LigerExperts
+        else:
+            modeling_nekomind_moe2.NekoMindMoe2MLP = LigerQwen3MoeSwiGLUMLP
+
+    if model is not None:
+        # The model instance already exists, so we need to additionally patch the
+        # instance variables that reference already-instantiated modules
+
+        # get the base model from the model instance
+        base_model: NekoMindMoe2Model = getattr(model, model.base_model_prefix, model)
+
+        if rms_norm:
+            _patch_rms_norm_module(base_model.norm)
+        for decoder_layer in base_model.layers:
+            if swiglu:
+                mlp = decoder_layer.mlp
+                # Sparse MoE block
+                if hasattr(mlp, "experts"):
+                    _patch_swiglu_module(mlp.experts, LigerExperts)
+                    if hasattr(mlp, "shared_expert"):
+                        _patch_swiglu_module(mlp.shared_expert, LigerQwen3MoeSwiGLUMLP)
+                # Dense MLP block
+                else:
+                    _patch_swiglu_module(mlp, LigerQwen3MoeSwiGLUMLP)
+            if rms_norm:
+                _patch_rms_norm_module(decoder_layer.input_layernorm)
+                _patch_rms_norm_module(decoder_layer.post_attention_layernorm)
+
+
 def apply_liger_kernel_to_gpt_oss(
     rope: bool = True,
     cross_entropy: bool = False,
@@ -3467,6 +3533,7 @@ MODEL_TYPE_TO_APPLY_LIGER_FN = {
     "qwen3_vl_moe": apply_liger_kernel_to_qwen3_vl_moe,
     "qwen3_vl_moe_text": apply_liger_kernel_to_qwen3_vl_moe,
     "nekomind_moe": apply_liger_kernel_to_nekomind_moe,
+    "nekomind_moe2": apply_liger_kernel_to_nekomind_moe2,
     "smollm3": apply_liger_kernel_to_smollm3,
     "phi3": apply_liger_kernel_to_phi3,
     "paligemma": apply_liger_kernel_to_paligemma,
