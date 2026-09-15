@@ -1,5 +1,5 @@
-from .nekomind_moe.configuration_nekomind_moe import NekoMindMoe2Config
-from .nekomind_moe.modeling_nekomind_moe import (
+from .nekomind_moe2.configuration_nekomind_moe2 import NekoMindMoe2Config
+from .nekomind_moe2.modeling_nekomind_moe2 import (
     NekoMindMoe2ForCausalLM,
     NekoMindMoe2Model,
     NekoMindMoe2PreTrainedModel,
