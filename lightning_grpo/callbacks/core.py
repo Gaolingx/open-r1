@@ -10,6 +10,7 @@ from typing import Any
 
 import lightning as L
 import torch
+from lightning_utilities.core.apply_func import apply_to_collection
 from transformers import PreTrainedTokenizerBase
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
@@ -23,11 +24,59 @@ from lightning_grpo.utils.config import save_json_config
 
 
 class CheckpointCallback(ModelCheckpoint):
-    """ModelCheckpoint with optional torch export delegated to LightningModule."""
+    """ModelCheckpoint with optional torch export delegated to LightningModule.
+
+    Also makes the checkpoint state device-agnostic. With ``ModelParallelStrategy``
+    (FSDP2) the rejected keys of the Lightning checkpoint dict -- including this
+    callback's state -- are written into ``<ckpt>/meta.pt`` with a plain
+    ``torch.save`` and read back with ``torch.load(..., weights_only=...)`` *without*
+    ``map_location`` (see ``lightning/fabric/strategies/model_parallel.py``,
+    ``_load_checkpoint``). Any CUDA tensor stored here is therefore re-materialized
+    on the physical GPU index that was current *at save time*:
+
+    * every rank allocates a CUDA context on that stale GPU, so that GPU keeps a few
+      hundred MiB hostage with 0% utilization for the whole training run;
+    * ``check_monitor_top_k`` then compares the fresh metric (current device) against
+      the stale reference tensor (old device) and raises
+      ``RuntimeError: Expected all tensors to be on the same device``.
+    """
 
     def __init__(self, *args: Any, save_pt_format: bool = True, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.save_pt_format = save_pt_format
+
+    def state_dict(self) -> dict[str, Any]:
+        """Keep GPU tensors (``best_k_models``/``current_score``/``kth_value``) out of ``meta.pt``."""
+
+        state = super().state_dict()
+        return apply_to_collection(state, torch.Tensor, lambda t: t.detach().cpu())
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Tolerate checkpoints written before the CPU conversion above."""
+
+        super().load_state_dict(apply_to_collection(state_dict, torch.Tensor, lambda t: t.detach().cpu()))
+
+    def check_monitor_top_k(self, trainer: L.Trainer, current: torch.Tensor | None = None) -> bool:
+        """Same logic as the base class, but never compare tensors across devices."""
+
+        if current is None:
+            return False
+
+        if self.save_top_k == -1:
+            return True
+
+        if len(self.best_k_models) < self.save_top_k:
+            return True
+
+        reference = self.best_k_models[self.kth_best_model_path]
+        if torch.is_tensor(current) and torch.is_tensor(reference) and current.device != reference.device:
+            reference = reference.to(current.device)
+
+        monitor_op = {"min": torch.lt, "max": torch.gt}[self.mode]
+        should_update_best_and_save = monitor_op(current, reference)
+
+        # If using multiple devices, make sure all processes are unanimous on the decision.
+        return trainer.strategy.reduce_boolean_decision(bool(should_update_best_and_save))
 
     def _save_checkpoint(self, trainer: L.Trainer, filepath: str) -> None:
         super()._save_checkpoint(trainer, filepath)
