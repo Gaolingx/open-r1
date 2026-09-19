@@ -1,14 +1,28 @@
-"""Auxiliary-loss-free load balancing via per-expert router bias (Megatron / DeepSeek-V3 style).
+"""Auxiliary-loss-free load balancing via a per-expert router bias (DeepSeek-V3 style).
 
-Instead of adding a differentiable auxiliary loss to the router, this module
+Instead of adding a differentiable auxiliary loss to the router, this callback
 updates a *non-gradient* per-expert bias ``e_score_correction_bias`` with a
-sign-based rule every optimizer step:
+sign-based rule once per optimizer step:
 
     b_i <- b_i + gamma * sign(mean_i(c_i) - c_i)
 
 where ``c_i`` is the number of tokens routed to expert ``i`` during the update
-interval (accumulated in ``tokens_per_expert``) and ``gamma`` is
-``router_bias_update_rate``.
+interval and ``gamma`` is ``router_bias_update_rate``.
+
+Non-invasive by design
+----------------------
+``NekoMindMoe2TopKRouter`` is used **exactly as shipped by Hugging Face**:
+
+* its ``forward`` already returns ``(router_logits, topk_weights, topk_indices)``,
+  so token counts are recovered with a ``forward_hook`` -- no counter buffer and
+  no counting code inside the model;
+* it already computes ``scores_for_choice = scores + self.e_score_correction_bias``,
+  so the shipped (never updated) zero-initialised buffer is all the model provides.
+
+The counters live on the callback: they never enter the model's ``state_dict`` and
+simply disappear when this callback is not registered. The bias itself is promoted
+to float32 in memory at ``setup`` time, which replaces the ``_keep_in_fp32_modules``
+declaration the HF file does not have.
 
 References:
     - Loss-Free Balancing, arXiv:2408.15664
@@ -21,12 +35,14 @@ distorts the model's output distribution.
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.distributed as dist
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.utilities import rank_zero_info
+
+DEFAULT_UPDATE_RATE = 1.0e-3
 
 
 def iter_routers(model: torch.nn.Module) -> list[torch.nn.Module]:
@@ -38,12 +54,15 @@ def iter_routers(model: torch.nn.Module) -> list[torch.nn.Module]:
 class RouterBiasUpdateCallback(Callback):
     """Update ``e_score_correction_bias`` once per optimizer step.
 
-    Token counts are accumulated inside the router's forward pass whenever the
-    module is in training mode, then consumed and reset here.
+    A ``forward_hook`` on every router accumulates the ``topk_indices`` that the
+    shipped ``forward`` already returns; the counters are then consumed and reset
+    in ``on_before_optimizer_step``. Nothing in the HF modeling code is touched.
 
     Args:
-        update_rate: Bias step size ``gamma``. When ``None`` (default) the value is
-            read from the policy config (``router_bias_update_rate``).
+        enabled: Master switch. When false, ``setup`` returns immediately and the bias is
+            left untouched (equivalent to plain top-k routing).
+        update_rate: Bias step size ``gamma``. When ``None`` (default) the value is read
+            from the policy config (``router_bias_update_rate``) as a fallback.
         reduce_dim_names: Device-mesh dimension names whose token counts must be
             summed before applying the update. Defaults to
             ``("data_parallel", "tensor_parallel")``: data-parallel ranks see
@@ -57,59 +76,119 @@ class RouterBiasUpdateCallback(Callback):
 
     def __init__(
         self,
+        enabled: bool = True,
         update_rate: float | None = None,
         reduce_dim_names: Sequence[str] = ("data_parallel", "tensor_parallel"),
         freeze_at_end_fraction: float = 0.0,
     ) -> None:
         super().__init__()
+        self.enabled = enabled
         self.update_rate = update_rate
         self.reduce_dim_names = tuple(reduce_dim_names)
         self.freeze_at_end_fraction = freeze_at_end_fraction
         self._routers: list[torch.nn.Module] = []
+        self._counts: list[torch.Tensor] = []
+        self._handles: list[Any] = []
         self._num_experts: int | None = None
 
     # ---- lifecycle -------------------------------------------------------
-    def setup(self, trainer, pl_module, stage) -> None:
-        """Resolve routers and bias hyper-parameters from the policy config."""
+    def setup(self, trainer, pl_module, stage: str = "fit") -> None:
+        """Resolve routers, promote the bias to fp32, and install counting hooks."""
+
+        self._detach_hooks()
+        self._routers = []
+        self._counts = []
+        self._num_experts = None
+
+        if stage != "fit":
+            return
+
+        if not self.enabled:
+            rank_zero_info("[RouterBias] Disabled via `optimization.router_bias_enabled`; callback inactive.")
+            return
 
         policy = getattr(pl_module, "policy", None) or getattr(pl_module, "model", None)
         if policy is None:
             rank_zero_info("[RouterBias] No `policy`/`model` attribute found; callback disabled.")
             return
 
-        config = getattr(policy, "config", None)
-        if not getattr(config, "enable_expert_bias", True):
-            rank_zero_info("[RouterBias] `enable_expert_bias=False`; callback disabled.")
-            return
-
         routers = iter_routers(policy)
         if not routers:
-            rank_zero_info("[RouterBias] No router with `e_score_correction_bias` found; callback disabled.")
+            rank_zero_info("[RouterBias] No module exposing `e_score_correction_bias` found; callback disabled.")
             return
 
-        if any(getattr(router, "tokens_per_expert", None) is None for router in routers):
-            raise RuntimeError(
-                "RouterBiasUpdateCallback requires every router to own a `tokens_per_expert` buffer. "
-                "Update `NekoMindMoe2TopKRouter`, or set `enable_expert_bias=False` to opt out."
-            )
-
-        # The bias must stay in float32: a 1e-3 update is below bfloat16 resolution.
-        for router in routers:
-            if router.e_score_correction_bias.dtype != torch.float32:
-                router.e_score_correction_bias.data = router.e_score_correction_bias.data.float()
-            if router.tokens_per_expert.dtype != torch.float32:
-                router.tokens_per_expert.data = router.tokens_per_expert.data.float()
-
         if self.update_rate is None:
-            self.update_rate = float(getattr(config, "router_bias_update_rate", 1.0e-3))
+            # Fallback for callers that do not pass a rate explicitly.
+            config = getattr(policy, "config", None)
+            self.update_rate = float(getattr(config, "router_bias_update_rate", DEFAULT_UPDATE_RATE))
+        if self.update_rate <= 0.0:
+            rank_zero_info(f"[RouterBias] `update_rate={self.update_rate}`; callback disabled.")
+            return
+
+        num_experts = routers[0].e_score_correction_bias.numel()
+        if any(router.e_score_correction_bias.numel() != num_experts for router in routers):
+            raise ValueError("[RouterBias] All routers must expose the same number of experts.")
 
         self._routers = routers
-        self._num_experts = routers[0].tokens_per_expert.numel()
+        self._num_experts = num_experts
+        for index, router in enumerate(routers):
+            bias = router.e_score_correction_bias
+            # The bias must stay in float32: a 1e-3 update is below bfloat16 resolution.
+            # Swapping `.data` keeps the buffer registered while avoiding the
+            # `_keep_in_fp32_modules` declaration the HF file does not have.
+            if bias.dtype != torch.float32:
+                bias.data = bias.data.to(torch.float32)
+            self._counts.append(torch.zeros(num_experts, dtype=torch.float32, device=bias.device))
+            self._handles.append(router.register_forward_hook(self._make_hook(index)))
 
         rank_zero_info(
-            f"[RouterBias] Tracking {len(routers)} routers (num_experts={self._num_experts}, "
+            f"[RouterBias] Tracking {len(routers)} routers (num_experts={num_experts}, "
             f"update_rate={self.update_rate}, reduce_dims={self._resolve_mesh_dim_names(pl_module)})"
         )
+
+    def teardown(self, trainer, pl_module, stage: str = "fit") -> None:
+        """Remove the counting hooks once the stage is over."""
+
+        self._detach_hooks()
+        self._routers = []
+        self._counts = []
+        self._num_experts = None
+
+    # ---- token counting (forward hook; the model stays untouched) --------
+    def _make_hook(self, index: int):
+        """Build the per-router hook that accumulates ``topk_indices``."""
+
+        def _hook(module, args, output):
+            # `TorchRolloutEngine` reuses this very policy instance under ``torch.no_grad()``,
+            # so training mode alone cannot distinguish a training forward from generation.
+            if not module.training or not torch.is_grad_enabled():
+                return
+            if not isinstance(output, (tuple, list)) or len(output) < 3:
+                return
+
+            indices = output[2]
+            if not torch.is_tensor(indices) or indices.dtype not in (torch.int32, torch.int64):
+                return
+
+            flat = indices.reshape(-1)
+            counts = self._counts[index]
+            if counts.device != flat.device:
+                counts = counts.to(flat.device)
+                self._counts[index] = counts
+            # ``index_add_`` keeps the output shape static, which keeps dynamo and CUDA
+            # graphs happy (``bincount`` would produce a data-dependent length).
+            counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
+
+        return _hook
+
+    def _detach_hooks(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+
+    def _zero_counts(self) -> None:
+        for counts in self._counts:
+            counts.zero_()
 
     # ---- reduction -------------------------------------------------------
     def _resolve_mesh_dim_names(self, pl_module) -> tuple[str, ...]:
@@ -144,37 +223,42 @@ class RouterBiasUpdateCallback(Callback):
 
     # ---- per-optimizer-step hook ----------------------------------------
     def on_before_optimizer_step(self, trainer, pl_module, optimizer) -> None:
-        if not self._routers or self.update_rate is None:
+        if not self._routers or not self._counts or self.update_rate is None:
             return
 
-        device = self._routers[0].tokens_per_expert.device
+        device = self._counts[0].device
+        num_experts = self._num_experts
 
-        # 0) 训练末期冻结偏置（DeepSeek-V3 的推荐做法）
+        # 0) Freeze the bias over the tail of training (the DeepSeek-V3 recipe).
         if self.freeze_at_end_fraction > 0.0:
             total_steps = getattr(trainer, "estimated_stepping_batches", 0) or 0
             if total_steps > 0 and trainer.global_step / float(total_steps) >= (1.0 - self.freeze_at_end_fraction):
-                for router in self._routers:
-                    router.tokens_per_expert.zero_()
+                self._zero_counts()
                 return
 
         with torch.no_grad():
-            # 1) 汇总所有层的计数 -> [num_layers, num_experts]
-            counts = torch.stack([router.tokens_per_expert for router in self._routers]).to(dtype=torch.float32)
-            # 2) 全局归约（DP 上每 rank 只看到部分 token）；fp32 归约避免 bf16 精度丢失
+            # 1) Stack every layer's counter -> [num_layers, num_experts].
+            counts = torch.stack([counter.to(dtype=torch.float32) for counter in self._counts])
+            # 2) Sum over the ranks that saw different tokens (data parallel). The
+            #    reduction runs in fp32 so no precision is lost before taking the sign.
             for group in self._reduce_groups(pl_module):
                 dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
 
-            # 3) 符号更新：等价于 e_i = c_bar - c_i
-            num_experts = self._num_experts
+            # 3) Sign update, algebraically equivalent to `e_i = c_bar - c_i`.
             total = counts.sum(dim=-1, keepdim=True)  # [num_layers, 1]
             direction = torch.sign(total - counts * num_experts)  # [num_layers, num_experts]
 
-            # 4) 写回并清零计数
+            # 4) Write the bias back and reset the counters. A repeated forward only
+            #    rescales `counts` uniformly, which leaves the sign rule unchanged.
             for row, router in zip(direction, self._routers):
-                router.e_score_correction_bias.add_(row * self.update_rate)
-                router.tokens_per_expert.zero_()
+                router_bias = router.e_score_correction_bias
+                if router_bias.dtype != torch.float32:
+                    router_bias.data = router_bias.data.to(torch.float32)
+                router_bias.add_(row * self.update_rate)
+            self._zero_counts()
 
-            # 5) 监控指标（归约后各 rank 一致，无需 sync_dist）
+            # 5) Monitoring metrics. Counts are already reduced, so every rank agrees
+            #    and no `sync_dist` is needed.
             mean = total / num_experts
             max_violation = ((counts - mean).abs().amax(dim=-1) / mean.clamp_min(1.0)).mean()
             load_cv = (counts.std(dim=-1) / mean.squeeze(-1).clamp_min(1.0)).mean()

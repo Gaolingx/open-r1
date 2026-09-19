@@ -39,12 +39,6 @@ class NekoMindMoe2Config(PreTrainedConfig):
         Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
     linear_lower_bound (`float`, *optional*, defaults to -5.0):
         Whether the forget gate has a lower bound to apply to the decay.
-    enable_expert_bias (`bool`, *optional*, defaults to `True`):
-        Enable the auxiliary-loss-free balancing bias ``e_score_correction_bias``. When enabled the router
-        tracks per-expert token counts in ``tokens_per_expert`` and the training callback updates the bias
-        with a sign rule instead of adding a differentiable auxiliary loss.
-    router_bias_update_rate (`float`, *optional*, defaults to `1e-3`):
-        Step size (``gamma``) of the per-expert bias update.
     """
 
     model_type = "nekomind_moe2"
@@ -112,8 +106,6 @@ class NekoMindMoe2Config(PreTrainedConfig):
     linear_lower_bound: float | None = -5.0
     mlp_layer_types: list[str] | None = None
     layer_types: list[str] | None = None
-    enable_expert_bias: bool = True
-    router_bias_update_rate: float = 1e-3
 
     linear_head_dim: int = 128
     linear_num_heads: int = 32

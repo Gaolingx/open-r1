@@ -689,13 +689,7 @@ class NekoMindMoe2TopKRouter(nn.Module):
         self.num_group = config.n_group
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
-        # Auxiliary-loss-free load balancing: `e_score_correction_bias` is a non-gradient
-        # per-expert bias used only for *selection*, updated by RouterBiasUpdateCallback.
-        # It must stay in float32, otherwise a ~1e-3 update is below bfloat16 resolution.
-        self.enable_expert_bias = getattr(config, "enable_expert_bias", True)
-        self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts, dtype=torch.float32))
-        # Per-step token counter consumed (and reset) by the callback; never checkpointed.
-        self.tokens_per_expert = nn.Buffer(torch.zeros(self.num_experts, dtype=torch.float32), persistent=False)
+        self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
 
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -722,16 +716,6 @@ class NekoMindMoe2TopKRouter(nn.Module):
             denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
             topk_weights /= denominator
         topk_weights = topk_weights * self.routed_scaling_factor
-
-        if self.training and self.enable_expert_bias and torch.is_grad_enabled():
-            # Token statistics for the auxiliary-loss-free update. Gradient-checkpoint
-            # recomputation may count a micro-batch twice, which is harmless: both the
-            # sign rule and the logged imbalance ratios are invariant to uniform rescaling.
-            token_indices = topk_indices.reshape(-1)
-            counts = self.tokens_per_expert.new_zeros(self.num_experts)
-            counts.index_add_(0, token_indices, torch.ones_like(token_indices, dtype=counts.dtype))
-            self.tokens_per_expert.add_(counts)
-
         return router_logits, topk_weights, topk_indices
 
 
@@ -868,8 +852,6 @@ class NekoMindMoe2PreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["NekoMindMoe2DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
-    # Keep the auxiliary-loss-free balancing bias in float32: 1e-3 updates vanish in bf16.
-    _keep_in_fp32_modules = ["e_score_correction_bias"]
     _supports_flash_attn = True
     _supports_sdpa = True
     _keys_to_ignore_on_load_unexpected = None
@@ -896,6 +878,7 @@ class NekoMindMoe2PreTrainedModel(PreTrainedModel):
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, NekoMindMoe2TopKRouter):
             init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            init.zeros_(module.e_score_correction_bias)
         elif isinstance(module, NekoMindMoe2RMSNormGated):
             init.ones_(module.weight)
 

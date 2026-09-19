@@ -488,7 +488,11 @@ def build_callbacks(config: TrainingBaseConfig) -> list[Callback]:
         EfficiencyMonitorCallback(log_every_n_steps=config.logging.log_every_n_steps),
         GlobalSampleCountCallback(log_every_n_steps=config.logging.log_every_n_steps),
         GradParamNormCallback(log_every_n_steps=config.logging.log_every_n_steps),
-        RouterBiasUpdateCallback(freeze_at_end_fraction=config.optimization.router_bias_freeze_at_end_fraction),
+        RouterBiasUpdateCallback(
+            enabled=config.optimization.router_bias_enabled,
+            update_rate=config.optimization.router_bias_update_rate,
+            freeze_at_end_fraction=config.optimization.router_bias_freeze_at_end_fraction,
+        ),
         NaNLossCallback(),
         ConfigSnapshotCallback(config),
         RichProgressBar(),
