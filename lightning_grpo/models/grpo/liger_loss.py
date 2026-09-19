@@ -18,7 +18,7 @@ from torch.distributed.tensor import DTensor, Replicate
 from lightning_grpo.models.common import get_lm_head_model, get_transformer_backbone_model
 from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
-from lightning_grpo.utils.metrics import MoEAuxLossComputer, collect_moe_metrics
+from lightning_grpo.utils.metrics import collect_moe_metrics
 
 
 def _materialize_liger_lm_head(
@@ -137,7 +137,6 @@ class LigerDPOLossComputer:
         self.ref_model = ref_model
         self.nll_coeff = nll_coeff
         self.loss_parallel_enabled = loss_parallel_enabled
-        self.aux_loss_computer = MoEAuxLossComputer(model)
         self.loss_fn = LigerFusedLinearDPOLoss(
             beta=beta,
             loss_type=loss_type,
@@ -198,13 +197,8 @@ class LigerDPOLossComputer:
         if nll_loss is not None:
             loss = (loss - nll_loss) + self.nll_coeff * nll_loss
 
-        # Compute MoE auxiliary loss from router logits
-        attention_mask = batch.get("attention_mask")
-        moe_metrics = collect_moe_metrics(outputs, top_k=self.aux_loss_computer.num_experts_per_tok)
-        aux_loss, aux_metrics = self.aux_loss_computer.compute(outputs, attention_mask)
-        if aux_loss is not None:
-            loss = loss + aux_loss.to(loss.device)
-        moe_metrics.update(aux_metrics)
+        # Collect router-level MoE diagnostics
+        moe_metrics = collect_moe_metrics(outputs, top_k=getattr(self.model.config, "num_experts_per_tok", 1))
 
         return loss, {
             "chosen_logps": chosen_logps,
@@ -252,7 +246,6 @@ class LigerGRPOLossComputer:
         self.metrics_aggregator = metrics_aggregator
         self.rollout_temperature = rollout_temperature
         self.loss_parallel_enabled = loss_parallel_enabled
-        self.aux_loss_computer = MoEAuxLossComputer(module.policy)
 
         config = module.config
         loss_type = "bnpo" if config.rollout.loss_type == "grpo" else config.rollout.loss_type
@@ -406,9 +399,6 @@ class LigerGRPOLossComputer:
             ref_weight,
             ref_bias,
         )
-        aux_loss, aux_metrics = self.aux_loss_computer.compute(moe_outputs, model_attention_mask)
-        if aux_loss is not None:
-            loss = loss + aux_loss.to(loss.device)
 
         with torch.no_grad():
             mean_kl = liger_metrics[0] if self.module.config.rollout.kl_beta != 0.0 else completion_ids.new_tensor(0.0, dtype=torch.float32)
@@ -449,6 +439,5 @@ class LigerGRPOLossComputer:
             moe_outputs=moe_outputs,
             top_k=self.module.policy.config.num_experts_per_tok,
         )
-        metrics.update(aux_metrics)
 
         return loss, metrics

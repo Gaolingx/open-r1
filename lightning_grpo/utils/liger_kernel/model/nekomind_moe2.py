@@ -5,7 +5,6 @@ from typing import Union
 import torch
 
 from transformers.modeling_outputs import MoeModelOutputWithPast
-from transformers.models.mixtral.modeling_mixtral import load_balancing_loss_func
 
 from liger_kernel.transformers.model.loss_utils import LigerForCausalLMLoss
 from liger_kernel.transformers.model.loss_utils import unpack_cross_entropy_result
@@ -122,20 +121,10 @@ def lce_forward(
                 **kwargs,
             )
 
-    aux_loss = None
-    if output_router_logits:
-        aux_loss = load_balancing_loss_func(
-            outputs.router_logits,
-            self.num_experts,
-            self.num_experts_per_tok,
-            attention_mask,
-        )
-        if labels is not None:
-            loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
-
+    # Router logits are only collected for monitoring; load balancing is handled by
+    # the non-differentiable `e_score_correction_bias` update (see RouterBiasUpdateCallback).
     if not return_dict:
         output = (logits,) + outputs[1:]
-        output = ((aux_loss,) + output) if aux_loss is not None else output
         output = ((loss,) + output) if loss is not None else output
         output = output + (token_accuracy,) if token_accuracy is not None else output
         output = output + (predicted_tokens,) if predicted_tokens is not None else output
@@ -144,7 +133,6 @@ def lce_forward(
     # Return custom output class with accuracy field
     return LigerMoeCausalLMOutputWithPast(
         loss=loss,
-        aux_loss=aux_loss,
         logits=logits,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,

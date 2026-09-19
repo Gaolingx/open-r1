@@ -6,10 +6,13 @@ from lightning_grpo.callbacks.core import (
     PeriodicSampleGenerationCallback,
     build_callbacks,
 )
+from lightning_grpo.callbacks.router_bias import RouterBiasUpdateCallback, iter_routers
 
 __all__ = [
     "ConfigSnapshotCallback",
     "EfficiencyMonitorCallback",
     "PeriodicSampleGenerationCallback",
+    "RouterBiasUpdateCallback",
     "build_callbacks",
+    "iter_routers",
 ]

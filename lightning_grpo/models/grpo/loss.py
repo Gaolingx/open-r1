@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.parallel import loss_parallel
 
-from lightning_grpo.utils.metrics import MoEAuxLossComputer, collect_moe_metrics
+from lightning_grpo.utils.metrics import collect_moe_metrics
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -115,7 +115,7 @@ def compute_standard_cross_entropy_loss(
     label_smoothing: float = 0.0,
     loss_parallel_enabled: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute standard CE loss and manually add MoE auxiliary loss."""
+    """Compute standard CE loss and collect MoE routing diagnostics."""
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
 
@@ -135,13 +135,7 @@ def compute_standard_cross_entropy_loss(
     )
     loss = ce_loss
 
-    aux_loss_computer = MoEAuxLossComputer(model)
-    aux_loss, aux_metrics = aux_loss_computer.compute(outputs, attention_mask)
-    if aux_loss is not None:
-        loss = loss + aux_loss.to(loss.device)
-
     metrics = collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok)
-    metrics.update(aux_metrics)
     metrics["lm_loss"] = ce_loss.detach()
     metrics["_policy_outputs"] = outputs
 
@@ -260,15 +254,8 @@ def compute_standard_sft_loss(
         # Compute DFT loss
         loss = dft_loss(outputs, labels)
 
-        # Compute MoE auxiliary loss if applicable
-        aux_loss_computer = MoEAuxLossComputer(model)
-        aux_loss, aux_metrics = aux_loss_computer.compute(outputs, attention_mask)
-        if aux_loss is not None:
-            loss = loss + aux_loss.to(loss.device)
-
         # Gather metrics
         metrics = collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok)
-        metrics.update(aux_metrics)
         metrics["lm_loss"] = loss.detach()
         metrics["_policy_outputs"] = outputs
 
@@ -379,11 +366,6 @@ def compute_standard_dpo_loss(
         )
         loss = loss + nll_coeff * nll_loss
 
-    aux_loss_computer = MoEAuxLossComputer(model)
-    aux_loss, aux_metrics = aux_loss_computer.compute(outputs, attention_mask)
-    if aux_loss is not None:
-        loss = loss + aux_loss.to(loss.device)
-
     # Compute rewards for logging
     chosen_rewards = beta * chosen_logratios.detach()
     rejected_rewards = beta * rejected_logratios.detach()
@@ -400,7 +382,6 @@ def compute_standard_dpo_loss(
     }
 
     metrics_dict.update(collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok))
-    metrics_dict.update(aux_metrics)
 
     return loss, metrics_dict
 
@@ -579,10 +560,6 @@ def compute_standard_grpo_loss(
         loss_type=loss_type,
         max_completion_length=max_completion_length,
     )
-    aux_loss_computer = MoEAuxLossComputer(model)
-    aux_loss, aux_metrics = aux_loss_computer.compute(outputs, model_attention_mask)
-    if aux_loss is not None:
-        loss = loss + aux_loss.to(loss.device)
 
     with torch.no_grad():
         entropy = entropy_from_logits(completion_logits)
@@ -601,7 +578,6 @@ def compute_standard_grpo_loss(
         }
 
     local_metrics.update(collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok))
-    local_metrics.update(aux_metrics)
     local_metrics["_policy_outputs"] = outputs
 
     return loss, local_metrics

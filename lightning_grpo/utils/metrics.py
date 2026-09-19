@@ -6,59 +6,12 @@ from typing import Any, Optional
 
 import lightning as L
 import torch
-from transformers.trainer_utils import unwrap_peft_model
-from transformers.models.mixtral.modeling_mixtral import load_balancing_loss_func
-from lightning.pytorch.utilities import rank_zero_warn
 
 
 def _get_output_value(outputs: Any, key: str) -> Any:
     if isinstance(outputs, dict):
         return outputs.get(key)
     return getattr(outputs, key, None)
-
-
-class MoEAuxLossComputer:
-    """Compute MoE router auxiliary loss from captured router logits."""
-
-    def __init__(self, model: Any) -> None:
-        self.model = unwrap_peft_model(model)
-        self.config = getattr(self.model, "config", None)
-        self.aux_loss_enabled = getattr(self.config, "output_router_logits", False)
-        self.aux_loss_coef = getattr(self.config, "router_aux_loss_coef", 0.0)
-        self.num_experts = getattr(self.config, "num_experts", 0)
-        self.num_experts_per_tok = getattr(self.config, "num_experts_per_tok", 0)
-
-        if self.aux_loss_enabled and self.aux_loss_coef == 0.0:
-            rank_zero_warn(
-                "You set `output_router_logits` to `True` in the model config, but `router_aux_loss_coef` is set to "
-                "`0.0`, meaning the auxiliary loss will not be used. Either set `router_aux_loss_coef` to a value "
-                "greater than `0.0`, or set `output_router_logits` to `False` if you don't want to use the auxiliary "
-                "loss.",
-            )
-
-    def compute(self, outputs: Any, attention_mask: torch.Tensor | None = None) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
-        """Return weighted aux loss for optimization and detached aux metric for logging."""
-
-        metrics: dict[str, torch.Tensor] = {}
-        if not self.aux_loss_enabled or self.aux_loss_coef == 0.0:
-            return None, metrics
-
-        router_logits = _get_output_value(outputs, "router_logits")
-        aux_loss = _get_output_value(outputs, "aux_loss")
-
-        if aux_loss is None and router_logits is not None:
-            aux_loss = load_balancing_loss_func(
-                router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
-
-        if aux_loss is None or not torch.is_tensor(aux_loss):
-            return None, metrics
-
-        metrics["aux_loss"] = aux_loss.detach().to(dtype=torch.float32)
-        return self.aux_loss_coef * aux_loss, metrics
 
 
 def format_metric_value(value: Any) -> Optional[float]:
@@ -74,6 +27,11 @@ def format_metric_value(value: Any) -> Optional[float]:
 def collect_moe_metrics(outputs: Any, top_k: int = 1) -> dict[str, torch.Tensor]:
     """Extract aggregate MoE routing diagnostics from model outputs.
 
+    These are router-*logit* level diagnostics. Realized (post-bias, post-grouped-top-k)
+    expert load is tracked separately via ``tokens_per_expert`` by
+    ``RouterBiasUpdateCallback``. Load balancing itself is handled by updating
+    ``e_score_correction_bias`` instead of adding an auxiliary loss.
+
     Args:
         outputs: Model forward outputs containing ``router_logits``.
         top_k: Number of top experts selected per token (``num_experts_per_tok``).
@@ -85,10 +43,6 @@ def collect_moe_metrics(outputs: Any, top_k: int = 1) -> dict[str, torch.Tensor]
         return metrics
 
     router_logits = _get_output_value(outputs, "router_logits")
-    aux_loss = _get_output_value(outputs, "aux_loss")
-
-    if aux_loss is not None:
-        metrics["aux_loss"] = aux_loss.detach().to(dtype=torch.float32)
 
     if router_logits is None:
         return metrics
@@ -175,7 +129,6 @@ def log_moe_metrics(
         )
 
     moe_keys = [
-        "aux_loss",
         "router_entropy",
         "dead_expert_fraction",
         "load_imbalance_mean",

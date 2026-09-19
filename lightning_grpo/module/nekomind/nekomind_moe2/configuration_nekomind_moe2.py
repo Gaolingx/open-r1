@@ -27,8 +27,6 @@ from transformers.utils import auto_docstring
 @strict
 class NekoMindMoe2Config(PreTrainedConfig):
     r"""
-    mla_use_nope (`bool`, *optional*, defaults to `True`):
-        Use NoPE attention. MLA asserts that this is enabled.
     mla_use_output_gate (`bool`, *optional*, defaults to `False`):
         Apply sigmoid output gate before the MLA output projection.
     mlp_layer_types (`list[str]`, *optional*):
@@ -41,17 +39,16 @@ class NekoMindMoe2Config(PreTrainedConfig):
         Kernel size for the short convolution applied to queries, keys, and values in linear attention layers.
     linear_lower_bound (`float`, *optional*, defaults to -5.0):
         Whether the forget gate has a lower bound to apply to the decay.
+    enable_expert_bias (`bool`, *optional*, defaults to `True`):
+        Enable the auxiliary-loss-free balancing bias ``e_score_correction_bias``. When enabled the router
+        tracks per-expert token counts in ``tokens_per_expert`` and the training callback updates the bias
+        with a sign rule instead of adding a differentiable auxiliary loss.
+    router_bias_update_rate (`float`, *optional*, defaults to `1e-3`):
+        Step size (``gamma``) of the per-expert bias update.
     """
 
     model_type = "nekomind_moe2"
     keys_to_ignore_at_inference = ["past_key_values"]
-
-    attribute_map = {
-        "num_experts": "num_local_experts",
-        "num_experts_per_tok": "num_experts_per_token",
-    }
-
-    # Default tensor parallel plan for base model `NekoMindMoe`
     base_model_tp_plan = {
         "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
         "layers.*.mlp.experts.down_proj": "rowwise",
@@ -75,40 +72,48 @@ class NekoMindMoe2Config(PreTrainedConfig):
         "layers.*.mlp.experts": "moe_tp_experts",
     }
 
+    attribute_map = {
+        "num_local_experts": "n_routed_experts",
+        "num_experts_per_tok": "num_experts_per_token",
+    }
+
     vocab_size: int = 151936
     hidden_size: int = 2048
     intermediate_size: int = 6144
+    moe_intermediate_size: int = 768
     num_hidden_layers: int = 24
     num_attention_heads: int = 32
     num_key_value_heads: int | None = 32
+    n_shared_experts: int = 1
+    routed_scaling_factor: float = 2.446
+    kv_lora_rank: int = 512
     q_lora_rank: int | None = None
-    kv_lora_rank: int | None = None
-    qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int | None = 128
-    mla_use_nope: bool = True
-    mla_use_output_gate: bool = False
-    linear_lower_bound: float | None = -5.0
+    qk_nope_head_dim: int = 128
+    n_group: int | None = 8
+    topk_group: int | None = 4
+    num_experts_per_tok: int = 8
+    norm_topk_prob: bool = True
     hidden_act: str = "silu"
     max_position_embeddings: int = 32768
     initializer_range: float = 0.02
     rms_norm_eps: float = 1e-6
     use_cache: bool = True
-    tie_word_embeddings: bool = False
-    attention_dropout: float | int = 0.0
-    attention_bias: bool = False
-    moe_intermediate_size: int = 768
-    shared_expert_intermediate_size: int = 768
-    num_experts_per_tok: int = 8
-    num_experts: int = 128
-    norm_topk_prob: bool = False
-    output_router_logits: bool = False
-    router_aux_loss_coef: float = 0.001
-    mlp_layer_types: list[str] | None = None
-    layer_types: list[str] | None = None
     pad_token_id: int | None = None
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
+    pretraining_tp: int | None = 1
+    tie_word_embeddings: bool = False
+    attention_bias: bool = False
+    attention_dropout: float | int | None = 0.0
+    num_local_experts: int = 128
+    mla_use_output_gate: bool = False
+    linear_lower_bound: float | None = -5.0
+    mlp_layer_types: list[str] | None = None
+    layer_types: list[str] | None = None
+    enable_expert_bias: bool = True
+    router_bias_update_rate: float = 1e-3
 
     linear_head_dim: int = 128
     linear_num_heads: int = 32
@@ -117,9 +122,9 @@ class NekoMindMoe2Config(PreTrainedConfig):
     def __post_init__(self, **kwargs):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.head_dim = self.qk_rope_head_dim
-
         super().__post_init__(**kwargs)
         # Checkpoint stores linear attention attributes in a config sub-dict: if it's there, extract them
         linear_attn_config = kwargs.get("linear_attn_config", {})

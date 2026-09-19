@@ -157,6 +157,9 @@ class OptimizationConfig:
     gradient_clip_val: float = 1.0
     train_micro_batch_size: int = 1
     eval_micro_batch_size: int = 1
+    # Fraction of the tail of training during which the auxiliary-loss-free router
+    # bias update is frozen (0.0 keeps updating until the very last step).
+    router_bias_freeze_at_end_fraction: float = 0.0
 
 
 @dataclass

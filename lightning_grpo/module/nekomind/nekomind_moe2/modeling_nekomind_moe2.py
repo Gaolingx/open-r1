@@ -39,7 +39,7 @@ from transformers.integrations.accelerate import force_accelerate_hooks
 from transformers.masking_utils import create_causal_mask, create_recurrent_attention_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
@@ -622,29 +622,13 @@ class NekoMindMoe2DeltaAttention(nn.Module):
         return output
 
 
-class NekoMindMoe2MLP(nn.Module):
-    def __init__(self, config, intermediate_size=None):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
-
-
 @use_experts_implementation
 class NekoMindMoe2Experts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
     def __init__(self, config):
         super().__init__()
-        self.num_experts = config.num_experts
+        self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.moe_intermediate_size
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
@@ -678,46 +662,101 @@ class NekoMindMoe2Experts(nn.Module):
         return final_hidden_states
 
 
-class NekoMindMoe2TopKRouter(nn.Module):
-    def __init__(self, config):
+class NekoMindMoe2MLP(nn.Module):
+    def __init__(self, config, intermediate_size=None):
         super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_experts
-        self.norm_topk_prob = config.norm_topk_prob
-        self.hidden_dim = config.hidden_size
-        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, hidden_states):
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)  # (seq_len, num_experts)
-        routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
-        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)  # (seq_len, top_k)
-        if self.norm_topk_prob:
-            router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-        router_scores = router_top_value.to(routing_weights.dtype)
-        return router_logits, router_scores, router_indices
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
 
 
-class NekoMindMoe2SparseMoeBlock(nn.Module):
+class NekoMindMoe2TopKRouter(nn.Module):
     def __init__(self, config: NekoMindMoe2Config):
         super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_local_experts
+        self.hidden_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.num_group = config.n_group
+        self.topk_group = config.topk_group
+        self.norm_topk_prob = config.norm_topk_prob
+        # Auxiliary-loss-free load balancing: `e_score_correction_bias` is a non-gradient
+        # per-expert bias used only for *selection*, updated by RouterBiasUpdateCallback.
+        # It must stay in float32, otherwise a ~1e-3 update is below bfloat16 resolution.
+        self.enable_expert_bias = getattr(config, "enable_expert_bias", True)
+        self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts, dtype=torch.float32))
+        # Per-step token counter consumed (and reset) by the callback; never checkpointed.
+        self.tokens_per_expert = nn.Buffer(torch.zeros(self.num_experts, dtype=torch.float32), persistent=False)
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.view(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        scores = router_logits.sigmoid()
+        scores_for_choice = scores + self.e_score_correction_bias
+        group_scores = (
+            scores_for_choice.view(-1, self.num_group, self.num_experts // self.num_group)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )
+        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(-1, self.num_group, self.num_experts // self.num_group)
+            .reshape(-1, self.num_experts)
+        )
+        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_indices)
+        if self.norm_topk_prob:
+            denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weights /= denominator
+        topk_weights = topk_weights * self.routed_scaling_factor
+
+        if self.training and self.enable_expert_bias and torch.is_grad_enabled():
+            # Token statistics for the auxiliary-loss-free update. Gradient-checkpoint
+            # recomputation may count a micro-batch twice, which is harmless: both the
+            # sign rule and the logged imbalance ratios are invariant to uniform rescaling.
+            token_indices = topk_indices.reshape(-1)
+            counts = self.tokens_per_expert.new_zeros(self.num_experts)
+            counts.index_add_(0, token_indices, torch.ones_like(token_indices, dtype=counts.dtype))
+            self.tokens_per_expert.add_(counts)
+
+        return router_logits, topk_weights, topk_indices
+
+
+class NekoMindMoe2MoE(nn.Module):
+    """
+    A mixed expert module containing shared experts.
+    """
+
+    def __init__(self, config: NekoMindMoe2Config):
+        super().__init__()
+        self.config = config
         self.experts = NekoMindMoe2Experts(config)
         self.gate = NekoMindMoe2TopKRouter(config)
-        self.shared_expert = NekoMindMoe2MLP(config, intermediate_size=config.shared_expert_intermediate_size)
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        self.shared_experts = NekoMindMoe2MLP(
+            config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
+        )
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-        shared_expert_output = self.shared_expert(hidden_states_reshaped)
-        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
-        expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
-
-        shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
-
-        expert_output = expert_output + shared_expert_output
-        expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
-        return expert_output
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residuals = hidden_states
+        orig_shape = hidden_states.shape
+        _, topk_weights, topk_indices = self.gate(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
+        hidden_states = hidden_states + self.shared_experts(residuals)
+        return hidden_states
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -777,9 +816,7 @@ class NekoMindMoe2DecoderLayer(GradientCheckpointingLayer):
         )
 
         self.mlp = (
-            NekoMindMoe2SparseMoeBlock(config)
-            if config.mlp_layer_types[layer_idx] == "sparse"
-            else NekoMindMoe2MLP(config)
+            NekoMindMoe2MoE(config) if config.mlp_layer_types[layer_idx] == "sparse" else NekoMindMoe2MLP(config)
         )
 
         self.input_layernorm = NekoMindMoe2RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -831,6 +868,8 @@ class NekoMindMoe2PreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["NekoMindMoe2DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
+    # Keep the auxiliary-loss-free balancing bias in float32: 1e-3 updates vanish in bf16.
+    _keep_in_fp32_modules = ["e_score_correction_bias"]
     _supports_flash_attn = True
     _supports_sdpa = True
     _keys_to_ignore_on_load_unexpected = None
@@ -936,75 +975,6 @@ class NekoMindMoe2Model(NekoMindMoe2PreTrainedModel):
         )
 
 
-def load_balancing_loss_func(
-    gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
-    num_experts: int | None = None,
-    top_k=2,
-    attention_mask: torch.Tensor | None = None,
-) -> torch.Tensor | int:
-    r"""
-    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
-
-    See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
-    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-    experts is too unbalanced.
-
-    Args:
-        gate_logits:
-            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts].
-        num_experts:
-            Number of experts
-        top_k:
-            The number of experts to route per-token, can be also interpreted as the `top-k` routing
-            parameter.
-        attention_mask (`torch.Tensor`, *optional*):
-            The attention_mask used in forward function
-            shape [batch_size X sequence_length] if not None.
-
-    Returns:
-        The auxiliary loss.
-    """
-    if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
-
-    # Accumulate assignment counts and probability sums layer by layer, normalizing at the end,
-    # so peak memory stays O(seq_len * num_experts) regardless of the number of layers.
-    compute_device = gate_logits[0].device
-    tokens_per_expert_sum = torch.zeros(num_experts, dtype=torch.float32, device=compute_device)
-    router_prob_sum = torch.zeros(num_experts, dtype=torch.float32, device=compute_device)
-    total_rows = 0.0
-
-    if attention_mask is not None:
-        # The same flat mask applies to every layer's [batch_size * sequence_length] rows.
-        flat_mask = attention_mask.reshape(-1).to(device=compute_device, dtype=torch.float32)
-
-    for layer_gate in gate_logits:
-        routing_weights = torch.nn.functional.softmax(layer_gate.to(compute_device), dim=-1)
-        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-        if attention_mask is None:
-            # Count of top-k assignments per expert
-            tokens_per_expert_sum = (
-                tokens_per_expert_sum + torch.bincount(selected_experts.reshape(-1), minlength=num_experts).float()
-            )
-            # Sum of routing probabilities per expert
-            router_prob_sum = router_prob_sum + routing_weights.float().sum(dim=0)
-            total_rows = total_rows + routing_weights.shape[0]
-        else:
-            # Same reductions, weighted by the attention mask to exclude padding tokens
-            tokens_per_expert_sum = tokens_per_expert_sum + torch.zeros(
-                num_experts, dtype=torch.float32, device=compute_device
-            ).scatter_add_(0, selected_experts.reshape(-1), flat_mask.repeat_interleave(top_k))
-            router_prob_sum = router_prob_sum + (routing_weights.float() * flat_mask.unsqueeze(-1)).sum(dim=0)
-            total_rows = total_rows + flat_mask.sum()
-
-    tokens_per_expert = tokens_per_expert_sum / total_rows
-    router_prob_per_expert = router_prob_sum / total_rows
-
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-    return overall_loss * num_experts
-
-
 @auto_docstring
 class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -1017,9 +987,6 @@ class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
         self.model = NekoMindMoe2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.router_aux_loss_coef = config.router_aux_loss_coef
-        self.num_experts = config.num_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1035,10 +1002,9 @@ class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        output_router_logits: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoeModelOutputWithPast:
+    ) -> CausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -1061,20 +1027,13 @@ class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.config.output_router_logits
-        )
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: MoeModelOutputWithPast = self.model(
+        outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_router_logits=output_router_logits,
             **kwargs,
         )
 
@@ -1085,27 +1044,14 @@ class NekoMindMoe2ForCausalLM(NekoMindMoe2PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        aux_loss = None
-        if output_router_logits:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
-            if labels is not None:
-                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
-
-        return MoeCausalLMOutputWithPast(
+        return CausalLMOutputWithPast(
             loss=loss,
-            aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
         )
 
 
