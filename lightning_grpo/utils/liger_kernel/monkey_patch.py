@@ -1789,6 +1789,7 @@ def apply_liger_kernel_to_nekomind_moe2(
     )
 
     from lightning_grpo.module.nekomind.nekomind_moe2 import modeling_nekomind_moe2
+    from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2Attention
     from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2Model
     from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2MoE
 
@@ -1844,9 +1845,10 @@ def apply_liger_kernel_to_nekomind_moe2(
             if rms_norm:
                 _patch_rms_norm_module(decoder_layer.input_layernorm)
                 _patch_rms_norm_module(decoder_layer.post_attention_layernorm)
-                if decoder_layer.self_attn.q_a_layernorm is not None:
-                    _patch_rms_norm_module(decoder_layer.self_attn.q_a_layernorm)
-                _patch_rms_norm_module(decoder_layer.self_attn.kv_a_layernorm)
+                if isinstance(decoder_layer.self_attn, NekoMindMoe2Attention):
+                    if decoder_layer.self_attn.q_a_layernorm is not None:
+                        _patch_rms_norm_module(decoder_layer.self_attn.q_a_layernorm)
+                    _patch_rms_norm_module(decoder_layer.self_attn.kv_a_layernorm)
 
 
 def apply_liger_kernel_to_gpt_oss(
