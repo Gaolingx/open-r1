@@ -34,20 +34,27 @@ distorts the model's output distribution.
 
 Diagnostics
 -----------
-This callback is the single home of the MoE routing diagnostics (``router/*``).
-It already sees both halves of the router's output, so it covers the realized
-(post-bias, post-grouped-top-k) load *and* the router logits:
+Single home of the ``router/*`` diagnostics: the callback sees both halves of the
+router output, so it covers the realized (post-bias, post-grouped-top-k) load
+*and* the raw logits.
 
-* ``router/entropy`` -- mean per-token entropy of ``softmax(router_logits)``,
-  averaged over tokens and layers. Logit-level, hence independent of the
-  correction bias and of the group restriction; bounded by ``ln(num_experts)``.
-* ``router/load_imbalance_mean`` / ``router/load_imbalance_max`` -- dispersion of
-  the realized per-expert load, relative to the ideal uniform load.
+* ``router/entropy`` -- per-token entropy of ``softmax(router_logits)``, averaged
+  over tokens and layers. Logit-level, so independent of the bias and of the group
+  restriction; bounded by ``ln(num_experts)``.
+* ``router/load_imbalance_mean`` / ``_max`` / ``_min`` / ``load_cv`` -- realized
+  load over the ideal uniform load. ``max`` / ``min`` are per-layer ratios (1.0 =
+  exactly its fair share, so a ``max`` of 1.35 = the busiest expert took 35%
+  more), then averaged over layers. ``mean`` is the L1 deviation over all
+  (layer, expert) pairs (0.0 = even); ``load_cv`` is the per-layer L2 deviation
+  (std / mean), which reacts to a few moderately hot experts sooner than ``mean``.
 * ``router/dead_experts`` -- fraction of (layer, expert) pairs that got no token.
-* ``router/bias_abs_mean`` / ``router/bias_abs_max`` -- magnitude of the bias itself.
+* ``router/bias_abs_mean`` / ``router/bias_abs_max`` -- magnitude of the bias.
 
-The set is one metric per concept: there is no separate ``load_cv`` or
-``max_violation`` anymore, since ``load_imbalance_*`` covers the same deviation.
+``min`` catches a *starved but alive* expert, which ``dead_experts`` only sees at
+zero. Note ``max`` / ``min`` are extremes over ``num_experts`` counts, so a
+perfectly balanced router already reads ``1 +/- 2.2 / sqrt(c)`` with
+``c = tokens_per_layer_per_step * top_k / num_experts`` (``mean``: ``0.8 / sqrt(c)``);
+only a larger ``c`` lowers that floor, not more layers.
 """
 
 from __future__ import annotations
@@ -309,13 +316,13 @@ class RouterBiasUpdateCallback(Callback):
             self._zero_counts()
 
             # 5) Monitoring metrics. Counts are already reduced, so every rank agrees
-            #    and no `sync_dist` is needed. `ideal` keeps the historical
-            #    `max(ideal_load, 1.0)` guard for intervals with very few tokens.
             entropy = (entropy_sums / token_counts.clamp_min(1.0)).mean()
             ideal_load = (total / num_experts).clamp_min(1.0)  # [num_layers, 1]
             load_ratios = counts / ideal_load  # [num_layers, num_experts]
             load_imbalance_mean = (load_ratios - 1.0).abs().mean()
             load_imbalance_max = load_ratios.amax(dim=-1).mean()
+            load_imbalance_min = load_ratios.amin(dim=-1).mean()
+            load_cv = (counts.std(dim=-1) / ideal_load.squeeze(-1)).mean()
             dead_experts = (counts == 0.0).to(dtype=torch.float32).mean()
             bias = torch.stack([router.e_score_correction_bias.detach().float() for router in self._routers])
             bias_abs_mean = bias.abs().mean()
@@ -326,6 +333,8 @@ class RouterBiasUpdateCallback(Callback):
             pl_module.log("router/entropy", entropy.to(device), **log_kwargs)
             pl_module.log("router/load_imbalance_mean", load_imbalance_mean.to(device), **log_kwargs)
             pl_module.log("router/load_imbalance_max", load_imbalance_max.to(device), **log_kwargs)
+            pl_module.log("router/load_imbalance_min", load_imbalance_min.to(device), **log_kwargs)
+            pl_module.log("router/load_cv", load_cv.to(device), **log_kwargs)
             pl_module.log("router/dead_experts", dead_experts.to(device), **log_kwargs)
             pl_module.log("router/bias_abs_mean", bias_abs_mean.to(device), **log_kwargs)
             pl_module.log("router/bias_abs_max", bias_abs_max.to(device), **log_kwargs)
