@@ -30,7 +30,6 @@ from lightning_grpo.models.grpo.liger_loss import LigerDPOLossComputer
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
-from lightning_grpo.utils.metrics import log_moe_metrics
 from lightning_grpo.utils.liger_kernel.warpper import apply_liger_kernel
 
 
@@ -142,8 +141,6 @@ class DPOLightningModule(L.LightningModule):
             self.log(f"{stage}/logps/chosen", metrics["chosen_logps"].mean(), on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/logps/rejected", metrics["rejected_logps"].mean(), on_step=on_step, on_epoch=True, sync_dist=True)
             self.log(f"{stage}/nll_loss", metrics["nll_loss"], on_step=on_step, on_epoch=True, sync_dist=True)
-
-        log_moe_metrics(self, metrics, stage, on_step=on_step)
 
         return loss
 

@@ -18,7 +18,6 @@ from torch.distributed.tensor import DTensor, Replicate
 from lightning_grpo.models.common import get_lm_head_model, get_transformer_backbone_model
 from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
-from lightning_grpo.utils.metrics import collect_moe_metrics
 
 
 def _materialize_liger_lm_head(
@@ -59,19 +58,17 @@ def _get_last_hidden_state(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     logits_to_keep: int,
-    output_router_logits: bool = True,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> torch.Tensor:
     """Forward pass to get last hidden state without computing logits."""
     outputs = get_transformer_backbone_model(model)(
         input_ids=input_ids,
         attention_mask=attention_mask,
         use_cache=False,
-        output_router_logits=output_router_logits,
     )
     last_hidden_state = outputs.last_hidden_state
     last_hidden_state = last_hidden_state[:, :-1, :]
     last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]
-    return last_hidden_state, outputs
+    return last_hidden_state
 
 
 def compute_liger_sft_loss(
@@ -84,7 +81,9 @@ def compute_liger_sft_loss(
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute token-level next-token loss using the patched Liger CE forward.
-    Also collects MoE metrics and Liger's token accuracy.
+
+    ``_policy_outputs`` feeds ``masked_token_stats`` in the SFT/pretrain modules;
+    the MoE routing diagnostics are owned by ``RouterBiasUpdateCallback``.
     """
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
@@ -97,17 +96,13 @@ def compute_liger_sft_loss(
         attention_mask=attention_mask,
         labels=labels,
         use_cache=False,
-        output_router_logits=True,
         ignore_index=ignore_index,
         label_smoothing=label_smoothing,
         use_token_scaling=use_token_scaling,
     )
     loss = outputs.loss
 
-    metrics = collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok)
-    metrics["_policy_outputs"] = outputs
-
-    return loss, metrics
+    return loss, {"_policy_outputs": outputs}
 
 
 class LigerDPOLossComputer:
@@ -156,7 +151,6 @@ class LigerDPOLossComputer:
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
-            output_router_logits=True,
         )
         hidden_states = outputs.last_hidden_state[:, :-1].contiguous()
 
@@ -197,9 +191,6 @@ class LigerDPOLossComputer:
         if nll_loss is not None:
             loss = (loss - nll_loss) + self.nll_coeff * nll_loss
 
-        # Collect router-level MoE diagnostics
-        moe_metrics = collect_moe_metrics(outputs, top_k=getattr(self.model.config, "num_experts_per_tok", 1))
-
         return loss, {
             "chosen_logps": chosen_logps,
             "rejected_logps": rejected_logps,
@@ -208,8 +199,6 @@ class LigerDPOLossComputer:
             "nll_loss": nll_loss if nll_loss is not None else torch.tensor(0.0, device=loss.device),
             "chosen_rewards": chosen_rewards,
             "rejected_rewards": rejected_rewards,
-            "_policy_outputs": outputs,
-            **moe_metrics,
         }
 
 
@@ -331,7 +320,7 @@ class LigerGRPOLossComputer:
         model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.shape[1]
 
-        last_hidden_state, moe_outputs = _get_last_hidden_state(
+        last_hidden_state = _get_last_hidden_state(
             self.module.policy,
             input_ids=model_input_ids,
             attention_mask=model_attention_mask,
@@ -345,7 +334,7 @@ class LigerGRPOLossComputer:
         ref_bias = None
         if self.module.reference_model is not None:
             with torch.no_grad():
-                ref_hidden_state, _ = _get_last_hidden_state(
+                ref_hidden_state = _get_last_hidden_state(
                     self.module.reference_model,
                     input_ids=model_input_ids,
                     attention_mask=model_attention_mask,
@@ -436,8 +425,6 @@ class LigerGRPOLossComputer:
             global_is_cispo_clipped=global_is_cispo_clipped,
             global_advantages=global_advantages,
             reward_names=self.module.config.reward.reward_funcs,
-            moe_outputs=moe_outputs,
-            top_k=self.module.policy.config.num_experts_per_tok,
         )
 
         return loss, metrics

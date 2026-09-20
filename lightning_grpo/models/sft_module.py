@@ -21,7 +21,6 @@ from lightning_grpo.models.grpo.liger_loss import compute_liger_sft_loss
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
-from lightning_grpo.utils.metrics import log_moe_metrics
 from lightning_grpo.utils.liger_kernel.warpper import apply_liger_kernel
 
 
@@ -108,8 +107,6 @@ class SFTLightningModule(L.LightningModule):
         for key in optional_metrics:
             if key in stats:
                 self.log(f"{stage}/{key}", stats[key], prog_bar=False, on_step=on_step, on_epoch=True, sync_dist=True)
-
-        log_moe_metrics(self, metrics, stage, on_step=on_step)
 
         return loss
 

@@ -31,6 +31,23 @@ References:
 The bias only participates in expert *selection* (``scores + bias``); the mixing
 weights are still taken from the raw sigmoid scores, so the update never
 distorts the model's output distribution.
+
+Diagnostics
+-----------
+This callback is the single home of the MoE routing diagnostics (``router/*``).
+It already sees both halves of the router's output, so it covers the realized
+(post-bias, post-grouped-top-k) load *and* the router logits:
+
+* ``router/entropy`` -- mean per-token entropy of ``softmax(router_logits)``,
+  averaged over tokens and layers. Logit-level, hence independent of the
+  correction bias and of the group restriction; bounded by ``ln(num_experts)``.
+* ``router/load_imbalance_mean`` / ``router/load_imbalance_max`` -- dispersion of
+  the realized per-expert load, relative to the ideal uniform load.
+* ``router/dead_experts`` -- fraction of (layer, expert) pairs that got no token.
+* ``router/bias_abs_mean`` / ``router/bias_abs_max`` -- magnitude of the bias itself.
+
+The set is one metric per concept: there is no separate ``load_cv`` or
+``max_violation`` anymore, since ``load_imbalance_*`` covers the same deviation.
 """
 
 from __future__ import annotations
@@ -55,8 +72,10 @@ class RouterBiasUpdateCallback(Callback):
     """Update ``e_score_correction_bias`` once per optimizer step.
 
     A ``forward_hook`` on every router accumulates the ``topk_indices`` that the
-    shipped ``forward`` already returns; the counters are then consumed and reset
-    in ``on_before_optimizer_step``. Nothing in the HF modeling code is touched.
+    shipped ``forward`` already returns, plus the router logits behind the entropy
+    diagnostic; the accumulators are then consumed and reset in
+    ``on_before_optimizer_step``. Nothing in the HF modeling code is touched, and
+    this callback is the single owner of the ``router/*`` metrics.
 
     Args:
         enabled: Master switch. When false, ``setup`` returns immediately and the bias is
@@ -68,8 +87,9 @@ class RouterBiasUpdateCallback(Callback):
             ``("data_parallel", "tensor_parallel")``: data-parallel ranks see
             different tokens, while tensor-parallel ranks hold a replica of the
             router. Summing over a replicated dimension only rescales the counts,
-            which leaves both the sign rule and the logged ratios unchanged.
-            ``expert_parallel`` is appended automatically when the mesh defines it.
+            which leaves the sign rule, the logged ratios and the entropy mean
+            (sum and token count scale together) unchanged. ``expert_parallel`` is
+            appended automatically when the mesh defines it.
         freeze_at_end_fraction: Stop updating the bias during the last fraction of
             training, as recommended by the DeepSeek-V3 report. ``0.0`` disables it.
     """
@@ -88,6 +108,8 @@ class RouterBiasUpdateCallback(Callback):
         self.freeze_at_end_fraction = freeze_at_end_fraction
         self._routers: list[torch.nn.Module] = []
         self._counts: list[torch.Tensor] = []
+        self._entropy_sums: list[torch.Tensor] = []
+        self._token_counts: list[torch.Tensor] = []
         self._handles: list[Any] = []
         self._num_experts: int | None = None
 
@@ -98,6 +120,8 @@ class RouterBiasUpdateCallback(Callback):
         self._detach_hooks()
         self._routers = []
         self._counts = []
+        self._entropy_sums = []
+        self._token_counts = []
         self._num_experts = None
 
         if stage != "fit":
@@ -139,6 +163,10 @@ class RouterBiasUpdateCallback(Callback):
             if bias.dtype != torch.float32:
                 bias.data = bias.data.to(torch.float32)
             self._counts.append(torch.zeros(num_experts, dtype=torch.float32, device=bias.device))
+            # The entropy accumulators stay as scalars per layer: keeping the sum and
+            # the token count apart makes the mean exact under any amount of pooling.
+            self._entropy_sums.append(torch.zeros((), dtype=torch.float32, device=bias.device))
+            self._token_counts.append(torch.zeros((), dtype=torch.float32, device=bias.device))
             self._handles.append(router.register_forward_hook(self._make_hook(index)))
 
         rank_zero_info(
@@ -152,11 +180,13 @@ class RouterBiasUpdateCallback(Callback):
         self._detach_hooks()
         self._routers = []
         self._counts = []
+        self._entropy_sums = []
+        self._token_counts = []
         self._num_experts = None
 
-    # ---- token counting (forward hook; the model stays untouched) --------
+    # ---- accumulation (forward hook; the model stays untouched) ----------
     def _make_hook(self, index: int):
-        """Build the per-router hook that accumulates ``topk_indices``."""
+        """Build the per-router hook that accumulates ``topk_indices`` and the entropy."""
 
         def _hook(module, args, output):
             # `TorchRolloutEngine` reuses this very policy instance under ``torch.no_grad()``,
@@ -170,14 +200,26 @@ class RouterBiasUpdateCallback(Callback):
             if not torch.is_tensor(indices) or indices.dtype not in (torch.int32, torch.int64):
                 return
 
-            flat = indices.reshape(-1)
-            counts = self._counts[index]
-            if counts.device != flat.device:
-                counts = counts.to(flat.device)
-                self._counts[index] = counts
-            # ``index_add_`` keeps the output shape static, which keeps dynamo and CUDA
-            # graphs happy (``bincount`` would produce a data-dependent length).
-            counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
+            with torch.no_grad():
+                flat = indices.reshape(-1)
+                counts = self._counts[index]
+                if counts.device != flat.device:
+                    counts = counts.to(flat.device)
+                    self._counts[index] = counts
+                # ``index_add_`` keeps the output shape static, which keeps dynamo and CUDA
+                # graphs happy (``bincount`` would produce a data-dependent length).
+                counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
+
+                # Router-logit entropy: same formula as the retired ``router_entropy``
+                # metric (softmax over the raw logits, mean over tokens). Sum and token
+                # count are accumulated separately so every pooling step is exact; a
+                # recompute pass scales both by the same factor.
+                logits = output[0]
+                if torch.is_tensor(logits) and logits.ndim >= 2 and logits.shape[-1] == self._num_experts:
+                    probs = logits.detach().to(dtype=torch.float32).softmax(dim=-1)
+                    entropy_sum = -(probs * probs.clamp_min(1.0e-8).log()).sum()
+                    self._entropy_sums[index] = self._entropy_sums[index].to(probs.device) + entropy_sum
+                    self._token_counts[index] = self._token_counts[index].to(probs.device) + probs.shape[0]
 
         return _hook
 
@@ -189,6 +231,10 @@ class RouterBiasUpdateCallback(Callback):
     def _zero_counts(self) -> None:
         for counts in self._counts:
             counts.zero_()
+        for entropy_sum in self._entropy_sums:
+            entropy_sum.zero_()
+        for token_count in self._token_counts:
+            token_count.zero_()
 
     # ---- reduction -------------------------------------------------------
     def _resolve_mesh_dim_names(self, pl_module) -> tuple[str, ...]:
@@ -237,12 +283,17 @@ class RouterBiasUpdateCallback(Callback):
                 return
 
         with torch.no_grad():
-            # 1) Stack every layer's counter -> [num_layers, num_experts].
+            # 1) Stack every layer's counter -> [num_layers, num_experts], and the
+            #    per-layer entropy accumulators -> [num_layers] each.
             counts = torch.stack([counter.to(dtype=torch.float32) for counter in self._counts])
+            entropy_sums = torch.stack([value.to(dtype=torch.float32) for value in self._entropy_sums])
+            token_counts = torch.stack([value.to(dtype=torch.float32) for value in self._token_counts])
             # 2) Sum over the ranks that saw different tokens (data parallel). The
             #    reduction runs in fp32 so no precision is lost before taking the sign.
             for group in self._reduce_groups(pl_module):
                 dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
+                dist.all_reduce(entropy_sums, op=dist.ReduceOp.SUM, group=group)
+                dist.all_reduce(token_counts, op=dist.ReduceOp.SUM, group=group)
 
             # 3) Sign update, algebraically equivalent to `e_i = c_bar - c_i`.
             total = counts.sum(dim=-1, keepdim=True)  # [num_layers, 1]
@@ -258,10 +309,13 @@ class RouterBiasUpdateCallback(Callback):
             self._zero_counts()
 
             # 5) Monitoring metrics. Counts are already reduced, so every rank agrees
-            #    and no `sync_dist` is needed.
-            mean = total / num_experts
-            max_violation = ((counts - mean).abs().amax(dim=-1) / mean.clamp_min(1.0)).mean()
-            load_cv = (counts.std(dim=-1) / mean.squeeze(-1).clamp_min(1.0)).mean()
+            #    and no `sync_dist` is needed. `ideal` keeps the historical
+            #    `max(ideal_load, 1.0)` guard for intervals with very few tokens.
+            entropy = (entropy_sums / token_counts.clamp_min(1.0)).mean()
+            ideal_load = (total / num_experts).clamp_min(1.0)  # [num_layers, 1]
+            load_ratios = counts / ideal_load  # [num_layers, num_experts]
+            load_imbalance_mean = (load_ratios - 1.0).abs().mean()
+            load_imbalance_max = load_ratios.amax(dim=-1).mean()
             dead_experts = (counts == 0.0).to(dtype=torch.float32).mean()
             bias = torch.stack([router.e_score_correction_bias.detach().float() for router in self._routers])
             bias_abs_mean = bias.abs().mean()
@@ -269,8 +323,9 @@ class RouterBiasUpdateCallback(Callback):
 
         if float(total.sum()) > 0.0:
             log_kwargs = {"on_step": True, "on_epoch": False, "sync_dist": False, "prog_bar": False}
-            pl_module.log("router/max_violation", max_violation.to(device), **log_kwargs)
-            pl_module.log("router/load_cv", load_cv.to(device), **log_kwargs)
+            pl_module.log("router/entropy", entropy.to(device), **log_kwargs)
+            pl_module.log("router/load_imbalance_mean", load_imbalance_mean.to(device), **log_kwargs)
+            pl_module.log("router/load_imbalance_max", load_imbalance_max.to(device), **log_kwargs)
             pl_module.log("router/dead_experts", dead_experts.to(device), **log_kwargs)
             pl_module.log("router/bias_abs_mean", bias_abs_mean.to(device), **log_kwargs)
             pl_module.log("router/bias_abs_max", bias_abs_max.to(device), **log_kwargs)

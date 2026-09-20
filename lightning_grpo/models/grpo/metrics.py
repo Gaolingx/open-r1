@@ -7,7 +7,6 @@ from typing import Any
 import torch
 
 from lightning_grpo.models.grpo.loss import masked_mean
-from lightning_grpo.utils.metrics import collect_moe_metrics, log_moe_metrics
 
 
 class GRPOMetricsAggregator:
@@ -43,8 +42,6 @@ class GRPOMetricsAggregator:
         global_is_cispo_clipped: torch.Tensor,
         global_advantages: torch.Tensor,
         reward_names: list[str],
-        moe_outputs: Any | None = None,
-        top_k: int | None = None,
     ) -> dict[str, torch.Tensor]:
         global_rewards = (global_rewards_per_func * reward_weights.to(global_rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
         global_reward_group_std = global_rewards.view(-1, num_generations).std(dim=1)
@@ -76,7 +73,6 @@ class GRPOMetricsAggregator:
         for index, reward_name in enumerate(reward_names):
             metrics[f"reward/{reward_name}"] = global_rewards_per_func[:, index].mean()
             metrics[f"reward_std/{reward_name}"] = global_rewards_per_func[:, index].std(unbiased=False)
-        metrics.update(collect_moe_metrics(moe_outputs, top_k=top_k))
         return metrics
 
     def log_metrics(self, prefix: str, loss: torch.Tensor, metrics: dict[str, torch.Tensor], *, on_step: bool, on_epoch: bool) -> None:
@@ -89,7 +85,6 @@ class GRPOMetricsAggregator:
         module.log(f"{prefix}/advantage_std", metrics["advantage_std"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         module.log(f"{prefix}/kl", metrics["kl"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         module.log(f"{prefix}/entropy", metrics["entropy"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        log_moe_metrics(module, metrics, prefix, on_step=on_step, on_epoch=on_epoch)
         module.log(f"{prefix}/completions/mean_length", metrics["completion_length"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         module.log(f"{prefix}/completions/min_length", metrics["completion_length_min"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
         module.log(f"{prefix}/completions/max_length", metrics["completion_length_max"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)

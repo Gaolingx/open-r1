@@ -8,8 +8,6 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.parallel import loss_parallel
 
-from lightning_grpo.utils.metrics import collect_moe_metrics
-
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Compute a mask-aware mean."""
@@ -123,7 +121,6 @@ def compute_standard_cross_entropy_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         use_cache=False,
-        output_router_logits=True
     )
 
     ce_loss = compute_cross_entropy_loss(
@@ -135,9 +132,7 @@ def compute_standard_cross_entropy_loss(
     )
     loss = ce_loss
 
-    metrics = collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok)
-    metrics["lm_loss"] = ce_loss.detach()
-    metrics["_policy_outputs"] = outputs
+    metrics = {"lm_loss": ce_loss.detach(), "_policy_outputs": outputs}
 
     return loss, metrics
 
@@ -248,16 +243,13 @@ def compute_standard_sft_loss(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
-            output_router_logits=True
         )
 
         # Compute DFT loss
         loss = dft_loss(outputs, labels)
 
         # Gather metrics
-        metrics = collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok)
-        metrics["lm_loss"] = loss.detach()
-        metrics["_policy_outputs"] = outputs
+        metrics = {"lm_loss": loss.detach(), "_policy_outputs": outputs}
 
         return loss, metrics
     else:
@@ -319,7 +311,7 @@ def compute_standard_dpo_loss(
     completion_mask = batch["completion_mask"]
 
     # Forward through policy model
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, output_router_logits=True)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     shift_logits = outputs.logits[..., :-1, :].contiguous()
     shift_labels = input_ids[..., 1:].contiguous()
     shift_completion_mask = completion_mask[..., 1:].contiguous()
@@ -378,10 +370,7 @@ def compute_standard_dpo_loss(
         "nll_loss": nll_loss.detach(),
         "chosen_rewards": chosen_rewards,
         "rejected_rewards": rejected_rewards,
-        "_policy_outputs": outputs,
     }
-
-    metrics_dict.update(collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok))
 
     return loss, metrics_dict
 
@@ -519,7 +508,7 @@ def compute_standard_grpo_loss(
     model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
     logits_to_keep = completion_ids.size(1)
 
-    outputs = model(input_ids=model_input_ids, attention_mask=model_attention_mask, use_cache=False, output_router_logits=True)
+    outputs = model(input_ids=model_input_ids, attention_mask=model_attention_mask, use_cache=False)
     logits = materialize_vocab_parallel_logits(outputs.logits)
     shift_logits = logits[:, :-1, :]
     completion_logits = shift_logits[:, -logits_to_keep:, :]
@@ -576,9 +565,6 @@ def compute_standard_grpo_loss(
             "is_region_clipped": loss_metrics["is_region_clipped"].detach(),
             "is_cispo_clipped": loss_metrics["is_cispo_clipped"].detach(),
         }
-
-    local_metrics.update(collect_moe_metrics(outputs, top_k=model.config.num_experts_per_tok))
-    local_metrics["_policy_outputs"] = outputs
 
     return loss, local_metrics
 
@@ -701,8 +687,6 @@ class StandardGRPOLossComputer:
             local_metrics={**local_metrics, "completion_truncated": completion_truncated.to(torch.float32)},
             global_advantages=global_advantages,
             reward_names=config.reward.reward_funcs,
-            moe_outputs=local_metrics.get("_policy_outputs"),
-            top_k=self.module.policy.config.num_experts_per_tok,
         )
 
         return loss, metrics
@@ -717,8 +701,6 @@ def build_standard_grpo_training_metrics(
     local_metrics: dict[str, torch.Tensor],
     global_advantages: torch.Tensor,
     reward_names: list[str],
-    moe_outputs: Any | None = None,
-    top_k: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Gather local standard-GRPO diagnostics and build the logged metrics dict."""
 
@@ -748,6 +730,4 @@ def build_standard_grpo_training_metrics(
         global_is_cispo_clipped=global_is_cispo_clipped,
         global_advantages=global_advantages,
         reward_names=reward_names,
-        moe_outputs=moe_outputs,
-        top_k=top_k,
     )
