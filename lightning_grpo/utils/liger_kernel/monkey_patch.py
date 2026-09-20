@@ -1790,7 +1790,7 @@ def apply_liger_kernel_to_nekomind_moe2(
 
     from lightning_grpo.module.nekomind.nekomind_moe2 import modeling_nekomind_moe2
     from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2Model
-    from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2Moe
+    from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2MoE
 
     from lightning_grpo.utils.liger_kernel.model.nekomind_moe2 import lce_forward as nekomind2_lce_forward
     from liger_kernel.transformers.swiglu import LigerQwen3MoeSwiGLUMLP
@@ -1831,7 +1831,7 @@ def apply_liger_kernel_to_nekomind_moe2(
             _patch_rms_norm_module(base_model.norm)
         for decoder_layer in base_model.layers:
             if swiglu:
-                if isinstance(decoder_layer.mlp, NekoMindMoe2Moe):
+                if isinstance(decoder_layer.mlp, NekoMindMoe2MoE):
                     if IS_TRANSFORMERS_V5_OR_LATER:
                         _patch_swiglu_module(decoder_layer.mlp.experts, LigerExperts)
                     else:
