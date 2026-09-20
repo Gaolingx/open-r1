@@ -1789,9 +1789,7 @@ def apply_liger_kernel_to_nekomind_moe2(
     )
 
     from lightning_grpo.module.nekomind.nekomind_moe2 import modeling_nekomind_moe2
-    from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2Attention
     from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2Model
-    from lightning_grpo.module.nekomind.nekomind_moe2.modeling_nekomind_moe2 import NekoMindMoe2MoE
 
     from lightning_grpo.utils.liger_kernel.model.nekomind_moe2 import lce_forward as nekomind2_lce_forward
     from liger_kernel.transformers.swiglu import LigerQwen3MoeSwiGLUMLP
@@ -1817,9 +1815,10 @@ def apply_liger_kernel_to_nekomind_moe2(
             modeling_nekomind_moe2.NekoMindMoe2ForCausalLM.forward = nekomind2_lce_forward
 
     if swiglu:
-        modeling_nekomind_moe2.NekoMindMoe2MLP = LigerQwen3MoeSwiGLUMLP
         if IS_TRANSFORMERS_V5_OR_LATER:
             modeling_nekomind_moe2.NekoMindMoe2Experts = LigerExperts
+        else:
+            modeling_nekomind_moe2.NekoMindMoe2MLP = LigerQwen3MoeSwiGLUMLP
 
     if model is not None:
         # The model instance already exists, so we need to additionally patch the
@@ -1832,23 +1831,23 @@ def apply_liger_kernel_to_nekomind_moe2(
             _patch_rms_norm_module(base_model.norm)
         for decoder_layer in base_model.layers:
             if swiglu:
-                if isinstance(decoder_layer.mlp, NekoMindMoe2MoE):
-                    if IS_TRANSFORMERS_V5_OR_LATER:
-                        _patch_swiglu_module(decoder_layer.mlp.experts, LigerExperts)
-                    else:
-                        for mlp_expert in decoder_layer.mlp.experts:
-                            _patch_swiglu_module(mlp_expert, LigerQwen3MoeSwiGLUMLP)
-                    if decoder_layer.mlp.shared_experts is not None:
-                        _patch_swiglu_module(decoder_layer.mlp.shared_experts, LigerQwen3MoeSwiGLUMLP)
+                mlp = decoder_layer.mlp
+                # Sparse MoE block
+                if hasattr(mlp, "experts"):
+                    _patch_swiglu_module(mlp.experts, LigerExperts)
+                    if hasattr(mlp, "shared_expert"):
+                        _patch_swiglu_module(mlp.shared_expert, LigerQwen3MoeSwiGLUMLP)
+                # Dense MLP block
                 else:
-                    _patch_swiglu_module(decoder_layer.mlp, LigerQwen3MoeSwiGLUMLP)
+                    _patch_swiglu_module(mlp, LigerQwen3MoeSwiGLUMLP)
             if rms_norm:
                 _patch_rms_norm_module(decoder_layer.input_layernorm)
                 _patch_rms_norm_module(decoder_layer.post_attention_layernorm)
-                if isinstance(decoder_layer.self_attn, NekoMindMoe2Attention):
-                    if decoder_layer.self_attn.q_a_layernorm is not None:
-                        _patch_rms_norm_module(decoder_layer.self_attn.q_a_layernorm)
-                    _patch_rms_norm_module(decoder_layer.self_attn.kv_a_layernorm)
+                self_attn = decoder_layer.self_attn
+                if hasattr(self_attn, "q_a_layernorm"):
+                    _patch_rms_norm_module(self_attn.q_a_layernorm)
+                if hasattr(self_attn, "kv_a_layernorm"):
+                    _patch_rms_norm_module(self_attn.kv_a_layernorm)
 
 
 def apply_liger_kernel_to_gpt_oss(
