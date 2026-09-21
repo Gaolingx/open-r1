@@ -38,23 +38,43 @@ Single home of the ``router/*`` diagnostics: the callback sees both halves of th
 router output, so it covers the realized (post-bias, post-grouped-top-k) load
 *and* the raw logits.
 
-* ``router/entropy`` -- per-token entropy of ``softmax(router_logits)``, averaged
-  over tokens and layers. Logit-level, so independent of the bias and of the group
+* ``router/entropy`` -- per-token entropy of ``softmax(router_logits)``, averaged over
+  tokens and layers. Logit-level, so independent of the bias and of the group
   restriction; bounded by ``ln(num_experts)``.
-* ``router/load_imbalance_mean`` / ``_max`` / ``_min`` / ``load_cv`` -- realized
-  load over the ideal uniform load. ``max`` / ``min`` are per-layer ratios (1.0 =
-  exactly its fair share, so a ``max`` of 1.35 = the busiest expert took 35%
-  more), then averaged over layers. ``mean`` is the L1 deviation over all
-  (layer, expert) pairs (0.0 = even); ``load_cv`` is the per-layer L2 deviation
-  (std / mean), which reacts to a few moderately hot experts sooner than ``mean``.
+* ``router/load_imbalance_mean`` / ``load_max_violation`` / ``load_cv`` -- realized load
+  over the ideal uniform load, all 0.0 when even. ``mean`` is the L1 deviation over all
+  (layer, expert) pairs; ``load_max_violation`` is the per-layer worst single-expert
+  deviation from its fair share, normalized by that share (0.35 = one expert was 35% off),
+  then averaged over layers; ``load_cv`` is the per-layer L2 deviation (std / mean), which
+  reacts to a few moderately hot experts sooner than ``mean``.
 * ``router/dead_experts`` -- fraction of (layer, expert) pairs that got no token.
-* ``router/bias_abs_mean`` / ``router/bias_abs_max`` -- magnitude of the bias.
+* ``router/bias_abs_mean`` / ``router/bias_dc`` -- bias magnitude. Only the CENTERED bias
+  ``b_c = b - b.mean(-1)`` is observable: adding ``alpha`` to every expert of a layer leaves
+  routing bit-for-bit unchanged (``group_scores`` shift by ``2*alpha`` for all groups, the
+  mask and the raw-sigmoid weights are untouched), and nothing restores that per-layer
+  constant -- the counts ignore it while ``sum_i sign(mean_i(c) - c_i) != 0`` in general --
+  so raw ``|b|`` random-walks as ``~0.8 * gamma * sqrt(steps)`` even on a healthy router
+  (measured: 0.0437 raw vs 0.0127 centered). ``bias_abs_mean`` is that CENTERED magnitude;
+  ``bias_dc`` is the raw per-layer mean, logged only to make the drift visible.
+* ``router/bias_promote_imbalance`` -- which side the centred bias is net working on. The
+  sign is the direction of the router's OWN PRIOR, not of the current load (the bias has
+  already flattened that): ``b_c > 0`` = the raw scores *under*-select the expert, so the
+  bias props it up; ``b_c < 0`` = over-selected, held back. A *mass* split cannot express
+  this (``mass(b+) - mass(|b-|) == sum(b) == E * dc``, and after centring the two masses are
+  equal by construction), so the asymmetry is a HEADCOUNT: ``(P - S) / (P + S)``, ``P``/``S``
+  = experts with ``b_c > 0`` / ``b_c < 0``. 0.0 = the two camps are equally populated,
+  ``> 0`` = more experts propped up than held back; range ``[-1, 1]``.
+* ``router/bias_promote_max`` / ``bias_suppress_max`` -- the two tail extremes, kept because
+  they CAN disagree with the headcount and neither alone is conclusive (measured: 73/27 by
+  count while suppression was 1.75x stronger per expert). ``bias_abs_max`` was just the larger
+  of the two and was retired. The ``0.25`` (sigmoid-score spread) bound applies to them; a
+  runaway ``bias_promote_max`` -- a dead expert's sign freezes positive -- together with
+  ``router/dead_experts`` is the real alarm.
 
-``min`` catches a *starved but alive* expert, which ``dead_experts`` only sees at
-zero. Note ``max`` / ``min`` are extremes over ``num_experts`` counts, so a
-perfectly balanced router already reads ``1 +/- 2.2 / sqrt(c)`` with
-``c = tokens_per_layer_per_step * top_k / num_experts`` (``mean``: ``0.8 / sqrt(c)``);
-only a larger ``c`` lowers that floor, not more layers.
+``load_max_violation`` is an extreme over ``num_experts`` counts, so a perfectly balanced
+router already reads ``2.2 / sqrt(c)`` with ``c = tokens_per_layer_per_step * top_k /
+num_experts`` (``mean``: ``0.8 / sqrt(c)``); only a larger ``c`` lowers that floor, not
+more layers.
 """
 
 from __future__ import annotations
@@ -164,14 +184,12 @@ class RouterBiasUpdateCallback(Callback):
         self._num_experts = num_experts
         for index, router in enumerate(routers):
             bias = router.e_score_correction_bias
-            # The bias must stay in float32: a 1e-3 update is below bfloat16 resolution.
-            # Swapping `.data` keeps the buffer registered while avoiding the
-            # `_keep_in_fp32_modules` declaration the HF file does not have.
+            # Keep the bias in fp32 (a 1e-3 step is below bfloat16 resolution); swapping
+            # `.data` preserves the buffer registration.
             if bias.dtype != torch.float32:
                 bias.data = bias.data.to(torch.float32)
             self._counts.append(torch.zeros(num_experts, dtype=torch.float32, device=bias.device))
-            # The entropy accumulators stay as scalars per layer: keeping the sum and
-            # the token count apart makes the mean exact under any amount of pooling.
+            # Per-layer scalars: sum and token count kept apart so the mean stays exact.
             self._entropy_sums.append(torch.zeros((), dtype=torch.float32, device=bias.device))
             self._token_counts.append(torch.zeros((), dtype=torch.float32, device=bias.device))
             self._handles.append(router.register_forward_hook(self._make_hook(index)))
@@ -217,10 +235,7 @@ class RouterBiasUpdateCallback(Callback):
                 # graphs happy (``bincount`` would produce a data-dependent length).
                 counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
 
-                # Router-logit entropy: same formula as the retired ``router_entropy``
-                # metric (softmax over the raw logits, mean over tokens). Sum and token
-                # count are accumulated separately so every pooling step is exact; a
-                # recompute pass scales both by the same factor.
+                # Router-logit entropy: softmax over the raw logits, mean over tokens.
                 logits = output[0]
                 if torch.is_tensor(logits) and logits.ndim >= 2 and logits.shape[-1] == self._num_experts:
                     probs = logits.detach().to(dtype=torch.float32).softmax(dim=-1)
@@ -320,21 +335,30 @@ class RouterBiasUpdateCallback(Callback):
             ideal_load = (total / num_experts).clamp_min(1.0)  # [num_layers, 1]
             load_ratios = counts / ideal_load  # [num_layers, num_experts]
             load_imbalance_mean = (load_ratios - 1.0).abs().mean()
-            load_imbalance_max = load_ratios.amax(dim=-1).mean()
-            load_imbalance_min = load_ratios.amin(dim=-1).mean()
+            load_max_violation = ((counts - ideal_load).abs().amax(dim=-1) / ideal_load.squeeze(-1)).mean()
             load_cv = (counts.std(dim=-1) / ideal_load.squeeze(-1)).mean()
             dead_experts = (counts == 0.0).to(dtype=torch.float32).mean()
+
+            # 5b) Bias diagnostics (see module docstring): only the centered bias is observable.
             bias = torch.stack([router.e_score_correction_bias.detach().float() for router in self._routers])
-            bias_abs_mean = bias.abs().mean()
-            bias_abs_max = bias.abs().max()
+            bias_dc = bias.mean()
+            centered = bias - bias.mean(dim=-1, keepdim=True)
+            bias_abs_mean = centered.abs().mean()
+            # Signed headcount (P - S) / (P + S); all-zero bias still reads 0.0.
+            signs = torch.sign(centered)
+            bias_promote_imbalance = signs.mean() / signs.abs().mean().clamp_min(1.0e-8)
+            bias_promote_max = centered.max()
+            bias_suppress_max = centered.min()
 
         if float(total.sum()) > 0.0:
             log_kwargs = {"on_step": True, "on_epoch": False, "sync_dist": False, "prog_bar": False}
             pl_module.log("router/entropy", entropy.to(device), **log_kwargs)
             pl_module.log("router/load_imbalance_mean", load_imbalance_mean.to(device), **log_kwargs)
-            pl_module.log("router/load_imbalance_max", load_imbalance_max.to(device), **log_kwargs)
-            pl_module.log("router/load_imbalance_min", load_imbalance_min.to(device), **log_kwargs)
+            pl_module.log("router/load_max_violation", load_max_violation.to(device), **log_kwargs)
             pl_module.log("router/load_cv", load_cv.to(device), **log_kwargs)
             pl_module.log("router/dead_experts", dead_experts.to(device), **log_kwargs)
             pl_module.log("router/bias_abs_mean", bias_abs_mean.to(device), **log_kwargs)
-            pl_module.log("router/bias_abs_max", bias_abs_max.to(device), **log_kwargs)
+            pl_module.log("router/bias_dc", bias_dc.to(device), **log_kwargs)
+            pl_module.log("router/bias_promote_imbalance", bias_promote_imbalance.to(device), **log_kwargs)
+            pl_module.log("router/bias_promote_max", bias_promote_max.to(device), **log_kwargs)
+            pl_module.log("router/bias_suppress_max", bias_suppress_max.to(device), **log_kwargs)

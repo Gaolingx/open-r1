@@ -81,9 +81,6 @@ def compute_liger_sft_loss(
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute token-level next-token loss using the patched Liger CE forward.
-
-    ``_policy_outputs`` feeds ``masked_token_stats`` in the SFT/pretrain modules;
-    the MoE routing diagnostics are owned by ``RouterBiasUpdateCallback``.
     """
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
