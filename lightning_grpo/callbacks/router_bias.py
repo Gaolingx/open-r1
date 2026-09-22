@@ -24,6 +24,14 @@ simply disappear when this callback is not registered. The bias itself is promot
 to float32 in memory at ``setup`` time, which replaces the ``_keep_in_fp32_modules``
 declaration the HF file does not have.
 
+Padding
+-------
+``NekoMindMoe2TopKRouter.forward`` has no ``attention_mask`` argument, so the mask is
+captured with a ``forward_pre_hook`` on the policy instead of being threaded down.
+Matching Megatron-LM's ``TopKRouter._apply_expert_bias``, the mask is applied to the
+*counting* only: pad rows are still routed and dispatched, but they no longer vote in
+the bias update, in the load denominators, or in the diagnostics.
+
 References:
     - Loss-Free Balancing, arXiv:2408.15664
     - DeepSeek-V3 Technical Report, arXiv:2412.19437
@@ -139,6 +147,7 @@ class RouterBiasUpdateCallback(Callback):
         self._token_counts: list[torch.Tensor] = []
         self._handles: list[Any] = []
         self._num_experts: int | None = None
+        self._attn_mask: torch.Tensor | None = None
 
     # ---- lifecycle -------------------------------------------------------
     def setup(self, trainer, pl_module, stage: str = "fit") -> None:
@@ -150,6 +159,7 @@ class RouterBiasUpdateCallback(Callback):
         self._entropy_sums = []
         self._token_counts = []
         self._num_experts = None
+        self._attn_mask = None
 
         if stage != "fit":
             return
@@ -182,6 +192,7 @@ class RouterBiasUpdateCallback(Callback):
 
         self._routers = routers
         self._num_experts = num_experts
+        self._handles.append(policy.register_forward_pre_hook(self._make_mask_hook(), with_kwargs=True))
         for index, router in enumerate(routers):
             bias = router.e_score_correction_bias
             # Keep the bias in fp32 (a 1e-3 step is below bfloat16 resolution); swapping
@@ -208,8 +219,33 @@ class RouterBiasUpdateCallback(Callback):
         self._entropy_sums = []
         self._token_counts = []
         self._num_experts = None
+        self._attn_mask = None
 
     # ---- accumulation (forward hook; the model stays untouched) ----------
+    def _make_mask_hook(self):
+        """Capture the policy's ``attention_mask`` for the routers (they never see it)."""
+
+        def _hook(module, args, kwargs):
+            mask = kwargs.get("attention_mask")
+            if mask is None and len(args) > 1 and torch.is_tensor(args[1]):
+                mask = args[1]
+            self._attn_mask = mask
+
+        return _hook
+
+    def _row_mask(self, num_rows: int, device) -> torch.Tensor | None:
+        """Flattened valid-token weights (``0``/``1``) in row order, or ``None``.
+
+        Returns ``None`` when no mask was captured or its length does not match
+        the router's token dimension, in which case every row counts (Megatron's
+        ``padding_mask is None`` branch).
+        """
+
+        mask = self._attn_mask
+        if mask is None or not torch.is_tensor(mask) or mask.numel() != num_rows:
+            return None
+        return (mask.reshape(-1) != 0).to(dtype=torch.float32, device=device)
+
     def _make_hook(self, index: int):
         """Build the per-router hook that accumulates ``topk_indices`` and the entropy."""
 
@@ -227,21 +263,32 @@ class RouterBiasUpdateCallback(Callback):
 
             with torch.no_grad():
                 flat = indices.reshape(-1)
+                top_k = indices.shape[-1]
                 counts = self._counts[index]
                 if counts.device != flat.device:
                     counts = counts.to(flat.device)
                     self._counts[index] = counts
+                # Pad rows are excluded from the count but still routed.
+                valid = self._row_mask(flat.numel() // top_k, flat.device)
+                if valid is None:
+                    weight = torch.ones_like(flat, dtype=torch.float32)
+                else:
+                    weight = valid.unsqueeze(-1).expand(-1, top_k).reshape(-1)
                 # ``index_add_`` keeps the output shape static, which keeps dynamo and CUDA
                 # graphs happy (``bincount`` would produce a data-dependent length).
-                counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
+                counts.index_add_(0, flat, weight)
 
-                # Router-logit entropy: softmax over the raw logits, mean over tokens.
+                # Router-logit entropy: softmax over the raw logits, mean over valid tokens.
                 logits = output[0]
                 if torch.is_tensor(logits) and logits.ndim >= 2 and logits.shape[-1] == self._num_experts:
                     probs = logits.detach().to(dtype=torch.float32).softmax(dim=-1)
-                    entropy_sum = -(probs * probs.clamp_min(1.0e-8).log()).sum()
+                    row_entropy = -(probs * probs.clamp_min(1.0e-8).log()).sum(dim=-1)
+                    if valid is None:
+                        entropy_sum, token_count = row_entropy.sum(), probs.shape[0]
+                    else:
+                        entropy_sum, token_count = (row_entropy * valid).sum(), valid.sum()
                     self._entropy_sums[index] = self._entropy_sums[index].to(probs.device) + entropy_sum
-                    self._token_counts[index] = self._token_counts[index].to(probs.device) + probs.shape[0]
+                    self._token_counts[index] = self._token_counts[index].to(probs.device) + token_count
 
         return _hook
 
@@ -317,7 +364,8 @@ class RouterBiasUpdateCallback(Callback):
                 dist.all_reduce(entropy_sums, op=dist.ReduceOp.SUM, group=group)
                 dist.all_reduce(token_counts, op=dist.ReduceOp.SUM, group=group)
 
-            # 3) Sign update, algebraically equivalent to `e_i = c_bar - c_i`.
+            # 3) Sign update, algebraically equivalent to `e_i = c_bar - c_i`. Counts hold
+            #    valid tokens only, so `total / num_experts` is the fair share of real load.
             total = counts.sum(dim=-1, keepdim=True)  # [num_layers, 1]
             direction = torch.sign(total - counts * num_experts)  # [num_layers, num_experts]
 
