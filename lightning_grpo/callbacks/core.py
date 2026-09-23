@@ -243,6 +243,30 @@ class GradParamNormCallback(Callback):
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)
 
 
+class LearningRateCallback(Callback):
+    """Log the current optimizer learning rate as ``train/learning_rate``."""
+
+    def on_before_optimizer_step(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        optimizer: torch.optim.Optimizer,
+    ) -> None:
+        """Record the first optimizer parameter group's learning rate per step."""
+
+        if not optimizer.param_groups:
+            return
+        learning_rate = float(optimizer.param_groups[0]["lr"])
+        pl_module.log(
+            "train/learning_rate",
+            learning_rate,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=False,
+        )
+
+
 class LRandSchedulerOverrideCallback(Callback):
     """Override optimizer LR and optionally reset scheduler state after ckpt resume."""
 
@@ -485,6 +509,7 @@ def build_callbacks(config: TrainingBaseConfig) -> list[Callback]:
     callbacks: list[Callback] = [
         ckpt_callback,
         LRandSchedulerOverrideCallback(config),
+        LearningRateCallback(),
         EfficiencyMonitorCallback(log_every_n_steps=config.logging.log_every_n_steps),
         GlobalSampleCountCallback(log_every_n_steps=config.logging.log_every_n_steps),
         GradParamNormCallback(log_every_n_steps=config.logging.log_every_n_steps),
