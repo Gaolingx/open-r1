@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import lightning as L
 import torch
@@ -61,22 +61,45 @@ class MoEAuxLossComputer:
         return self.aux_loss_coef * aux_loss, metrics
 
 
-def format_metric_value(value: Any) -> Optional[float]:
-    if value is None:
+def _align_token_mask(
+    attention_mask: torch.Tensor | None,
+    num_tokens: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Flatten an ``(batch, seq)`` attention mask to ``(batch*seq,)`` and align it with flattened router logits.
+
+    Returns a boolean keep-mask (``True`` for real tokens), or ``None`` when no usable mask is available.
+    """
+
+    if attention_mask is None or attention_mask.numel() == 0:
         return None
-    if torch.is_tensor(value):
-        if value.numel() != 1:
-            return None
-        return float(value.detach().float().cpu().item())
-    return float(value)
+
+    flat_mask = attention_mask.detach().reshape(-1).to(device=device)
+    if flat_mask.numel() != num_tokens:
+        rank_zero_warn(
+            "MoE metrics received an attention mask with "
+            f"{flat_mask.numel()} entries, but the router logits contain {num_tokens} tokens. "
+            "Padding tokens will not be excluded from the routing diagnostics.",
+        )
+        return None
+
+    return flat_mask != 0
 
 
-def collect_moe_metrics(outputs: Any, top_k: int = 1) -> dict[str, torch.Tensor]:
+def collect_moe_metrics(
+    outputs: Any,
+    top_k: int = 1,
+    attention_mask: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
     """Extract aggregate MoE routing diagnostics from model outputs.
 
     Args:
         outputs: Model forward outputs containing ``router_logits``.
         top_k: Number of top experts selected per token (``num_experts_per_tok``).
+        attention_mask: Optional ``(batch, seq)`` mask aligned with ``router_logits``. Padding positions
+            (``mask == 0``) are excluded from the routing diagnostics so that they do not bias
+            ``router_entropy`` / ``dead_expert_fraction`` / ``load_imbalance_*``. ``aux_loss`` is always
+            reported as-is because the model already computes it with the mask internally.
     """
 
     metrics: dict[str, torch.Tensor] = {}
@@ -107,6 +130,9 @@ def collect_moe_metrics(outputs: Any, top_k: int = 1) -> dict[str, torch.Tensor]
     layer_load_imbalance_means: list[torch.Tensor] = []
     layer_load_imbalance_maxs: list[torch.Tensor] = []
 
+    token_mask: torch.Tensor | None = None
+    mask_resolved = False
+
     for layer_logits in valid_router_logits:
         probs = layer_logits.detach().to(dtype=torch.float32)
         if probs.ndim == 0 or probs.shape[-1] == 0:
@@ -115,6 +141,16 @@ def collect_moe_metrics(outputs: Any, top_k: int = 1) -> dict[str, torch.Tensor]
         probs = probs.reshape(-1, probs.shape[-1])
         if probs.numel() == 0:
             continue
+
+        # Resolve the flattened ``(batch*seq,)`` keep-mask once; all layers share the same token layout.
+        if not mask_resolved:
+            token_mask = _align_token_mask(attention_mask, probs.shape[0], probs.device)
+            mask_resolved = True
+
+        if token_mask is not None and token_mask.numel() == probs.shape[0]:
+            if not torch.any(token_mask):
+                continue
+            probs = probs[token_mask]
 
         row_sums = probs.sum(dim=-1)
         is_probability_distribution = torch.allclose(
@@ -191,6 +227,4 @@ def log_moe_metrics(
     log_kwargs = {"prog_bar": False, "on_step": on_step, "on_epoch": on_epoch, "sync_dist": sync_dist}
 
     for key, value in moe_metrics.items():
-        formatted_value = format_metric_value(value)
-        if formatted_value is not None:
-            module.log(f"{stage}/moe_{key}", formatted_value, **log_kwargs)
+        module.log(f"{stage}/moe_{key}", value, **log_kwargs)
