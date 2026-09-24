@@ -82,6 +82,23 @@ def masked_token_stats(logits: torch.Tensor, labels: torch.Tensor, ignore_index:
     }
 
 
+def resolve_token_stats(
+    metrics: dict[str, Any],
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+) -> dict[str, Any]:
+    """Return token-level stats, deriving them from logits whenever they were materialized.
+
+    Liger's fused linear cross-entropy does not materialize logits while the model is in
+    training mode, so the metrics already produced by the loss are reused in that case.
+    """
+
+    logits = getattr(metrics.get("_policy_outputs"), "logits", None)
+    if logits is None:
+        return metrics
+    return masked_token_stats(logits, labels, ignore_index=ignore_index)
+
+
 # SFT Loss
 def compute_cross_entropy_loss(
     logits: torch.Tensor,

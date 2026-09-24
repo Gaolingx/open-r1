@@ -16,7 +16,7 @@ from lightning_grpo.models.common import (
     export_configured_model,
     load_tokenizer,
 )
-from lightning_grpo.models.grpo.loss import masked_token_stats, compute_standard_sft_loss
+from lightning_grpo.models.grpo.loss import resolve_token_stats, compute_standard_sft_loss
 from lightning_grpo.models.grpo.liger_loss import compute_liger_sft_loss
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
@@ -100,8 +100,7 @@ class PretrainLightningModule(L.LightningModule):
 
         self.log(f"{stage}/loss", loss, prog_bar=prog_bar, on_step=on_step, on_epoch=True, sync_dist=True)
         with torch.no_grad():
-            outputs = metrics.get("_policy_outputs")
-            stats = masked_token_stats(outputs.logits, labels, ignore_index=self.config.data.ignore_index) if not use_liger or stage == "val" else metrics
+            stats = resolve_token_stats(metrics, labels, ignore_index=self.config.data.ignore_index)
 
         optional_metrics = ["token_accuracy", "entropy", "mean_logprob", "perplexity"]
         for key in optional_metrics:
