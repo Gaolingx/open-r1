@@ -2,70 +2,45 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-import torch
-from datasets import Dataset
+from datasets import Dataset, IterableDataset
 from lightning.pytorch.utilities import rank_zero_warn
-from transformers import PreTrainedTokenizerBase
 
 from lightning_grpo.utils.configs.base import ModelConfig, OptimizationConfig
 from lightning_grpo.utils.configs.sft import SFTDataConfig
 from lightning_grpo.data.base import (
     ChatTemplateProcessor,
     ChatTemplateDataModule,
-    preprocess_chat_messages,
-    resolve_shuffle_state,
+    PackedCausalLMCollator,
+    SequencePacker,
     iter_batch_samples,
+    packed_features,
+    resolve_pad_token_id,
+    resolve_shuffle_state,
 )
 from lightning_grpo.models.common import load_tokenizer
+
+
+SFT_PACKED_FEATURES = packed_features("input_ids", "labels")
+"""On-disk schema for packed SFT rows: `input_ids`, `labels`, and `doc_starts`.
+
+The all-ones `attention_mask` of the previous pipeline is rebuilt by the collator, so
+only the tokens and their label mask are cached.
+"""
 
 
 class SkipSFTSampleError(ValueError):
     """Raised when a malformed or non-trainable SFT sample should be skipped."""
 
 
-class SFTBatchCollator:
-    """Causal LM collator for pre-tokenized SFT samples."""
-
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, ignore_index: int = -100) -> None:
-        self.tokenizer = tokenizer
-        self.ignore_index = ignore_index
-
-    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        """Collate a list of tokenized examples."""
-
-        input_ids = [torch.tensor(item["input_ids"], dtype=torch.long) for item in batch]
-        labels = [torch.tensor(item["labels"], dtype=torch.long) for item in batch]
-        if "attention_mask" in batch[0]:
-            attention_mask = [torch.tensor(item["attention_mask"], dtype=torch.long) for item in batch]
-        else:
-            attention_mask = [torch.ones_like(ids) for ids in input_ids]
-
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id,
-        )
-        attention_mask = torch.nn.utils.rnn.pad_sequence(
-            attention_mask,
-            batch_first=True,
-            padding_value=0,
-        )
-        labels = torch.nn.utils.rnn.pad_sequence(
-            labels,
-            batch_first=True,
-            padding_value=self.ignore_index,
-        )
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-
 class SFTDataModule(ChatTemplateDataModule):
-    """Lightning data module for supervised fine-tuning."""
+    """Lightning data module for supervised fine-tuning.
+
+    Chat samples are tokenized into `input_ids`/`labels`, packed into max-length rows,
+    and collated with the shared `PackedCausalLMCollator`, which rebuilds the attention
+    mask instead of caching it.
+    """
 
     def __init__(
         self,
@@ -78,21 +53,52 @@ class SFTDataModule(ChatTemplateDataModule):
         self.optimization_config = optimization_config
         self.tokenizer = load_tokenizer(model_config)
         self.chat_processor = ChatTemplateProcessor(self.tokenizer)
-        self.collator = SFTBatchCollator(self.tokenizer, ignore_index=self.data_config.ignore_index)
+        self.collator = PackedCausalLMCollator(
+            resolve_pad_token_id(self.tokenizer),
+            ignore_index=self.data_config.ignore_index,
+            boundary_loss_mask=self.data_config.packing_boundary_loss_mask,
+        )
 
     def setup(self, stage: Optional[str] = None) -> None:
         """Load and preprocess train and validation datasets."""
 
         dataset_dict = self.load_dataset_dict()
-        formatter = self.build_conversation_template()
 
         train_split = dataset_dict[self.data_config.train_split]
-        self.train_dataset = self._tokenize_dataset(train_split, formatter)
+        self.train_dataset = self._build_dataset(
+            train_split,
+            desc="Tokenizing and packing SFT dataset",
+        )
 
         self.val_dataset = None
         val_split_name = self.resolve_val_split_name(dataset_dict)
         if val_split_name is not None:
-            self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name], formatter)
+            self.val_dataset = self._build_dataset(
+                dataset_dict[val_split_name],
+                desc="Tokenizing and packing SFT validation dataset",
+            )
+
+    def _build_dataset(
+        self,
+        dataset: Dataset | IterableDataset,
+        *,
+        desc: str,
+    ) -> Dataset | IterableDataset:
+        """Tokenize chat samples, pack them into max-length rows, drop placeholders."""
+
+        packer = self.build_sequence_packer(
+            self.data_config.max_seq_length,
+            # Streaming datasets have no fixed row count that must be preserved.
+            emit_placeholders=not isinstance(dataset, IterableDataset),
+        )
+        transform = self._build_transform(packer)
+        return self.map_packed_dataset(
+            dataset,
+            transform,
+            desc=desc,
+            features=SFT_PACKED_FEATURES,
+            drop_placeholders=self.data_config.packing_enabled,
+        )
 
     @staticmethod
     def _extract_assistant_mask(processed: dict[str, Any]) -> list[bool]:
@@ -135,12 +141,16 @@ class SFTDataModule(ChatTemplateDataModule):
             return False
         return bool(content)
 
-    def _tokenize_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
-        """Convert dataset rows into tokenized causal language modeling samples."""
+    def _build_transform(
+        self,
+        packer: SequencePacker,
+    ) -> Callable[[dict[str, list[Any]]], dict[str, list[list[int]]]]:
+        """Build the row -> packed token columns transform."""
 
         tokenizer = self.tokenizer
         chat_processor = self.chat_processor
         data_config = self.data_config
+        prepare_messages = self.prepare_messages
 
         extract_assistant_mask = self._extract_assistant_mask
         find_subsequence_starts = self._find_subsequence_starts
@@ -177,7 +187,6 @@ class SFTDataModule(ChatTemplateDataModule):
                 tools=tools,
                 max_length=data_config.max_seq_length,
                 return_assistant_tokens_mask=return_assistant_tokens_mask,
-                empty_think_ratio=data_config.empty_think_ratio,
             )
 
         def split_prompt_and_completion(
@@ -286,8 +295,7 @@ class SFTDataModule(ChatTemplateDataModule):
                 raise SkipSFTSampleError("empty response")
 
         def tokenize_sample(sample: dict[str, Any]) -> dict[str, list[int]]:
-            messages, tools = chat_processor.prepare_sample(sample)
-            messages = preprocess_chat_messages(messages, data_config.add_system_ratio)
+            messages, tools = prepare_messages(sample)
             validate_messages_for_training(messages)
             add_generation_prompt = should_add_generation_prompt(messages)
             needs_assistant_mask = data_config.assistant_only_loss
@@ -300,11 +308,10 @@ class SFTDataModule(ChatTemplateDataModule):
             )
 
             input_ids = list(processed["input_ids"])
-            attention_mask = list(processed.get("attention_mask", [1] * len(input_ids)))
             labels = build_labels(messages, tools, input_ids, processed)
             if not any(label != data_config.ignore_index for label in labels):
                 raise SkipSFTSampleError("assistant mask produced no trainable labels")
-            return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+            return {"input_ids": input_ids, "labels": labels}
 
         def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
             tokenized_samples: list[dict[str, list[int]]] = []
@@ -312,8 +319,7 @@ class SFTDataModule(ChatTemplateDataModule):
 
             for raw_sample in iter_batch_samples(batch):
                 try:
-                    sample = formatter(raw_sample)
-                    tokenized_samples.append(tokenize_sample(sample))
+                    tokenized_samples.append(tokenize_sample(raw_sample))
                 except Exception as exc:
                     exc_message = str(exc)
                     reason = f"preprocessing error: {type(exc).__name__}"
@@ -327,17 +333,14 @@ class SFTDataModule(ChatTemplateDataModule):
                     + ", ".join(f"{reason}={count}" for reason, count in sorted(skipped_reasons.items()))
                 )
 
-            return {
-                "input_ids": [sample["input_ids"] for sample in tokenized_samples],
-                "attention_mask": [sample["attention_mask"] for sample in tokenized_samples],
-                "labels": [sample["labels"] for sample in tokenized_samples],
-            }
+            return packer.pack(
+                {
+                    "input_ids": [sample["input_ids"] for sample in tokenized_samples],
+                    "labels": [sample["labels"] for sample in tokenized_samples],
+                }
+            )
 
-        return self.map_dataset(
-            dataset,
-            preprocess_batch,
-            desc="Tokenizing SFT dataset",
-        )
+        return preprocess_batch
 
     def train_dataloader(self):
         """Build the training dataloader."""

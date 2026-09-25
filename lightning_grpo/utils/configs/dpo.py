@@ -13,8 +13,9 @@ from lightning_grpo.utils.configs.sft import ChatDataConfig
 class DPODataConfig(ChatDataConfig):
     """Dataset configuration specific to Direct Preference Optimization.
 
-    Expects datasets with 'chosen' and 'rejected' columns (conversational format)
-    or 'prompt', 'chosen', 'rejected' columns (standard format).
+    `chosen_column` and `rejected_column` must both hold OpenAI-style message lists.
+    The trailing assistant turn of each side is the completion; everything before it is
+    the shared prompt.
     """
 
     chosen_column: str = "chosen"

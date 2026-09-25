@@ -23,8 +23,6 @@ data:
   dataset_config: all
   train_split: train
   val_split: test
-  prompt_column: prompt
-  response_column: response
   max_seq_length: 2048
   num_workers: 4
   preprocessing_batch_size: 128

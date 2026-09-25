@@ -30,7 +30,6 @@ data:
   dataset_name: trl-lib/ultrafeedback_binarized
   train_split: train
   val_split: test
-  prompt_column: prompt
   chosen_column: chosen
   rejected_column: rejected
   max_seq_length: 2048

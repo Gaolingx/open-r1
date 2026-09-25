@@ -64,13 +64,8 @@ data:
           - E:/training/datasets/minimind_dataset/rlaif.jsonl
   train_split: train
   val_split: test
-  prompt_column: prompt
-  response_column: response
-  messages_column: conversations
-  tools_column: tools
   add_generation_prompt: true
   add_system_ratio: 0.0
-  thinking_ratio: 0.9
   max_seq_length: 2500
   num_workers: 4
   preprocessing_batch_size: 128

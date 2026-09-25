@@ -66,13 +66,14 @@ class ModelConfig:
 
 @dataclass
 class DatasetConfig:
-    """Configuration for a dataset."""
+    """Configuration for a single dataset inside a mixture."""
 
     id: str
     config: Optional[str] = None
     split: str = "train"
     data_files: Optional[DataFiles] = None
     columns: Optional[list[str]] = None
+    column_mapping: Optional[dict[str, str]] = None
     weight: Optional[float] = None
 
 
@@ -97,7 +98,11 @@ class DataConfig:
     preprocessing_use_cache: bool = True
     preprocessing_keep_in_memory: bool = False
     add_system_ratio: float = 0.0
-    empty_think_ratio: float = 1.0
+
+    # sequence packing
+    packing_enabled: bool = False
+    packing_lookahead: int = 0
+    packing_boundary_loss_mask: bool = True
 
 
 @dataclass

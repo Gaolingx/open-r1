@@ -6,7 +6,6 @@ from typing import Any, Optional
 
 import torch
 from datasets import Dataset
-from lightning.pytorch.utilities import rank_zero_warn
 from transformers import PreTrainedTokenizerBase
 
 from lightning_grpo.utils.configs.base import ModelConfig, OptimizationConfig
@@ -15,9 +14,10 @@ from lightning_grpo.data.base import (
     ChatTemplateProcessor,
     ChatTemplateDataModule,
     preprocess_chat_messages,
+    resolve_pad_token_id,
     resolve_shuffle_state,
     iter_batch_samples,
-    json_loads_if_needed,
+    sample_system_prompt,
 )
 from lightning_grpo.models.common import load_tokenizer
 
@@ -32,6 +32,7 @@ class DPOBatchCollator:
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase, ignore_index: int = -100) -> None:
         self.tokenizer = tokenizer
+        self.pad_token_id = resolve_pad_token_id(tokenizer)
         self.ignore_index = ignore_index
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
@@ -75,10 +76,9 @@ class DPOBatchCollator:
         all_attention_mask = chosen_attention_mask + rejected_attention_mask
         all_completion_mask = chosen_completion_mask + rejected_completion_mask
 
-        # Pad sequences to the same length
-        pad_token_id = self.tokenizer.pad_token_id
+        # Pad both halves to the longest sequence in the batch.
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            all_input_ids, batch_first=True, padding_value=pad_token_id,
+            all_input_ids, batch_first=True, padding_value=self.pad_token_id,
         )
         attention_mask = torch.nn.utils.rnn.pad_sequence(
             all_attention_mask, batch_first=True, padding_value=0,
@@ -97,10 +97,15 @@ class DPOBatchCollator:
 class DPODataModule(ChatTemplateDataModule):
     """Lightning data module for Direct Preference Optimization.
 
-    Expects datasets in one of two formats:
-    1. Conversational: 'chosen' and 'rejected' columns with message lists,
-       optionally with a 'prompt' column.
-    2. Standard: 'prompt', 'chosen', 'rejected' columns with plain text.
+    `chosen_column` and `rejected_column` must both hold OpenAI-style message lists, for
+    example `[{"role": "user", "content": ...}, {"role": "assistant", "content": ...}]`.
+    The trailing assistant turn is the completion; the turns before it form the prompt
+    shared by both sides.
+
+    Sequence packing is deliberately not supported here: the loss pairs `chosen[i]`
+    with `rejected[i]` by splitting the batch in half, so merging or reordering rows
+    would silently break the preference pairs. The cached columns are unpadded
+    `prompt_ids`/`chosen_ids`/`rejected_ids`, so there is no padding to reclaim anyway.
     """
 
     def __init__(
@@ -111,6 +116,11 @@ class DPODataModule(ChatTemplateDataModule):
         system_prompt: Optional[str] = None,
     ) -> None:
         super().__init__(data_config=data_config, system_prompt=system_prompt)
+        self.reject_sequence_packing(
+            "DPO",
+            "the loss pairs chosen[i] with rejected[i] via chunk(2), so rows cannot be "
+            "merged or reordered without breaking the preference pairs.",
+        )
         self.optimization_config = optimization_config
         self.tokenizer = load_tokenizer(model_config)
         self.chat_processor = ChatTemplateProcessor(self.tokenizer)
@@ -120,15 +130,14 @@ class DPODataModule(ChatTemplateDataModule):
         """Load and preprocess train and validation datasets."""
 
         dataset_dict = self.load_dataset_dict()
-        formatter = self.build_conversation_template()
 
         train_split = dataset_dict[self.data_config.train_split]
-        self.train_dataset = self._tokenize_dataset(train_split, formatter)
+        self.train_dataset = self._tokenize_dataset(train_split)
 
         self.val_dataset = None
         val_split_name = self.resolve_val_split_name(dataset_dict)
         if val_split_name is not None:
-            self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name], formatter)
+            self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name])
 
     @staticmethod
     def _split_messages_for_dpo(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -138,13 +147,15 @@ class DPODataModule(ChatTemplateDataModule):
             return messages[:-1], [messages[-1]]
         return messages, []
 
-    def _tokenize_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
+    def _tokenize_dataset(self, dataset: Dataset) -> Dataset:
         """Convert dataset rows into tokenized DPO preference pairs."""
 
         chat_processor = self.chat_processor
         max_seq_length = self.data_config.max_seq_length
         chosen_column = self.data_config.chosen_column
         rejected_column = self.data_config.rejected_column
+        tools_column = self.data_config.tools_column
+        system_prompt = self.system_prompt
         add_system_ratio = self.data_config.add_system_ratio
         split_messages_for_dpo = DPODataModule._split_messages_for_dpo
 
@@ -158,19 +169,6 @@ class DPODataModule(ChatTemplateDataModule):
             )
             return list(processed["input_ids"])
 
-        def normalize_preference_sample(raw_sample: dict[str, Any], completion_column: str) -> dict[str, Any]:
-            """Build one canonical prompt+completion sample for a DPO side."""
-
-            raw_completion = json_loads_if_needed(raw_sample[completion_column])
-            if isinstance(raw_completion, list):
-                sample = dict(raw_sample)
-                sample["messages"] = raw_completion
-                return formatter(sample)
-
-            sample = dict(raw_sample)
-            sample["response"] = raw_completion
-            return formatter(sample)
-
         def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
             """Tokenize a batch of preference samples into prompt/chosen/rejected ids."""
 
@@ -180,12 +178,15 @@ class DPODataModule(ChatTemplateDataModule):
 
             samples = iter_batch_samples(batch)
             for raw_sample in samples:
-                chosen_sample = normalize_preference_sample(raw_sample, chosen_column)
-                rejected_sample = normalize_preference_sample(raw_sample, rejected_column)
-                chosen_messages, chosen_tools = chat_processor.prepare_sample(chosen_sample)
-                rejected_messages, rejected_tools = chat_processor.prepare_sample(rejected_sample)
-                chosen_messages = preprocess_chat_messages(chosen_messages, add_system_ratio)
-                rejected_messages = preprocess_chat_messages(rejected_messages, add_system_ratio)
+                tools = raw_sample.get(tools_column)
+                # Resolve the system prompt once per row so both sides stay identical.
+                row_system_prompt = sample_system_prompt(system_prompt, add_system_ratio)
+                chosen_messages, _ = preprocess_chat_messages(
+                    raw_sample[chosen_column], tools=tools, system_prompt=row_system_prompt
+                )
+                rejected_messages, _ = preprocess_chat_messages(
+                    raw_sample[rejected_column], tools=tools, system_prompt=row_system_prompt
+                )
                 prompt_messages, chosen_completion = split_messages_for_dpo(chosen_messages)
                 _, rejected_completion = split_messages_for_dpo(rejected_messages)
                 prompt_ids = tokenize_messages(prompt_messages) if prompt_messages else []
@@ -194,13 +195,10 @@ class DPODataModule(ChatTemplateDataModule):
                 chosen_ids = chosen_all_ids[len(prompt_ids):]
                 rejected_ids = rejected_all_ids[len(prompt_ids):]
 
-                # Truncate to max_seq_length
+                # Truncating the prompt is pointless: the completions were already split
+                # off the same truncated window, so a prompt that fills it leaves nothing
+                # to learn from. Those rows are skipped below instead of being trained on.
                 max_completion_len = max_seq_length - len(prompt_ids)
-                if max_completion_len <= 0:
-                    # Truncate prompt if it exceeds max length
-                    prompt_ids = prompt_ids[:max_seq_length // 2]
-                    max_completion_len = max_seq_length - len(prompt_ids)
-
                 chosen_ids = chosen_ids[:max_completion_len]
                 rejected_ids = rejected_ids[:max_completion_len]
 

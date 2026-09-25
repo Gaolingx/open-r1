@@ -14,6 +14,7 @@ class PretrainDataConfig(DataConfig):
 
     text_column: str = "text"
     ignore_index: int = -100
+    packing_enabled: bool = True
 
 
 @dataclass

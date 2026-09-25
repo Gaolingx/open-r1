@@ -1,36 +1,81 @@
-"""Pretraining data module and collation utilities for Lightning."""
+"""Pretraining data module: tokenize raw text, pack documents, and collate batches."""
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-import torch
-from datasets import Dataset
+from datasets import Dataset, IterableDataset
 
-from lightning_grpo.utils.configs.pretrain import PretrainConfig
-from lightning_grpo.data.base import BaseDataModule, resolve_shuffle_state
+from lightning_grpo.data.base import (
+    BaseDataModule,
+    PackedCausalLMCollator,
+    SequencePacker,
+    packed_features,
+    resolve_pad_token_id,
+    resolve_shuffle_state,
+)
 from lightning_grpo.models.common import load_tokenizer
+from lightning_grpo.utils.configs.pretrain import PretrainConfig
 
 
-class PretrainBatchCollator:
-    """Pad tokenized pretraining samples into dense training batches."""
+PACKED_FEATURES = packed_features("input_ids")
+"""On-disk schema for packed pretraining rows: `input_ids` plus `doc_starts`.
 
-    def __init__(self, pad_token_id: int, ignore_index: int = -100) -> None:
-        self.pad_token_id = pad_token_id
-        self.ignore_index = ignore_index
+`input_ids` stores every token exactly once; the all-ones `attention_mask` and the
+`labels` copy of the previous pipeline are rebuilt by the collator instead of being
+cached, which removed two of the three token arrays from the Arrow files.
+"""
 
-    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        """Collate a list of tokenized examples."""
 
-        input_ids = [torch.tensor(item["input_ids"], dtype=torch.long) for item in batch]
-        attention_mask = [torch.tensor(item["attention_mask"], dtype=torch.long) for item in batch]
-        labels = [torch.tensor(item["labels"], dtype=torch.long) for item in batch]
+class PretrainTokenizeAndPack:
+    """Tokenize raw text and pack whole documents into max-length rows.
 
-        return {
-            "input_ids": torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id),
-            "attention_mask": torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0),
-            "labels": torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=self.ignore_index),
-        }
+    Documents are never split across rows and never shrunk to make room, so the only
+    short rows are the tails of a packing batch, which the collator pads. That turns
+    most padding tokens into real training tokens. `SequencePacker` documents the
+    lookahead and placeholder-row semantics.
+    """
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        *,
+        text_column: str,
+        max_seq_length: int,
+        packer: SequencePacker,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.text_column = text_column
+        self.packer = packer
+        self.bos_token_id = getattr(tokenizer, "bos_token_id", None)
+        self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        # Reserve room for the BOS/EOS wrappers that the tokenizer does not add itself.
+        special_tokens = int(self.bos_token_id is not None) + int(self.eos_token_id is not None)
+        self.inner_max_length = max(1, max_seq_length - special_tokens)
+
+    def _wrap_document(self, token_ids: list[int]) -> list[int]:
+        """Add the document delimiters used both for packing and for the LM loss."""
+
+        tokens = list(token_ids)
+        if self.bos_token_id is not None:
+            tokens.insert(0, self.bos_token_id)
+        if self.eos_token_id is not None:
+            tokens.append(self.eos_token_id)
+        return tokens
+
+    def __call__(self, batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
+        """Tokenize one batch of raw texts and pack them into full-length rows."""
+
+        texts = [str(text) for text in batch[self.text_column]]
+        encoded = self.tokenizer(
+            texts,
+            truncation=True,
+            max_length=self.inner_max_length,
+            padding=False,
+            add_special_tokens=False,
+        )
+        documents = [self._wrap_document(token_ids) for token_ids in encoded["input_ids"]]
+        return self.packer.pack({"input_ids": documents})
 
 
 class PretrainDataModule(BaseDataModule):
@@ -40,58 +85,52 @@ class PretrainDataModule(BaseDataModule):
         super().__init__(data_config=config.data)
         self.config = config
         self.tokenizer = load_tokenizer(config.model)
-        self.collator = PretrainBatchCollator(self.tokenizer.pad_token_id, ignore_index=config.data.ignore_index)
+        self.collator = PackedCausalLMCollator(
+            resolve_pad_token_id(self.tokenizer),
+            ignore_index=config.data.ignore_index,
+            boundary_loss_mask=config.data.packing_boundary_loss_mask,
+        )
 
-    def _tokenize_dataset(self, dataset: Dataset) -> Dataset:
-        text_column = self.config.data.text_column
-        max_length = self.config.data.max_seq_length
-        tokenizer = self.tokenizer
+    def _build_dataset(self, dataset: Dataset | IterableDataset, *, desc: str) -> Dataset | IterableDataset:
+        """Tokenize raw text, pack whole documents into max-length rows, drop placeholders."""
 
-        def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
-            texts = [str(text) for text in batch[text_column]]
-            tokenized = tokenizer(
-                texts,
-                truncation=True,
-                max_length=max_length - 2,
-                padding=False,
-                add_special_tokens=False,
-            )
+        packer = self.build_sequence_packer(
+            self.config.data.max_seq_length,
+            # Streaming datasets have no fixed row count that must be preserved.
+            emit_placeholders=not isinstance(dataset, IterableDataset),
+        )
+        transform = PretrainTokenizeAndPack(
+            self.tokenizer,
+            text_column=self.config.data.text_column,
+            max_seq_length=self.config.data.max_seq_length,
+            packer=packer,
+        )
 
-            input_ids_batch: list[list[int]] = []
-            attention_mask_batch: list[list[int]] = []
-            labels_batch: list[list[int]] = []
-
-            for ids in tokenized["input_ids"]:
-                tokens = [tokenizer.bos_token_id] + list(ids) + [tokenizer.eos_token_id]
-                attention_mask = [1] * len(tokens)
-                labels = list(tokens)
-                input_ids_batch.append(tokens)
-                attention_mask_batch.append(attention_mask)
-                labels_batch.append(labels)
-
-            return {
-                "input_ids": input_ids_batch,
-                "attention_mask": attention_mask_batch,
-                "labels": labels_batch,
-            }
-
-        return self.map_dataset(
+        return self.map_packed_dataset(
             dataset,
-            preprocess_batch,
-            desc="Tokenizing pretraining dataset",
+            transform,
+            desc=desc,
+            features=PACKED_FEATURES,
+            drop_placeholders=self.config.data.packing_enabled,
         )
 
     def setup(self, stage: Optional[str] = None) -> None:
-        """Load and tokenize the pretraining dataset."""
+        """Load, tokenize, and pack the pretraining dataset."""
 
         dataset_dict = self.load_dataset_dict()
         train_dataset = dataset_dict[self.config.data.train_split]
-        self.train_dataset = self._tokenize_dataset(train_dataset)
+        self.train_dataset = self._build_dataset(
+            train_dataset,
+            desc="Tokenizing and packing pretraining dataset",
+        )
 
         self.val_dataset = None
         val_split_name = self.resolve_val_split_name(dataset_dict)
         if val_split_name is not None:
-            self.val_dataset = self._tokenize_dataset(dataset_dict[val_split_name])
+            self.val_dataset = self._build_dataset(
+                dataset_dict[val_split_name],
+                desc="Tokenizing and packing pretraining validation dataset",
+            )
 
     def train_dataloader(self):
         """Build the training dataloader."""

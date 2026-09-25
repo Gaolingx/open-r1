@@ -59,7 +59,13 @@ class GRPORolloutCollator:
 
 
 class GRPODataModule(ChatTemplateDataModule):
-    """Lightning data module for GRPO prompt and reward flows."""
+    """Lightning data module for GRPO prompt and reward flows.
+
+    Sequence packing is deliberately not supported here: every rollout needs its own
+    prompt, and prompts are left padded at collate time so generation can start from a
+    common position. The cached columns are raw prompt text and metadata, so there is
+    no tokenized padding to reclaim either.
+    """
 
     def __init__(
         self,
@@ -70,6 +76,11 @@ class GRPODataModule(ChatTemplateDataModule):
         system_prompt: Optional[str] = None,
     ) -> None:
         super().__init__(data_config=data_config, system_prompt=system_prompt)
+        self.reject_sequence_packing(
+            "GRPO",
+            "every rollout needs its own prompt, and prompts are left padded at collate "
+            "time for generation.",
+        )
         self.optimization_config = optimization_config
         self.rollout_config = rollout_config
         self.tokenizer = load_tokenizer(model_config)
@@ -80,36 +91,32 @@ class GRPODataModule(ChatTemplateDataModule):
         """Load and preprocess prompt-only datasets for GRPO."""
 
         dataset_dict = self.load_dataset_dict()
-        formatter = self.build_conversation_template()
 
         train_dataset = dataset_dict[self.data_config.train_split]
         val_split_name = self.resolve_val_split_name(dataset_dict)
 
-        self.train_dataset = self._prepare_prompt_dataset(train_dataset, formatter)
+        self.train_dataset = self._prepare_prompt_dataset(train_dataset)
         self.val_dataset = None
         if val_split_name is not None:
-            self.val_dataset = self._prepare_prompt_dataset(dataset_dict[val_split_name], formatter)
+            self.val_dataset = self._prepare_prompt_dataset(dataset_dict[val_split_name])
 
-    def _prepare_prompt_dataset(self, dataset: Dataset, formatter: Any) -> Dataset:
-        """Build prompt text plus reward metadata for online optimization."""
+    def _prepare_prompt_dataset(self, dataset: Dataset) -> Dataset:
+        """Render prompts and collect reward metadata for online optimization.
 
-        response_column = getattr(self.data_config, "response_column", "solution")
-        messages_column = getattr(self.data_config, "messages_column", "messages")
+        Every dataset column except the conversation itself is forwarded to the reward
+        functions through `metadata`, so reward-specific fields need no registration here.
+        """
+
         chat_processor = self.chat_processor
-        add_generation_prompt = getattr(self.data_config, "add_generation_prompt", True)
-
-        def resolve_solution(sample: dict[str, Any]) -> Any:
-            for key in (response_column, "solution", "answer", "response", "output"):
-                if key in sample and sample[key] is not None:
-                    return sample[key]
-            return None
+        messages_column = self.data_config.messages_column
+        add_generation_prompt = self.data_config.add_generation_prompt
+        prepare_messages = self.prepare_messages
 
         def preprocess_batch(batch: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
             prompt_texts: list[str] = []
             metadata: list[str] = []
             for sample in iter_batch_samples(batch):
-                formatted = formatter(sample)
-                messages, tools = chat_processor.prepare_sample(formatted)
+                messages, tools = prepare_messages(sample)
                 prompt_texts.append(
                     chat_processor.render(
                         messages,
@@ -118,16 +125,11 @@ class GRPODataModule(ChatTemplateDataModule):
                     )
                 )
                 reward_metadata = {
-                    key: value
-                    for key, value in sample.items()
-                    if key != messages_column
+                    key: value for key, value in sample.items() if key != messages_column
                 }
-                reward_metadata.setdefault("prompt_messages", messages)
+                reward_metadata["prompt_messages"] = messages
                 if tools is not None:
-                    reward_metadata.setdefault("tools", tools)
-                solution = resolve_solution(sample)
-                if solution is not None:
-                    reward_metadata.setdefault("solution", solution)
+                    reward_metadata["tools"] = tools
                 metadata.append(json.dumps(reward_metadata, ensure_ascii=False))
             return {"prompt_text": prompt_texts, "metadata": metadata, "sample_id": indices}
 

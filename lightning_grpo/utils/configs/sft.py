@@ -11,11 +11,18 @@ from lightning_grpo.utils.configs.base import TrainingBaseConfig
 
 @dataclass
 class ChatDataConfig(DataConfig):
-    """Dataset configuration used by chat-style supervised tasks."""
+    """Dataset configuration shared by the chat-style supervised tasks.
 
-    prompt_column: str = "prompt"
-    response_column: str = "response"
+    Rows must expose a single OpenAI-style conversation column; there is no support for
+    separate prompt/response text columns or ShareGPT `conversations` blobs.
+    """
+
     messages_column: str = "messages"
+    """Column holding the conversation as `[{"role": ..., "content": ...}, ...]`."""
+
+    tools_column: str = "tools"
+    """Optional column holding the OpenAI `tools` request parameter for that row."""
+
     add_generation_prompt: bool = True
 
 
@@ -30,6 +37,7 @@ class SFTDataConfig(ChatDataConfig):
     instruction_template: Optional[str] = None
     instruction_template_ids: Optional[list[int]] = None
     ignore_index: int = -100
+    packing_enabled: bool = True
 
 
 @dataclass
