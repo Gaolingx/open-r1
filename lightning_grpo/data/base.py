@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import hashlib
+import json
 import random
 from typing import Any, Callable, Optional
 
@@ -51,7 +53,24 @@ def iter_batch_samples(batch: dict[str, list[Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def sample_system_prompt(system_prompt: Optional[str], add_system_ratio: float) -> Optional[str]:
+def _stable_row_seed(content: Any, seed: int) -> int:
+    """Derive a stable 64-bit RNG seed from a row's content and the split seed."""
+
+    try:
+        payload = json.dumps(content, sort_keys=True, ensure_ascii=True, default=str)
+    except (TypeError, ValueError):
+        payload = repr(content)
+    digest = hashlib.blake2b(payload.encode("utf-8"), digest_size=8).digest()
+    return seed ^ int.from_bytes(digest, "little")
+
+
+def sample_system_prompt(
+    system_prompt: Optional[str],
+    add_system_ratio: float,
+    content: Any,
+    *,
+    seed: int,
+) -> Optional[str]:
     """Resolve the system prompt for one row.
 
     A configured `system_prompt` always wins; otherwise `add_system_ratio` randomly picks
@@ -61,8 +80,10 @@ def sample_system_prompt(system_prompt: Optional[str], add_system_ratio: float) 
 
     if system_prompt:
         return system_prompt
-    if add_system_ratio > 0.0 and random.random() < add_system_ratio:
-        return random.choice(SYSTEM_PROMPTS)
+    if add_system_ratio > 0.0:
+        rng = random.Random(_stable_row_seed(content, seed))
+        if rng.random() < add_system_ratio:
+            return rng.choice(SYSTEM_PROMPTS)
     return None
 
 
@@ -811,5 +832,10 @@ class ChatTemplateDataModule(BaseDataModule):
         return preprocess_chat_messages(
             messages,
             tools=sample.get(self.data_config.tools_column),
-            system_prompt=sample_system_prompt(self.system_prompt, self.data_config.add_system_ratio),
+            system_prompt=sample_system_prompt(
+                self.system_prompt,
+                self.data_config.add_system_ratio,
+                messages,
+                seed=self.data_config.split_seed,
+            ),
         )

@@ -157,6 +157,7 @@ class DPODataModule(ChatTemplateDataModule):
         tools_column = self.data_config.tools_column
         system_prompt = self.system_prompt
         add_system_ratio = self.data_config.add_system_ratio
+        split_seed = self.data_config.split_seed
         split_messages_for_dpo = DPODataModule._split_messages_for_dpo
 
         def tokenize_messages(messages: list[dict[str, Any]]) -> list[int]:
@@ -179,13 +180,20 @@ class DPODataModule(ChatTemplateDataModule):
             samples = iter_batch_samples(batch)
             for raw_sample in samples:
                 tools = raw_sample.get(tools_column)
+                chosen_content = raw_sample[chosen_column]
+                rejected_content = raw_sample[rejected_column]
                 # Resolve the system prompt once per row so both sides stay identical.
-                row_system_prompt = sample_system_prompt(system_prompt, add_system_ratio)
+                row_system_prompt = sample_system_prompt(
+                    system_prompt,
+                    add_system_ratio,
+                    (chosen_content, rejected_content),
+                    seed=split_seed,
+                )
                 chosen_messages, _ = preprocess_chat_messages(
-                    raw_sample[chosen_column], tools=tools, system_prompt=row_system_prompt
+                    chosen_content, tools=tools, system_prompt=row_system_prompt
                 )
                 rejected_messages, _ = preprocess_chat_messages(
-                    raw_sample[rejected_column], tools=tools, system_prompt=row_system_prompt
+                    rejected_content, tools=tools, system_prompt=row_system_prompt
                 )
                 prompt_messages, chosen_completion = split_messages_for_dpo(chosen_messages)
                 _, rejected_completion = split_messages_for_dpo(rejected_messages)
