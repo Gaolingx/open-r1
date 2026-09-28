@@ -5,8 +5,15 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from lightning_grpo.models.grpo.loss import masked_mean
+
+
+def _missing_reward_to_zero(values: torch.Tensor) -> torch.Tensor:
+    """Map missing (NaN) reward entries to 0."""
+
+    return torch.nan_to_num(values, nan=0.0)
 
 
 class GRPOMetricsAggregator:
@@ -16,14 +23,32 @@ class GRPOMetricsAggregator:
         self.module = module
 
     def gather_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """All-gather ``tensor`` across ranks, tolerating per-rank shape differences."""
+
         trainer = self.module.trainer
         if trainer is None or getattr(trainer, "world_size", 1) <= 1:
             return tensor
 
-        gathered = self.module.all_gather(tensor)
         if tensor.dim() == 0:
-            return gathered.reshape(-1)
-        return gathered.reshape(-1, *tensor.shape[1:])
+            return self.module.all_gather(tensor).reshape(-1)
+
+        local_size = torch.tensor(tensor.shape, dtype=torch.long, device=tensor.device)
+        gathered_sizes = self.module.all_gather(local_size).reshape(-1, tensor.dim())
+        max_size = gathered_sizes.max(dim=0).values.tolist()
+
+        gathered = self.module.all_gather(self._pad_to_shape(tensor, max_size))
+        return gathered.reshape(-1, *max_size[1:])
+
+    @staticmethod
+    def _pad_to_shape(tensor: torch.Tensor, shape: list[int]) -> torch.Tensor:
+        """Right-pad ``tensor`` with zeros up to ``shape`` (no-op when it already matches)."""
+
+        padding: list[int] = []
+        for size, target in zip(reversed(tensor.shape), reversed(shape)):
+            padding.extend((0, target - size))
+        if not any(padding):
+            return tensor
+        return F.pad(tensor, padding)
 
     def build_training_metrics(
         self,
@@ -71,33 +96,44 @@ class GRPOMetricsAggregator:
             "cispo_clip_ratio": masked_mean(global_is_cispo_clipped, global_loss_mask),
         }
         for index, reward_name in enumerate(reward_names):
-            metrics[f"reward/{reward_name}"] = global_rewards_per_func[:, index].mean()
-            metrics[f"reward_std/{reward_name}"] = global_rewards_per_func[:, index].std(unbiased=False)
+            # A missing reward is NaN for that (sample, function) pair; scoring it as 0 here
+            # matches the ``nansum`` used for the total reward above.
+            per_func = _missing_reward_to_zero(global_rewards_per_func[:, index])
+            metrics[f"reward/{reward_name}"] = per_func.mean()
+            metrics[f"reward_std/{reward_name}"] = per_func.std(unbiased=False)
         return metrics
 
     def log_metrics(self, prefix: str, loss: torch.Tensor, metrics: dict[str, torch.Tensor], *, on_step: bool, on_epoch: bool) -> None:
+        """Log the loss plus the already-aggregated metrics."""
+
         module = self.module
         module.log(f"{prefix}/loss", loss, prog_bar=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/reward", metrics["reward"], prog_bar=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/reward_std", metrics["reward_std"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/frac_reward_zero_std", metrics["frac_reward_zero_std"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/advantage_mean", metrics["advantage_mean"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/advantage_std", metrics["advantage_std"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/kl", metrics["kl"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/entropy", metrics["entropy"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/completions/mean_length", metrics["completion_length"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/completions/min_length", metrics["completion_length_min"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/completions/max_length", metrics["completion_length_max"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/completions/clipped_ratio", metrics["completion_clipped_ratio"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/completions/mean_terminated_length", metrics["terminated_length_mean"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/completions/min_terminated_length", metrics["terminated_length_min"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/completions/max_terminated_length", metrics["terminated_length_max"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        module.log(f"{prefix}/reward", metrics["reward"], prog_bar=True, on_step=on_step, on_epoch=on_epoch, sync_dist=False)
+
+        # Bulk-log the remaining metrics through a single call to minimize logger overhead.
+        logged: dict[str, torch.Tensor] = {
+            f"{prefix}/reward_std": metrics["reward_std"],
+            f"{prefix}/frac_reward_zero_std": metrics["frac_reward_zero_std"],
+            f"{prefix}/advantage_mean": metrics["advantage_mean"],
+            f"{prefix}/advantage_std": metrics["advantage_std"],
+            f"{prefix}/kl": metrics["kl"],
+            f"{prefix}/entropy": metrics["entropy"],
+            f"{prefix}/completions/mean_length": metrics["completion_length"],
+            f"{prefix}/completions/min_length": metrics["completion_length_min"],
+            f"{prefix}/completions/max_length": metrics["completion_length_max"],
+            f"{prefix}/completions/clipped_ratio": metrics["completion_clipped_ratio"],
+            f"{prefix}/completions/mean_terminated_length": metrics["terminated_length_mean"],
+            f"{prefix}/completions/min_terminated_length": metrics["terminated_length_min"],
+            f"{prefix}/completions/max_terminated_length": metrics["terminated_length_max"],
+        }
         if module.config.rollout.loss_type == "cispo":
-            module.log(f"{prefix}/cispo_clip_ratio", metrics["cispo_clip_ratio"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+            logged[f"{prefix}/cispo_clip_ratio"] = metrics["cispo_clip_ratio"]
         else:
-            module.log(f"{prefix}/clip_ratio/low", metrics["clip_ratio_low"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-            module.log(f"{prefix}/clip_ratio/high", metrics["clip_ratio_high"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-            module.log(f"{prefix}/clip_ratio/region", metrics["clip_ratio_region"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+            logged[f"{prefix}/clip_ratio/low"] = metrics["clip_ratio_low"]
+            logged[f"{prefix}/clip_ratio/high"] = metrics["clip_ratio_high"]
+            logged[f"{prefix}/clip_ratio/region"] = metrics["clip_ratio_region"]
         for reward_name in module.config.reward.reward_funcs:
-            module.log(f"{prefix}/rewards/{reward_name}/mean", metrics[f"reward/{reward_name}"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-            module.log(f"{prefix}/rewards/{reward_name}/std", metrics[f"reward_std/{reward_name}"], on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+            logged[f"{prefix}/rewards/{reward_name}/mean"] = metrics[f"reward/{reward_name}"]
+            logged[f"{prefix}/rewards/{reward_name}/std"] = metrics[f"reward_std/{reward_name}"]
+
+        module.log_dict(logged, on_step=on_step, on_epoch=on_epoch, sync_dist=False)

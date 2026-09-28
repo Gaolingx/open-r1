@@ -31,11 +31,51 @@ def approx_kl_divergence(log_probs: torch.Tensor, ref_log_probs: torch.Tensor) -
     return torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1.0
 
 
-def selective_log_softmax(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
-    """Gather token log-probabilities for target ids."""
+def selective_log_softmax(logits: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """
+    A memory-efficient implementation of the common `log_softmax -> gather` operation.
 
-    log_probs = torch.log_softmax(logits, dim=-1)
-    return torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+    This function is equivalent to the following naive implementation:
+    ```python
+    # for index with shape (...):
+    logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+    # for index with shape (..., K):
+    logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index)
+    ```
+
+    Args:
+        logits (`torch.Tensor`):
+            Logits tensor of shape `(..., num_classes)`.
+        index (`torch.Tensor`):
+            Index tensor of shape `(..., K)` or `(...)`, specifying the positions to gather from the log-softmax
+            output. When the last case is used, `K` log-probabilities are gathered per position (e.g. for top-K)
+
+    Returns:
+        `torch.Tensor`:
+            Gathered log probabilities with the same shape as `index`.
+    """
+    squeeze = index.ndim == logits.ndim - 1
+    if squeeze:
+        index = index.unsqueeze(-1)
+
+    if logits.dtype in [torch.float32, torch.float64]:
+        selected_logits = torch.gather(logits, dim=-1, index=index)
+        # loop to reduce peak mem consumption
+        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+        per_token_logps = selected_logits - logsumexp_values.unsqueeze(-1)  # log_softmax(x_i) = x_i - logsumexp(x)
+    else:
+        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
+        per_token_logps = []
+        for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
+            row_logps = F.log_softmax(row_logits, dim=-1)
+            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels)
+            per_token_logps.append(row_per_token_logps)
+        per_token_logps = torch.stack(per_token_logps)
+
+    if squeeze:
+        per_token_logps = per_token_logps.squeeze(-1)
+
+    return per_token_logps
 
 
 def tensor_parallel_loss_context(enabled: bool) -> Any:
@@ -152,53 +192,6 @@ def compute_standard_cross_entropy_loss(
     metrics = {"lm_loss": ce_loss.detach(), "_policy_outputs": outputs}
 
     return loss, metrics
-
-
-def selective_log_softmax(logits, index) -> torch.Tensor:
-    """
-    A memory-efficient implementation of the common `log_softmax -> gather` operation.
-
-    This function is equivalent to the following naive implementation:
-    ```python
-    # for index with shape (...):
-    logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
-    # for index with shape (..., K):
-    logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index)
-    ```
-
-    Args:
-        logits (`torch.Tensor`):
-            Logits tensor of shape `(..., num_classes)`.
-        index (`torch.Tensor`):
-            Index tensor of shape `(..., K)` or `(...)`, specifying the positions to gather from the log-softmax
-            output. When the last case is used, `K` log-probabilities are gathered per position (e.g. for top-K)
-
-    Returns:
-        `torch.Tensor`:
-            Gathered log probabilities with the same shape as `index`.
-    """
-    squeeze = index.ndim == logits.ndim - 1
-    if squeeze:
-        index = index.unsqueeze(-1)
-
-    if logits.dtype in [torch.float32, torch.float64]:
-        selected_logits = torch.gather(logits, dim=-1, index=index)
-        # loop to reduce peak mem consumption
-        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
-        per_token_logps = selected_logits - logsumexp_values.unsqueeze(-1)  # log_softmax(x_i) = x_i - logsumexp(x)
-    else:
-        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
-        per_token_logps = []
-        for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
-            row_logps = F.log_softmax(row_logits, dim=-1)
-            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels)
-            per_token_logps.append(row_per_token_logps)
-        per_token_logps = torch.stack(per_token_logps)
-
-    if squeeze:
-        per_token_logps = per_token_logps.squeeze(-1)
-
-    return per_token_logps
 
 
 def dft_loss(outputs, labels, num_items_in_batch=None):

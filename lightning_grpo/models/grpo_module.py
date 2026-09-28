@@ -44,9 +44,9 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         self.tokenizer = load_tokenizer(config.model)
         self.reference_model = self._build_reference_model()
         self.setup_tool_calling()
-        self.rollout_coordinator = LocalGenerateRolloutCoordinator(self)
         self.metrics_aggregator = GRPOMetricsAggregator(self)
-        self.reward_manager = GRPORewardManager(config, self.tokenizer, device=self.device)
+        self.rollout_coordinator: LocalGenerateRolloutCoordinator | None = None
+        self.reward_manager: GRPORewardManager | None = None
         self._liger_loss_computer: LigerGRPOLossComputer | None = None
         self._standard_loss_computer: StandardGRPOLossComputer | None = None
 
@@ -75,10 +75,13 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         configure_tensor_parallel(self.policy, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.policy, self.config.distributed, self.config.precision, self.device_mesh)
         self.policy = compile_model_if_configured(self.policy, self.config.model)
+        self.rollout_coordinator = LocalGenerateRolloutCoordinator(self)
         self.rollout_coordinator.update_policy()
         if self.reference_model is not None:
             configure_tensor_parallel(self.reference_model, self.config.distributed, self.device_mesh)
             configure_fully_shard(self.reference_model, self.config.distributed, self.config.precision, self.device_mesh)
+
+        self.reward_manager = GRPORewardManager(self.config, self.tokenizer, device=self.device)
 
         if self.config.liger_kernel.liger_grpo_enabled():
             self._liger_loss_computer = LigerGRPOLossComputer(
@@ -107,7 +110,6 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         if self.tool_executor is not None:
             rollout_batch = self._run_tool_calling(rollout_batch)
 
-        self.reward_manager.device = self.device
         if self.config.liger_kernel.liger_grpo_enabled():
             if self._liger_loss_computer is None:
                 raise RuntimeError("GRPO loss computer is not initialized. Call configure_model() first.")
@@ -143,9 +145,16 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
 
         return self._shared_step(batch, "train")
 
-    def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
-        """Refresh external rollout-engine weights after optimizer updates."""
+    def optimizer_step(
+        self,
+        epoch: int,
+        batch_idx: int,
+        optimizer: torch.optim.Optimizer,
+        optimizer_closure: Any | None = None,
+    ) -> None:
+        """Refresh the rollout-engine weights right after every policy update."""
 
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure=optimizer_closure)
         if self.config.rollout.engine == "vllm":
             self.rollout_coordinator.update_policy()
 
@@ -168,6 +177,6 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         self.shutdown_tool_calling()
 
         export_dir = self.config.output_dir + "/hf_final"
-        exported_paths = export_configured_model(self.model, self.config.model, export_dir, tokenizer=self.tokenizer)
+        exported_paths = export_configured_model(self.policy, self.config.model, export_dir, tokenizer=self.tokenizer)
         if exported_paths:
             self.print(f"Exported model artifacts to: {', '.join(sorted(str(p) for p in exported_paths.values()))}")

@@ -75,10 +75,15 @@ class LocalGenerateRolloutCoordinator:
             tokenizer.padding_side = old_padding_side
         return {key: value.to(self.module.device) for key, value in encoded.items()}
 
-    def _generate(self, prompts: list[str], *, num_generations: int = 1) -> RolloutResult:
-        """Generate completions with the configured rollout engine."""
+    def _generate(self, prompts: list[str], *, num_generations: int = 1, encoded: dict[str, torch.Tensor] | None = None) -> RolloutResult:
+        """Generate completions with the configured rollout engine.
 
-        encoded = self._tokenize_prompts(prompts)
+        ``encoded`` lets callers pass an existing tokenization of ``prompts`` so the same
+        prompt text is not tokenized once for generation and again when packing the batch.
+        """
+
+        if encoded is None:
+            encoded = self._tokenize_prompts(prompts)
         return self.rollout_engine.generate(
             prompt_ids=encoded["input_ids"],
             attention_mask=encoded["attention_mask"],
@@ -148,7 +153,9 @@ class LocalGenerateRolloutCoordinator:
 
         prompts = list(batch["prompt_text"])
         expanded_prompts = [prompt for prompt in prompts for _ in range(num_generations)]
-        result = self._generate(prompts, num_generations=num_generations)
+        # Tokenize the prompt batch exactly once: generation and packing share the encoding.
+        prompt_encoded = self._tokenize_prompts(prompts)
+        result = self._generate(prompts, num_generations=num_generations, encoded=prompt_encoded)
         completion_ids = result.completion_ids
         completion_mask = result.completion_mask
         completions = result.completions_text
@@ -167,6 +174,7 @@ class LocalGenerateRolloutCoordinator:
             metadata,
             num_generations=num_generations,
             old_per_token_logps=old_per_token_logps,
+            prompt_encoded=prompt_encoded,
         )
 
     def _pack_rollout(
@@ -178,13 +186,17 @@ class LocalGenerateRolloutCoordinator:
         metadata: list[dict[str, Any]],
         num_generations: int,
         old_per_token_logps: torch.Tensor | None = None,
+        prompt_encoded: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, Any]:
         """Pack generated samples into tensors consumed by the GRPO loss."""
 
         tokenizer = self.module.tokenizer
-        prompt_encoded = self._tokenize_prompts(prompts)
-        prompt_ids = prompt_encoded["input_ids"]
-        prompt_mask = prompt_encoded["attention_mask"]
+        # ``prompts`` holds one entry per completion; the base encoding covers one entry per
+        # prompt, so expand it to match ``completion_ids`` instead of tokenizing again.
+        if prompt_encoded is None:
+            prompt_encoded = self._tokenize_prompts(prompts[::num_generations])
+        prompt_ids = prompt_encoded["input_ids"].repeat_interleave(num_generations, dim=0)
+        prompt_mask = prompt_encoded["attention_mask"].repeat_interleave(num_generations, dim=0)
         completion_budget = self.module.config.rollout.max_total_length - prompt_ids.size(1)
         if completion_budget <= 0:
             raise RuntimeError(
