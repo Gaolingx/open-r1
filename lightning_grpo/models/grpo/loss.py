@@ -504,7 +504,6 @@ def compute_standard_grpo_loss(
     loss_type: str = "bnpo",
     temperature: float = 1.0,
     max_completion_length: int | None = None,
-    loss_parallel_enabled: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute a plain PyTorch GRPO loss without the Liger fused kernel."""
 
@@ -592,11 +591,18 @@ class StandardGRPOLossComputer:
         loss_parallel_enabled: bool = False,
     ) -> None:
 
+        if loss_parallel_enabled:
+            raise RuntimeError(
+                "Standard GRPO loss is incompatible with Tensor Parallel loss parallelism "
+                "(distributed.tensor_parallel.loss_parallel=True). Disable loss parallelism to "
+                "use this path; otherwise vocab-sharded logits would be silently replicated "
+                "per rank, risking OOM."
+            )
+
         self.module = module
         self.reward_manager = reward_manager
         self.metrics_aggregator = metrics_aggregator
         self.rollout_temperature = rollout_temperature
-        self.loss_parallel_enabled = loss_parallel_enabled
 
     def compute_advantages(self, rewards: torch.Tensor, num_generations: int) -> torch.Tensor:
         return compute_grpo_advantages(
@@ -686,12 +692,11 @@ class StandardGRPOLossComputer:
             loss_type=loss_type,
             temperature=self.rollout_temperature,
             max_completion_length=config.rollout.max_completion_length,
-            loss_parallel_enabled=self.loss_parallel_enabled,
         )
 
         metrics = build_standard_grpo_training_metrics(
             self.metrics_aggregator,
-            rewards_per_func=rewards_per_func,
+            global_rewards_per_func=global_rewards_per_func,
             reward_weights=reward_weights,
             num_generations=num_generations,
             local_metrics={**local_metrics, "completion_truncated": completion_truncated.to(torch.float32)},
@@ -705,7 +710,7 @@ class StandardGRPOLossComputer:
 def build_standard_grpo_training_metrics(
     metrics_aggregator: Any,
     *,
-    rewards_per_func: torch.Tensor,
+    global_rewards_per_func: torch.Tensor,
     reward_weights: torch.Tensor,
     num_generations: int,
     local_metrics: dict[str, torch.Tensor],
@@ -714,7 +719,6 @@ def build_standard_grpo_training_metrics(
 ) -> dict[str, torch.Tensor]:
     """Gather local standard-GRPO diagnostics and build the logged metrics dict."""
 
-    global_rewards_per_func = metrics_aggregator.gather_tensor(rewards_per_func.detach())
     global_loss_mask = metrics_aggregator.gather_tensor(local_metrics["loss_mask"].detach())
     global_per_token_kl = metrics_aggregator.gather_tensor(local_metrics["per_token_kl"].detach())
     global_entropy = metrics_aggregator.gather_tensor(local_metrics["entropy"].detach())

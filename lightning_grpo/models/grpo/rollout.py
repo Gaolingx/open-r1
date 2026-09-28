@@ -175,6 +175,7 @@ class LocalGenerateRolloutCoordinator:
             num_generations=num_generations,
             old_per_token_logps=old_per_token_logps,
             prompt_encoded=prompt_encoded,
+            engine_completion_truncated=result.completion_truncated,
         )
 
     def _pack_rollout(
@@ -187,6 +188,7 @@ class LocalGenerateRolloutCoordinator:
         num_generations: int,
         old_per_token_logps: torch.Tensor | None = None,
         prompt_encoded: dict[str, torch.Tensor] | None = None,
+        engine_completion_truncated: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Pack generated samples into tensors consumed by the GRPO loss."""
 
@@ -209,6 +211,7 @@ class LocalGenerateRolloutCoordinator:
             completion_ids = completion_ids.new_full((completion_ids.size(0), 1), fallback_token_id)
             completion_mask = completion_mask.new_ones((completion_mask.size(0), 1))
             max_completion = 1
+        pre_crop_lengths = completion_mask.sum(dim=1)
         completion_ids = completion_ids[:, :max_completion]
         completion_mask = completion_mask[:, :max_completion]
         if old_per_token_logps is not None:
@@ -216,7 +219,11 @@ class LocalGenerateRolloutCoordinator:
         else:
             with torch.no_grad():
                 old_logps = compute_per_token_logps(self.module, prompt_ids, prompt_mask, completion_ids, completion_mask, self.module.config.rollout.temperature)
-        completion_truncated = (completion_mask.sum(dim=1) >= max_completion).to(torch.long)
+        if engine_completion_truncated is not None:
+            engine_truncated = engine_completion_truncated.to(device=completion_ids.device, dtype=torch.bool)
+            completion_truncated = (engine_truncated | (pre_crop_lengths > max_completion)).to(torch.long)
+        else:
+            completion_truncated = (pre_crop_lengths >= max_completion).to(torch.long)
         sample_ids = torch.arange(completion_ids.size(0), device=self.module.device) // num_generations
 
         return {

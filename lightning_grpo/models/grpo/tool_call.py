@@ -12,6 +12,7 @@ import copy
 from typing import Any
 
 import asyncio
+import atexit
 import importlib
 import inspect
 import threading
@@ -131,8 +132,6 @@ class GRPOToolCallMixin:
         if not self._sync_tools and not self._async_tools:
             raise ValueError("rollout.tool_calling.enabled=True requires at least one callable in rollout.tool_calling.tools.")
 
-        if self._async_tools:
-            self._start_tool_async_loop()
         self.tool_executor = self
 
     def _start_tool_async_loop(self) -> None:
@@ -150,6 +149,8 @@ class GRPOToolCallMixin:
         thread.start()
         self._async_loop = loop
         self._async_thread = thread
+
+        atexit.register(self.shutdown_tool_calling)
 
     @property
     def async_loop(self) -> asyncio.AbstractEventLoop:
