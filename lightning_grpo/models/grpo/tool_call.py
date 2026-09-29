@@ -19,7 +19,7 @@ import threading
 
 import torch
 
-from lightning_grpo.utils.chat_template.chat_template_utils import (
+from trl.chat_template_utils import (
     add_response_schema,
     get_training_chat_template,
     is_chat_template_prefix_preserving,
