@@ -75,11 +75,20 @@ class LocalGenerateRolloutCoordinator:
             tokenizer.padding_side = old_padding_side
         return {key: value.to(self.module.device) for key, value in encoded.items()}
 
-    def _generate(self, prompts: list[str], *, num_generations: int = 1, encoded: dict[str, torch.Tensor] | None = None) -> RolloutResult:
+    def _generate(
+        self,
+        prompts: list[str],
+        *,
+        num_generations: int = 1,
+        encoded: dict[str, torch.Tensor] | None = None,
+        greedy: bool = False,
+        temperature: float | None = None,
+    ) -> RolloutResult:
         """Generate completions with the configured rollout engine.
 
         ``encoded`` lets callers pass an existing tokenization of ``prompts`` so the same
         prompt text is not tokenized once for generation and again when packing the batch.
+        ``greedy`` (and an explicit ``temperature``) are used for the ReMax reward baseline.
         """
 
         if encoded is None:
@@ -89,8 +98,9 @@ class LocalGenerateRolloutCoordinator:
             attention_mask=encoded["attention_mask"],
             num_generations=num_generations,
             max_new_tokens=self.module.config.rollout.max_completion_length,
-            temperature=self.module.config.rollout.temperature,
+            temperature=self.module.config.rollout.temperature if temperature is None else temperature,
             top_p=self.module.config.rollout.top_p,
+            greedy=greedy,
         )
 
     @torch.no_grad()
@@ -99,6 +109,62 @@ class LocalGenerateRolloutCoordinator:
 
         result = self._generate(prompts, num_generations=1)
         return result.completion_ids, result.completion_mask, result.completions_text
+
+    def remax_baseline_enabled(self) -> bool:
+        """Whether the configured advantage estimator needs a greedy baseline rollout."""
+
+        return str(self.module.config.rollout.advantage_estimator) == "remax"
+
+    def _remax_baseline_rollout(
+        self,
+        prompts: list[str],
+        batch_metadata: list[dict[str, Any]],
+        num_generations: int,
+        prompt_encoded: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, Any]:
+        """Greedy completions used as the ReMax reward baseline.
+
+        ReMax subtracts the reward of a greedily decoded completion from the sampled
+        rewards, so the baseline must come from the same policy at the same optimizer step.
+        ``rollout.remax_baseline_temperature`` selects greedy decoding (0) or a cold sample,
+        and the per-completion entries are expanded to match the sampled rollout order so
+        the loss can consume them positionally.
+        """
+
+        baseline_temperature = float(self.module.config.rollout.remax_baseline_temperature)
+        greedy = baseline_temperature <= 0.0
+        result = self._generate(
+            prompts,
+            num_generations=1,
+            encoded=prompt_encoded,
+            greedy=greedy,
+            temperature=None if greedy else baseline_temperature,
+        )
+        baseline_completions = list(result.completions_text)
+        if len(baseline_completions) != len(prompts):
+            raise RuntimeError(
+                f"ReMax baseline rollout returned {len(baseline_completions)} completions for "
+                f"{len(prompts)} prompts."
+            )
+        baseline_id_lists = list(result.completion_id_lists)
+
+        completions: list[str] = []
+        completion_id_lists: list[list[int]] = []
+        metadata: list[dict[str, Any]] = []
+        for index, completion in enumerate(baseline_completions):
+            base_metadata = batch_metadata[index] if index < len(batch_metadata) else {}
+            baseline_ids = list(baseline_id_lists[index]) if index < len(baseline_id_lists) else []
+            for _ in range(num_generations):
+                completions.append(completion)
+                completion_id_lists.append(baseline_ids)
+                metadata.append(
+                    self._metadata_for_generation(base_metadata, completion, [completion], unfinished=False)
+                )
+        return {
+            "baseline_completions": completions,
+            "baseline_completion_id_lists": completion_id_lists,
+            "baseline_metadata": metadata,
+        }
 
     def _batch_metadata(self, batch: dict[str, list[Any]]) -> list[dict[str, Any]]:
         """Return per-sample metadata dictionaries from the collated batch."""
@@ -166,6 +232,9 @@ class LocalGenerateRolloutCoordinator:
             sample_index = index // num_generations
             base_metadata = batch_metadata[sample_index] if sample_index < len(batch_metadata) else {}
             metadata.append(self._metadata_for_generation(base_metadata, completion, [completion], unfinished=False))
+        baseline = None
+        if self.remax_baseline_enabled():
+            baseline = self._remax_baseline_rollout(prompts, batch_metadata, num_generations, prompt_encoded)
         return self._pack_rollout(
             expanded_prompts,
             completion_ids,
@@ -176,6 +245,7 @@ class LocalGenerateRolloutCoordinator:
             old_per_token_logps=old_per_token_logps,
             prompt_encoded=prompt_encoded,
             engine_completion_truncated=result.completion_truncated,
+            baseline=baseline,
         )
 
     def _pack_rollout(
@@ -189,6 +259,7 @@ class LocalGenerateRolloutCoordinator:
         old_per_token_logps: torch.Tensor | None = None,
         prompt_encoded: dict[str, torch.Tensor] | None = None,
         engine_completion_truncated: torch.Tensor | None = None,
+        baseline: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Pack generated samples into tensors consumed by the GRPO loss."""
 
@@ -226,7 +297,7 @@ class LocalGenerateRolloutCoordinator:
             completion_truncated = (pre_crop_lengths >= max_completion).to(torch.long)
         sample_ids = torch.arange(completion_ids.size(0), device=self.module.device) // num_generations
 
-        return {
+        packed = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
@@ -239,6 +310,9 @@ class LocalGenerateRolloutCoordinator:
             "completion_id_lists": [row[row != tokenizer.pad_token_id].tolist() for row in completion_ids.detach().cpu()],
             "metadata": metadata,
         }
+        if baseline is not None:
+            packed.update(baseline)
+        return packed
 
     def rollout(self, batch: dict[str, list[Any]], *, training: bool) -> dict[str, Any]:
         num_generations = self.resolve_num_generations(training)

@@ -77,7 +77,15 @@ class VLLMConfig:
 
 @dataclass
 class GRPORolloutConfig:
-    """Rollout and policy-gradient hyperparameters for GRPO."""
+    """Rollout and policy-gradient hyperparameters for GRPO.
+
+    ``loss_type`` selects an *algorithm preset*: it pins the policy objective
+    (see :data:`lightning_grpo.models.grpo.loss.GRPO_ALGORITHM_PRESETS`), the
+    default advantage estimator and the default loss aggregation mode in one
+    go. Setting ``advantage_estimator`` / ``loss_agg_mode`` explicitly overrides
+    the preset defaults, which makes it possible to mix e.g. the DAPO objective
+    with RLOO advantages.
+    """
 
     engine: Literal["torch", "vllm"] = "torch"
     vllm: VLLMConfig = field(default_factory=VLLMConfig)
@@ -90,13 +98,75 @@ class GRPORolloutConfig:
     temperature: float = 0.8
     top_p: float = 1.0
     kl_beta: float = 0.1
-    loss_type: Literal["grpo", "bnpo", "cispo"] = "cispo"
-    epsilon: float = 0.2
-    epsilon_high: float = 5.0
-    advantage_epsilon: float = 1.0e-4
     use_reference_model: bool = True
     debug_samples: bool = False
     debug_every_n_steps: int = 20
+
+    # --- Algorithm selection -------------------------------------------------
+    loss_type: Literal[
+        "grpo",
+        "dapo",
+        "dr_grpo",
+        "cispo",
+        "gspo",
+        "sapo",
+        "geo_mean",
+        "dro",
+        "clip_cov",
+        "kl_cov",
+        "dppo_tv",
+        "dppo_kl",
+        "gpg",
+        "reinforce",
+    ] = "cispo"
+    # ``bnpo`` was a straight alias of ``grpo`` and is kept only for backwards
+    # compatible configs; it resolves to the ``grpo`` preset with a warning.
+    advantage_estimator: Optional[str] = None
+    loss_agg_mode: Optional[str] = None
+
+    # --- Importance-ratio clipping ------------------------------------------
+    epsilon: float = 0.2
+    # ``None`` means "use the preset default": ``epsilon`` for symmetric PPO-style
+    # clipping, 0.28 for DAPO ("clip-higher") and 5.0 for CISPO (which historically
+    # only clipped the upper side).
+    epsilon_high: Optional[float] = None
+    # Lower bound of the ratio for dual-clip PPO (https://arxiv.org/pdf/1912.09729).
+    clip_ratio_c: float = 3.0
+    # ``False`` turns the GRPO advantage into the Dr.GRPO advantage (no std scaling).
+    # ``None`` means "use the preset default": ``True`` everywhere except
+    # ``dr_grpo``, whose whole point is the unscaled advantage.
+    norm_adv_by_std_in_grpo: Optional[bool] = None
+    advantage_epsilon: float = 1.0e-4
+    # Discount factor used by the REINFORCE++ advantage estimators.
+    gamma: float = 1.0
+    # DAPO dynamic sampling, "light": zero out the loss mask of prompt groups whose
+    # rewards are all identical (zero advantage, zero gradient) instead of resampling.
+    drop_zero_advantage_groups: bool = False
+
+    # --- DAPO overlong reward shaping ---------------------------------------
+    # When ``overlong_buffer_len > 0`` a linear length penalty is added to the
+    # reward of completions whose length exceeds
+    # ``max_completion_length - overlong_buffer_len``. It is only applied to
+    # samples with a non-positive total reward, mirroring DAPO's intent of not
+    # punishing correct-but-long answers.
+    overlong_buffer_len: int = 0
+    overlong_penalty_factor: float = 1.0
+
+    # --- Policy-loss specific knobs ----------------------------------------
+    dro_beta: float = 0.1
+    sapo_tau_pos: float = 1.0
+    sapo_tau_neg: float = 1.0
+    clip_cov_ratio: float = 2.0e-4
+    clip_cov_lb: float = 1.0
+    clip_cov_ub: float = 5.0
+    kl_cov_ratio: float = 2.0e-4
+    ppo_kl_coef: float = 1.0
+    gpg_alpha: float = 1.0
+
+    # --- ReMax --------------------------------------------------------------
+    # Temperature used for the greedy baseline rollout. 0.0 requests greedy
+    # decoding; raise it slightly for engines that reject a zero temperature.
+    remax_baseline_temperature: float = 0.0
 
 
 @dataclass

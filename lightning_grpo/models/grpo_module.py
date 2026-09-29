@@ -17,8 +17,7 @@ from lightning_grpo.models.common import (
     load_tokenizer,
 )
 from lightning_grpo.models.grpo.rollout import LocalGenerateRolloutCoordinator
-from lightning_grpo.models.grpo.loss import StandardGRPOLossComputer
-from lightning_grpo.models.grpo.liger_loss import LigerGRPOLossComputer
+from lightning_grpo.models.grpo.loss import GRPOLossComputer, create_grpo_loss_computer
 from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
 from lightning_grpo.models.grpo.tool_call import GRPOToolCallMixin
@@ -47,8 +46,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         self.metrics_aggregator = GRPOMetricsAggregator(self)
         self.rollout_coordinator: LocalGenerateRolloutCoordinator | None = None
         self.reward_manager: GRPORewardManager | None = None
-        self._liger_loss_computer: LigerGRPOLossComputer | None = None
-        self._standard_loss_computer: StandardGRPOLossComputer | None = None
+        self.loss_computer: GRPOLossComputer | None = None
 
     def _build_reference_model(self) -> torch.nn.Module | None:
         """Create the frozen reference model used for KL regularization."""
@@ -83,23 +81,17 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
 
         self.reward_manager = GRPORewardManager(self.config, self.tokenizer, device=self.device)
 
-        if self.config.liger_kernel.liger_grpo_enabled():
-            self._liger_loss_computer = LigerGRPOLossComputer(
-                self,
-                self.reward_manager,
-                self.metrics_aggregator,
-                rollout_temperature=self.config.rollout.temperature,
-                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
-                compiled=self.config.liger_kernel.compiled,
-            )
-        else:
-            self._standard_loss_computer = StandardGRPOLossComputer(
-                self,
-                self.reward_manager,
-                self.metrics_aggregator,
-                rollout_temperature=self.config.rollout.temperature,
-                loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
-            )
+        # ``create_grpo_loss_computer`` honours the Liger request only when the kernel
+        # implements the selected loss; otherwise it warns and uses the standard path.
+        self.loss_computer = create_grpo_loss_computer(
+            self,
+            self.reward_manager,
+            self.metrics_aggregator,
+            use_liger_kernel=self.config.liger_kernel.liger_grpo_enabled(),
+            rollout_temperature=self.config.rollout.temperature,
+            loss_parallel_enabled=self.config.distributed.tensor_parallel.loss_parallel,
+            compiled=self.config.liger_kernel.compiled,
+        )
 
     def _shared_step(self, batch: dict[str, list[Any]], stage: str) -> torch.Tensor:
         """Generate rollouts, compute GRPO loss, and log metrics."""
@@ -110,14 +102,9 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         if self.tool_executor is not None:
             rollout_batch = self._run_tool_calling(rollout_batch)
 
-        if self.config.liger_kernel.liger_grpo_enabled():
-            if self._liger_loss_computer is None:
-                raise RuntimeError("GRPO loss computer is not initialized. Call configure_model() first.")
-            loss, metrics = self._liger_loss_computer.compute_loss(rollout_batch, training=stage == "train")
-        else:
-            if self._standard_loss_computer is None:
-                raise RuntimeError("Standard GRPO loss computer is not initialized. Call configure_model() first.")
-            loss, metrics = self._standard_loss_computer.compute_loss(rollout_batch, training=stage == "train")
+        if self.loss_computer is None:
+            raise RuntimeError("GRPO loss computer is not initialized. Call configure_model() first.")
+        loss, metrics = self.loss_computer.compute_loss(rollout_batch, training=stage == "train")
         self.metrics_aggregator.log_metrics(stage, loss, metrics, on_step=stage == "train", on_epoch=True)
 
         if self.config.rollout.debug_samples and self.trainer.is_global_zero:

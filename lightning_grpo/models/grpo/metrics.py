@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from lightning_grpo.models.grpo.loss import masked_mean
+from lightning_grpo.models.grpo.loss import masked_mean, resolve_grpo_algorithm
 
 
 def _missing_reward_to_zero(values: torch.Tensor) -> torch.Tensor:
@@ -67,8 +67,16 @@ class GRPOMetricsAggregator:
         global_is_cispo_clipped: torch.Tensor,
         global_advantages: torch.Tensor,
         reward_names: list[str],
+        global_shaped_rewards: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        global_rewards = (global_rewards_per_func * reward_weights.to(global_rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
+        # ``global_shaped_rewards`` carries reward-shaping terms that are not part of any
+        # individual reward function (e.g. DAPO's overlong length penalty), so the loss
+        # and the logged reward agree.
+        if global_shaped_rewards is None:
+            global_shaped_rewards = (
+                global_rewards_per_func * reward_weights.to(global_rewards_per_func.device).unsqueeze(0)
+            ).nansum(dim=-1)
+        global_rewards = global_shaped_rewards
         global_reward_group_std = global_rewards.view(-1, num_generations).std(dim=1)
 
         terminated_lengths = global_completion_lengths[global_completion_truncated == 0]
@@ -126,7 +134,7 @@ class GRPOMetricsAggregator:
             f"{prefix}/completions/min_terminated_length": metrics["terminated_length_min"],
             f"{prefix}/completions/max_terminated_length": metrics["terminated_length_max"],
         }
-        if module.config.rollout.loss_type == "cispo":
+        if resolve_grpo_algorithm(module.config.rollout).preset.clip_reporting == "cispo":
             logged[f"{prefix}/cispo_clip_ratio"] = metrics["cispo_clip_ratio"]
         else:
             logged[f"{prefix}/clip_ratio/low"] = metrics["clip_ratio_low"]

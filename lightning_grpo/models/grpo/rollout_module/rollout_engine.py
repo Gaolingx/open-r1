@@ -33,7 +33,7 @@ class TorchRolloutEngine(RolloutEngine):
         self.device = device
         self.autocast_ctx = autocast_ctx
 
-    def generate(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8, top_p: float = 1.0) -> RolloutResult:
+    def generate(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8, top_p: float = 1.0, *, greedy: bool = False) -> RolloutResult:
         model = self.policy_model.module if isinstance(self.policy_model, DistributedDataParallel) else self.policy_model
         model = getattr(model, '_orig_mod', model)
 
@@ -43,7 +43,7 @@ class TorchRolloutEngine(RolloutEngine):
                 input_ids=prompt_ids.repeat_interleave(num_generations, dim=0),
                 attention_mask=attention_mask.repeat_interleave(num_generations, dim=0),
                 max_new_tokens=max_new_tokens,
-                do_sample=True,
+                do_sample=not greedy,
                 temperature=temperature,
                 top_p=top_p,
                 num_return_sequences=1,
@@ -142,12 +142,15 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
         max_new_tokens: int,
         temperature: float = 0.8,
         top_p: float = 1.0,
+        *,
+        greedy: bool = False,
     ) -> RolloutResult:
         old_max_completion_length = self.engine.max_completion_length
         old_temperature = self.engine.temperature
         old_top_p = self.engine.top_p
         self.engine.max_completion_length = max_new_tokens
-        self.engine.temperature = temperature
+        # vLLM treats temperature 0 as greedy sampling.
+        self.engine.temperature = 0.0 if greedy else temperature
         self.engine.top_p = top_p
         try:
             prompt_id_lists = [ids[mask.bool()].tolist() for ids, mask in zip(prompt_ids, attention_mask, strict=True)]

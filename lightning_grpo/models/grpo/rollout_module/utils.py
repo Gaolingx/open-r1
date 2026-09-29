@@ -42,7 +42,12 @@ class RolloutEngine(ABC):
     tokenizer = None
 
     @abstractmethod
-    def generate(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8, top_p: float = 1.0) -> RolloutResult:
+    def generate(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8, top_p: float = 1.0, *, greedy: bool = False) -> RolloutResult:
+        """Sample ``num_generations`` completions per prompt.
+
+        ``greedy=True`` switches to deterministic decoding, which is what the ReMax reward
+        baseline needs.
+        """
         pass
 
     @abstractmethod
