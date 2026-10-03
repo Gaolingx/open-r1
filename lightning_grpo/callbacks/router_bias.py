@@ -11,7 +11,7 @@ interval and ``gamma`` is ``router_bias_update_rate``.
 
 Non-invasive by design
 ----------------------
-``NekoMindMoe2TopKRouter`` is used **exactly as shipped by Hugging Face**:
+``NekoMindMoe2TopkRouter`` is used **exactly as shipped by Hugging Face**:
 
 * its ``forward`` already returns ``(router_logits, topk_weights, topk_indices)``,
   so token counts are recovered with a ``forward_hook`` -- no counter buffer and
@@ -26,7 +26,7 @@ declaration the HF file does not have.
 
 Padding
 -------
-``NekoMindMoe2TopKRouter.forward`` has no ``attention_mask`` argument, so the mask is
+``NekoMindMoe2TopkRouter.forward`` has no ``attention_mask`` argument, so the mask is
 captured with a ``forward_pre_hook`` on the policy instead of being threaded down.
 Matching Megatron-LM's ``TopKRouter._apply_expert_bias``, the mask is applied to the
 *counting* only: pad rows are still routed and dispatched, but they no longer vote in

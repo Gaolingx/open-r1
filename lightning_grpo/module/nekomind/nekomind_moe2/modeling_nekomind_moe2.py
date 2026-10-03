@@ -48,6 +48,107 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 from .configuration_nekomind_moe2 import NekoMindMoe2Config
 
 
+@use_kernel_forward_from_hub("RMSNorm")
+class NekoMindMoe2RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        NekoMindMoe2RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+# NOTE: the FLA package does not re-cast to `input_dtype` in its implementation, maybe we should do the same
+@use_kernel_forward_from_hub("RMSNormGated")
+class NekoMindMoe2RMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, **kwargs) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        self.activation = "sigmoid"
+
+    def forward(self, hidden_states, gate=None) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+
+        # Strict FP32 norm (do not downcast on the weights)
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight.to(torch.float32) * hidden_states
+
+        # Apply gating
+        hidden_states = hidden_states * ACT2FN[self.activation](gate.to(torch.float32))
+
+        return hidden_states.to(input_dtype)
+
+
+@use_experts_implementation
+class NekoMindMoe2Experts(nn.Module):
+    """Collection of expert weights stored as 3D tensors."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_local_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+
+class NekoMindMoe2MLP(nn.Module):
+    def __init__(self, config, intermediate_size=None):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -622,63 +723,7 @@ class NekoMindMoe2DeltaAttention(nn.Module):
         return output
 
 
-@use_experts_implementation
-class NekoMindMoe2Experts(nn.Module):
-    """Collection of expert weights stored as 3D tensors."""
-
-    def __init__(self, config):
-        super().__init__()
-        self.num_experts = config.num_local_experts
-        self.hidden_dim = config.hidden_size
-        self.intermediate_dim = config.moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
-        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-        return final_hidden_states
-
-
-class NekoMindMoe2MLP(nn.Module):
-    def __init__(self, config, intermediate_size=None):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
-
-
-class NekoMindMoe2TopKRouter(nn.Module):
+class NekoMindMoe2TopkRouter(nn.Module):
     def __init__(self, config: NekoMindMoe2Config):
         super().__init__()
         self.top_k = config.num_experts_per_tok
@@ -728,7 +773,7 @@ class NekoMindMoe2MoE(nn.Module):
         super().__init__()
         self.config = config
         self.experts = NekoMindMoe2Experts(config)
-        self.gate = NekoMindMoe2TopKRouter(config)
+        self.gate = NekoMindMoe2TopkRouter(config)
         self.shared_experts = NekoMindMoe2MLP(
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
         )
@@ -741,51 +786,6 @@ class NekoMindMoe2MoE(nn.Module):
         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
         return hidden_states
-
-
-@use_kernel_forward_from_hub("RMSNorm")
-class NekoMindMoe2RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
-        """
-        NekoMindMoe2RMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
-# NOTE: the FLA package does not re-cast to `input_dtype` in its implementation, maybe we should do the same
-@use_kernel_forward_from_hub("RMSNormGated")
-class NekoMindMoe2RMSNormGated(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6, **kwargs) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-        self.activation = "sigmoid"
-
-    def forward(self, hidden_states, gate=None) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-
-        # Strict FP32 norm (do not downcast on the weights)
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = self.weight.to(torch.float32) * hidden_states
-
-        # Apply gating
-        hidden_states = hidden_states * ACT2FN[self.activation](gate.to(torch.float32))
-
-        return hidden_states.to(input_dtype)
 
 
 class NekoMindMoe2DecoderLayer(GradientCheckpointingLayer):
@@ -856,7 +856,7 @@ class NekoMindMoe2PreTrainedModel(PreTrainedModel):
     _supports_sdpa = True
     _keys_to_ignore_on_load_unexpected = None
     _can_record_outputs = {
-        "router_logits": OutputRecorder(NekoMindMoe2TopKRouter, index=0),
+        "router_logits": OutputRecorder(NekoMindMoe2TopkRouter, index=0),
         "hidden_states": NekoMindMoe2DecoderLayer,
         "attentions": NekoMindMoe2Attention,
     }
@@ -876,7 +876,7 @@ class NekoMindMoe2PreTrainedModel(PreTrainedModel):
         elif isinstance(module, NekoMindMoe2Experts):
             init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
-        elif isinstance(module, NekoMindMoe2TopKRouter):
+        elif isinstance(module, NekoMindMoe2TopkRouter):
             init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
             init.zeros_(module.e_score_correction_bias)
         elif isinstance(module, NekoMindMoe2RMSNormGated):
