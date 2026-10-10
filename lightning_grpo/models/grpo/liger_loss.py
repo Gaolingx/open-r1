@@ -10,15 +10,18 @@ Reference: https://github.com/linkedin/Liger-Kernel
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor
 
 from lightning_grpo.models.common import get_lm_head_model, get_transformer_backbone_model
+from lightning_grpo.models.grpo.contracts import DistributedContext, PolicyFn, RewardScorer
 from lightning_grpo.models.grpo.loss import GRPOLossComputer
-from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
-from lightning_grpo.models.grpo.reward import GRPORewardManager
+
+if TYPE_CHECKING:
+    from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
+    from lightning_grpo.utils.configs.grpo import GRPORolloutConfig
 
 
 def _materialize_liger_lm_head(
@@ -230,10 +233,13 @@ class LigerGRPOLossComputer(GRPOLossComputer):
 
     def __init__(
         self,
-        module: Any,
-        reward_manager: GRPORewardManager,
+        rollout: GRPORolloutConfig,
+        reward_manager: RewardScorer,
         metrics_aggregator: GRPOMetricsAggregator,
+        distributed: DistributedContext,
         *,
+        policy_fn: PolicyFn,
+        reference_policy_fn: PolicyFn,
         rollout_temperature: float,
         loss_parallel_enabled: bool = False,
         compiled: bool = True,
@@ -247,9 +253,12 @@ class LigerGRPOLossComputer(GRPOLossComputer):
             ) from e
 
         super().__init__(
-            module,
+            rollout,
             reward_manager,
             metrics_aggregator,
+            distributed,
+            policy_fn=policy_fn,
+            reference_policy_fn=reference_policy_fn,
             rollout_temperature=rollout_temperature,
             loss_parallel_enabled=loss_parallel_enabled,
         )
@@ -261,16 +270,15 @@ class LigerGRPOLossComputer(GRPOLossComputer):
                 "Use the standard PyTorch loss path instead."
             )
 
-        config = module.config
         self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
-            beta=config.rollout.kl_beta,
+            beta=rollout.kl_beta,
             compiled=compiled,
             epsilon_low=self.algorithm.epsilon_low,
             epsilon_high=self.algorithm.epsilon_high,
             temperature=rollout_temperature,
-            use_ref_model=config.rollout.use_reference_model,
+            use_ref_model=rollout.use_reference_model,
             loss_type=LIGER_LOSS_TYPES[self.algorithm.loss_type],
-            max_completion_length=config.rollout.max_completion_length,
+            max_completion_length=rollout.max_completion_length,
         )
 
     def _policy_loss(self, context: GRPOLossContext) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -287,8 +295,10 @@ class LigerGRPOLossComputer(GRPOLossComputer):
         model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.shape[1]
 
+        policy = self.policy_fn()
+        reference_model = self.reference_policy_fn()
         last_hidden_state = _get_last_hidden_state(
-            self.module.policy,
+            policy,
             input_ids=model_input_ids,
             attention_mask=model_attention_mask,
             logits_to_keep=logits_to_keep,
@@ -300,17 +310,17 @@ class LigerGRPOLossComputer(GRPOLossComputer):
         ref_hidden_state = None
         ref_weight = None
         ref_bias = None
-        if self.module.reference_model is not None:
+        if reference_model is not None:
             with torch.no_grad():
                 ref_hidden_state = _get_last_hidden_state(
-                    self.module.reference_model,
+                    reference_model,
                     input_ids=model_input_ids,
                     attention_mask=model_attention_mask,
                     logits_to_keep=logits_to_keep,
                 )
             ref_hidden_state = ref_hidden_state.contiguous()
             ref_weight, ref_bias = _materialize_liger_lm_head(
-                get_lm_head_model(self.module.reference_model),
+                get_lm_head_model(reference_model),
                 loss_parallel_enabled=self.loss_parallel_enabled,
             )
 
@@ -318,7 +328,7 @@ class LigerGRPOLossComputer(GRPOLossComputer):
         advantages = context.advantages.to(last_hidden_state.device)
 
         weight, bias = _materialize_liger_lm_head(
-            get_lm_head_model(self.module.policy),
+            get_lm_head_model(policy),
             loss_parallel_enabled=self.loss_parallel_enabled,
         )
         loss, liger_metrics = self.liger_grpo_loss(
@@ -351,7 +361,7 @@ class LigerGRPOLossComputer(GRPOLossComputer):
         """
 
         zeros = torch.zeros_like(loss_mask)
-        if float(self.module.config.rollout.kl_beta) != 0.0:
+        if float(self.rollout.kl_beta) != 0.0:
             mean_kl = liger_metrics[0].detach().to(loss_mask.dtype)
         else:
             mean_kl = zeros.new_zeros(())

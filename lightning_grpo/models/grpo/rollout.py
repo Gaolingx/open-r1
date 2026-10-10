@@ -3,62 +3,94 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.distributed as dist
 
 from lightning_grpo.models.common import compute_per_token_logps
+from lightning_grpo.models.grpo.contracts import EngineFactory, PolicyFn
 from lightning_grpo.models.grpo.rollout_module.rollout_engine import create_rollout_engine
 from lightning_grpo.models.grpo.rollout_module.utils import RolloutResult
 from lightning_grpo.data.base import apply_chat_template
 
+if TYPE_CHECKING:
+    from lightning_grpo.utils.configs.base import ModelConfig
+    from lightning_grpo.utils.configs.grpo import GRPORolloutConfig
+
+
+@dataclass(frozen=True)
+class RolloutContext:
+    """Read-only snapshot of everything the local rollout engine needs from the module.
+
+    The coordinator is built from this snapshot plus a policy provider instead of the
+    ``LightningModule`` itself, so it can be tested with a tokenizer stub and a fake
+    ``engine_factory`` - no module, trainer or inference server required.
+    """
+
+    rollout: GRPORolloutConfig
+    model: ModelConfig
+    tokenizer: Any
+    device: torch.device
+    world_size: int
+    global_rank: int
+    local_rank: int
+
+
 class LocalGenerateRolloutCoordinator:
     """Coordinate GRPO rollouts through the configured inference engine."""
 
-    def __init__(self, module: Any) -> None:
-        self.module = module
-        rollout_config = module.config.rollout
-        model_name_or_path = module.config.model.tokenizer_name_or_path or module.config.model.model_name_or_path
-        world_size = dist.get_world_size() if dist.is_initialized() else int(getattr(getattr(module, "trainer", None), "world_size", 1) or 1)
-        global_rank = dist.get_rank() if dist.is_initialized() else int(getattr(module, "global_rank", 0) or 0)
-        local_rank = int(getattr(module, "local_rank", 0) or 0)
-        self.rollout_engine = create_rollout_engine(
-            engine_type=rollout_config.engine,
-            policy_model=module.policy,
-            tokenizer=module.tokenizer,
-            device=str(module.device),
-            vllm_config=rollout_config.vllm,
+    def __init__(
+        self,
+        context: RolloutContext,
+        policy_fn: PolicyFn,
+        *,
+        engine_factory: EngineFactory = create_rollout_engine,
+    ) -> None:
+        self.rollout = context.rollout
+        self.model = context.model
+        self.tokenizer = context.tokenizer
+        self.device = context.device
+        # A provider rather than the model itself: the engine always sees the policy that
+        # is currently attached to the module (tensor parallel / FSDP2 / compile re-bind it).
+        self.policy_fn = policy_fn
+        model_name_or_path = context.model.tokenizer_name_or_path or context.model.model_name_or_path
+        self.rollout_engine = engine_factory(
+            engine_type=context.rollout.engine,
+            policy_model=policy_fn(),
+            tokenizer=context.tokenizer,
+            device=str(context.device),
+            vllm_config=context.rollout.vllm,
             model_name_or_path=model_name_or_path,
-            sampling_config_path=rollout_config.vllm.sampling_config_path,
-            max_completion_length=rollout_config.max_completion_length,
-            world_size=world_size,
-            local_rank=local_rank,
-            global_rank=global_rank,
+            sampling_config_path=context.rollout.vllm.sampling_config_path,
+            max_completion_length=context.rollout.max_completion_length,
+            world_size=context.world_size,
+            local_rank=context.local_rank,
+            global_rank=context.global_rank,
         )
 
     def update_policy(self) -> None:
         """Refresh the rollout engine's policy weights or model handle."""
 
-        self.rollout_engine.update_policy(self.module.policy)
+        self.rollout_engine.update_policy(self.policy_fn())
 
     def resolve_num_generations(self, training: bool) -> int:
         """Return the number of completions sampled per prompt."""
 
-        return self.module.config.rollout.num_generations if training else self.module.config.rollout.num_generations_eval
+        return self.rollout.num_generations if training else self.rollout.num_generations_eval
 
     def _max_prompt_length(self) -> int:
         """Return a prompt window that leaves room for at least one completion token."""
 
-        max_total_length = self.module.config.rollout.max_total_length
+        max_total_length = self.rollout.max_total_length
         if max_total_length <= 1:
             raise ValueError("rollout.max_total_length must be greater than 1 for GRPO loss computation.")
-        return min(self.module.config.rollout.max_prompt_length, max_total_length - 1)
+        return min(self.rollout.max_prompt_length, max_total_length - 1)
 
     def _tokenize_prompts(self, prompts: list[str]) -> dict[str, torch.Tensor]:
         """Left-pad prompts and truncate to the configured prompt window."""
 
-        tokenizer = self.module.tokenizer
+        tokenizer = self.tokenizer
         old_padding_side = tokenizer.padding_side
         tokenizer.padding_side = "left"
         try:
@@ -73,7 +105,7 @@ class LocalGenerateRolloutCoordinator:
             )
         finally:
             tokenizer.padding_side = old_padding_side
-        return {key: value.to(self.module.device) for key, value in encoded.items()}
+        return {key: value.to(self.device) for key, value in encoded.items()}
 
     def _generate(
         self,
@@ -97,9 +129,9 @@ class LocalGenerateRolloutCoordinator:
             prompt_ids=encoded["input_ids"],
             attention_mask=encoded["attention_mask"],
             num_generations=num_generations,
-            max_new_tokens=self.module.config.rollout.max_completion_length,
-            temperature=self.module.config.rollout.temperature if temperature is None else temperature,
-            top_p=self.module.config.rollout.top_p,
+            max_new_tokens=self.rollout.max_completion_length,
+            temperature=self.rollout.temperature if temperature is None else temperature,
+            top_p=self.rollout.top_p,
             greedy=greedy,
         )
 
@@ -113,7 +145,7 @@ class LocalGenerateRolloutCoordinator:
     def remax_baseline_enabled(self) -> bool:
         """Whether the configured advantage estimator needs a greedy baseline rollout."""
 
-        return str(self.module.config.rollout.advantage_estimator) == "remax"
+        return str(self.rollout.advantage_estimator) == "remax"
 
     def _remax_baseline_rollout(
         self,
@@ -131,7 +163,7 @@ class LocalGenerateRolloutCoordinator:
         the loss can consume them positionally.
         """
 
-        baseline_temperature = float(self.module.config.rollout.remax_baseline_temperature)
+        baseline_temperature = float(self.rollout.remax_baseline_temperature)
         greedy = baseline_temperature <= 0.0
         result = self._generate(
             prompts,
@@ -200,7 +232,7 @@ class LocalGenerateRolloutCoordinator:
 
         try:
             return apply_chat_template(
-                self.module.tokenizer,
+                self.tokenizer,
                 messages,
                 add_generation_prompt=add_generation_prompt,
                 tools=tools,
@@ -208,7 +240,7 @@ class LocalGenerateRolloutCoordinator:
             )
         except TypeError:
             return apply_chat_template(
-                self.module.tokenizer,
+                self.tokenizer,
                 messages,
                 add_generation_prompt=add_generation_prompt,
                 tools=tools,
@@ -263,14 +295,14 @@ class LocalGenerateRolloutCoordinator:
     ) -> dict[str, Any]:
         """Pack generated samples into tensors consumed by the GRPO loss."""
 
-        tokenizer = self.module.tokenizer
+        tokenizer = self.tokenizer
         # ``prompts`` holds one entry per completion; the base encoding covers one entry per
         # prompt, so expand it to match ``completion_ids`` instead of tokenizing again.
         if prompt_encoded is None:
             prompt_encoded = self._tokenize_prompts(prompts[::num_generations])
         prompt_ids = prompt_encoded["input_ids"].repeat_interleave(num_generations, dim=0)
         prompt_mask = prompt_encoded["attention_mask"].repeat_interleave(num_generations, dim=0)
-        completion_budget = self.module.config.rollout.max_total_length - prompt_ids.size(1)
+        completion_budget = self.rollout.max_total_length - prompt_ids.size(1)
         if completion_budget <= 0:
             raise RuntimeError(
                 "Tokenized prompts leave no room for completion tokens. "
@@ -286,16 +318,16 @@ class LocalGenerateRolloutCoordinator:
         completion_ids = completion_ids[:, :max_completion]
         completion_mask = completion_mask[:, :max_completion]
         if old_per_token_logps is not None:
-            old_logps = old_per_token_logps[:, :max_completion].to(self.module.device) * completion_mask.to(old_per_token_logps.dtype)
+            old_logps = old_per_token_logps[:, :max_completion].to(self.device) * completion_mask.to(old_per_token_logps.dtype)
         else:
             with torch.no_grad():
-                old_logps = compute_per_token_logps(self.module, prompt_ids, prompt_mask, completion_ids, completion_mask, self.module.config.rollout.temperature)
+                old_logps = compute_per_token_logps(self.policy_fn(), prompt_ids, prompt_mask, completion_ids, completion_mask, self.rollout.temperature)
         if engine_completion_truncated is not None:
             engine_truncated = engine_completion_truncated.to(device=completion_ids.device, dtype=torch.bool)
             completion_truncated = (engine_truncated | (pre_crop_lengths > max_completion)).to(torch.long)
         else:
             completion_truncated = (pre_crop_lengths >= max_completion).to(torch.long)
-        sample_ids = torch.arange(completion_ids.size(0), device=self.module.device) // num_generations
+        sample_ids = torch.arange(completion_ids.size(0), device=self.device) // num_generations
 
         packed = {
             "prompt_ids": prompt_ids,

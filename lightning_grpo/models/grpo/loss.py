@@ -5,14 +5,19 @@ import warnings
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.parallel import loss_parallel
 
+from lightning_grpo.models.grpo.contracts import DistributedContext, PolicyFn, RewardScorer
 from lightning_grpo.utils.loss import core_algos as algos
+
+if TYPE_CHECKING:
+    from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
+    from lightning_grpo.utils.configs.grpo import GRPORolloutConfig
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -722,6 +727,11 @@ class GRPOLossComputer(ABC):
     distributed advantage normalization and the metric contract are shared here, which is
     exactly the logic that used to be duplicated between the standard and the Liger
     kernel implementations.
+
+    Every collaborator is injected: the rollout configuration slice, the reward scorer,
+    the metrics aggregator, the distributed context and the policy/reference-model
+    *providers*. Nothing here reaches back into the owning ``LightningModule``, so each
+    piece can be unit tested on its own.
     """
 
     #: ``loss_type`` values the subclass can actually evaluate.
@@ -729,19 +739,27 @@ class GRPOLossComputer(ABC):
 
     def __init__(
         self,
-        module: Any,
-        reward_manager: Any,
-        metrics_aggregator: Any,
+        rollout: GRPORolloutConfig,
+        reward_manager: RewardScorer,
+        metrics_aggregator: GRPOMetricsAggregator,
+        distributed: DistributedContext,
         *,
+        policy_fn: PolicyFn,
+        reference_policy_fn: PolicyFn,
         rollout_temperature: float,
         loss_parallel_enabled: bool = False,
     ) -> None:
-        self.module = module
+        self.rollout = rollout
         self.reward_manager = reward_manager
         self.metrics_aggregator = metrics_aggregator
+        self.distributed = distributed
+        # Providers, not values: tensor parallelism, FSDP2 and ``torch.compile`` re-bind
+        # ``module.policy`` after the loss computer is built.
+        self.policy_fn = policy_fn
+        self.reference_policy_fn = reference_policy_fn
         self.rollout_temperature = rollout_temperature
         self.loss_parallel_enabled = loss_parallel_enabled
-        self.algorithm = resolve_grpo_algorithm(module.config.rollout)
+        self.algorithm = resolve_grpo_algorithm(rollout)
         self._uses_greedy_baseline = self.algorithm.advantage_estimator == "remax"
 
     # ------------------------------------------------------------------ API
@@ -753,11 +771,14 @@ class GRPOLossComputer(ABC):
         self,
         rollout_batch: dict[str, Any],
         *,
-        training: bool,
+        num_generations: int,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute the objective and the logged metrics for one rollout batch."""
+        """Compute the objective and the logged metrics for one rollout batch.
 
-        num_generations = self.module.rollout_coordinator.resolve_num_generations(training)
+        ``num_generations`` depends on the rollout stage (train vs validation), so the
+        caller resolves it from the rollout coordinator and passes it in.
+        """
+
         rewards = self._compute_rewards(rollout_batch)
         advantages = self._compute_advantages(rollout_batch, rewards, num_generations=num_generations)
         context = GRPOLossContext(
@@ -792,7 +813,7 @@ class GRPOLossComputer(ABC):
             metadata=rollout_batch["metadata"],
         )
         rewards = self._apply_overlong_penalty(rollout_batch, rewards)
-        global_per_func = self.metrics_aggregator.gather_tensor(rewards_per_func.detach())
+        global_per_func = self.distributed.gather(rewards_per_func.detach())
         weights = self.reward_manager.reward_weight_tensor.to(global_per_func.device)
         global_rewards = (global_per_func * weights.unsqueeze(0)).nansum(dim=-1)
         return GRPORolloutRewards(
@@ -811,11 +832,11 @@ class GRPOLossComputer(ABC):
         correct-but-long answers keep their reward, as in DAPO.
         """
 
-        buffer_len = int(getattr(self.module.config.rollout, "overlong_buffer_len", 0) or 0)
+        buffer_len = int(self.rollout.overlong_buffer_len or 0)
         if buffer_len <= 0:
             return rewards
-        factor = float(getattr(self.module.config.rollout, "overlong_penalty_factor", 1.0))
-        horizon = int(self.module.config.rollout.max_completion_length)
+        factor = float(self.rollout.overlong_penalty_factor)
+        horizon = int(self.rollout.max_completion_length)
         lengths = rollout_batch["completion_mask"].sum(dim=1).to(rewards.dtype)
         exceedance = ((lengths - (horizon - buffer_len)) / float(buffer_len)).clamp(min=0.0, max=1.0)
         penalty = -factor * exceedance
@@ -836,7 +857,7 @@ class GRPOLossComputer(ABC):
         """
 
         sample_ids = rollout_batch["sample_ids"].detach()
-        global_sample_ids = self.metrics_aggregator.gather_tensor(sample_ids)
+        global_sample_ids = self.distributed.gather(sample_ids)
 
         # Every estimator reachable from here is outcome-only: the scalar reward sits on the
         # last valid token and the resulting advantage is broadcast over the sequence. A
@@ -848,7 +869,7 @@ class GRPOLossComputer(ABC):
         estimator_kwargs: dict[str, Any] = {
             "response_mask": torch.ones_like(token_level_rewards),
             "index": global_sample_ids.cpu().numpy(),
-            "epsilon": float(self.module.config.rollout.advantage_epsilon),
+            "epsilon": float(self.rollout.advantage_epsilon),
             "norm_adv_by_std_in_grpo": bool(self.algorithm.norm_adv_by_std_in_grpo),
             "config": self.algorithm.actor_config,
             **self.algorithm.actor_config.extra,
@@ -885,7 +906,7 @@ class GRPOLossComputer(ABC):
         )
         weights = self.reward_manager.reward_weight_tensor.to(baseline_per_func.device)
         local_baselines = (baseline_per_func * weights.unsqueeze(0)).nansum(dim=-1)
-        return self.metrics_aggregator.gather_tensor(local_baselines.detach())
+        return self.distributed.gather(local_baselines.detach())
 
     def _local_advantages(
         self,
@@ -904,8 +925,7 @@ class GRPOLossComputer(ABC):
                 f"Gathered reward batch ({global_size}) is not a whole multiple of the local "
                 f"rollout batch ({local_size}). Every rank must hold the same local batch size."
             )
-        process_index = getattr(getattr(self.module, "trainer", None), "global_rank", 0)
-        start = int(process_index) * local_size
+        start = int(self.distributed.rank) * local_size
         stop = start + local_size
         if not torch.equal(global_sample_ids[start:stop].to(local_sample_ids.device), local_sample_ids):
             raise RuntimeError(
@@ -931,7 +951,7 @@ class GRPOLossComputer(ABC):
         they carry no learning signal either way.
         """
 
-        if not getattr(self.module.config.rollout, "drop_zero_advantage_groups", False):
+        if not self.rollout.drop_zero_advantage_groups:
             return None
         if num_generations <= 1 or global_advantages.numel() % num_generations != 0:
             return None
@@ -993,25 +1013,23 @@ class GRPOLossComputer(ABC):
     ) -> dict[str, torch.Tensor]:
         """Gather the local diagnostics and assemble the logged metric dict."""
 
-        aggregator = self.metrics_aggregator
         completion_lengths = rollout_batch["completion_mask"].sum(dim=1).float()
         completion_truncated = rollout_batch["completion_truncated"].to(torch.float32)
-        return aggregator.build_training_metrics(
+        return self.metrics_aggregator.build_training_metrics(
             global_rewards_per_func=rewards.global_per_func,
             reward_weights=rewards.weights,
             global_shaped_rewards=rewards.global_rewards,
             num_generations=num_generations,
-            global_per_token_kl=aggregator.gather_tensor(local_metrics["per_token_kl"].detach()),
-            global_loss_mask=aggregator.gather_tensor(local_metrics["loss_mask"].detach()),
-            global_entropy=aggregator.gather_tensor(local_metrics["entropy"].detach()),
-            global_completion_lengths=aggregator.gather_tensor(completion_lengths.detach()),
-            global_completion_truncated=aggregator.gather_tensor(completion_truncated.detach()),
-            global_is_low_clipped=aggregator.gather_tensor(local_metrics["is_low_clipped"].detach()),
-            global_is_high_clipped=aggregator.gather_tensor(local_metrics["is_high_clipped"].detach()),
-            global_is_region_clipped=aggregator.gather_tensor(local_metrics["is_region_clipped"].detach()),
-            global_is_cispo_clipped=aggregator.gather_tensor(local_metrics["is_cispo_clipped"].detach()),
+            global_per_token_kl=self.distributed.gather(local_metrics["per_token_kl"].detach()),
+            global_loss_mask=self.distributed.gather(local_metrics["loss_mask"].detach()),
+            global_entropy=self.distributed.gather(local_metrics["entropy"].detach()),
+            global_completion_lengths=self.distributed.gather(completion_lengths.detach()),
+            global_completion_truncated=self.distributed.gather(completion_truncated.detach()),
+            global_is_low_clipped=self.distributed.gather(local_metrics["is_low_clipped"].detach()),
+            global_is_high_clipped=self.distributed.gather(local_metrics["is_high_clipped"].detach()),
+            global_is_region_clipped=self.distributed.gather(local_metrics["is_region_clipped"].detach()),
+            global_is_cispo_clipped=self.distributed.gather(local_metrics["is_cispo_clipped"].detach()),
             global_advantages=advantages.global_advantages,
-            reward_names=self.module.config.reward.reward_funcs,
         )
 
 
@@ -1057,10 +1075,13 @@ class StandardGRPOLossComputer(GRPOLossComputer):
 
     def __init__(
         self,
-        module: Any,
-        reward_manager: Any,
-        metrics_aggregator: Any,
+        rollout: GRPORolloutConfig,
+        reward_manager: RewardScorer,
+        metrics_aggregator: GRPOMetricsAggregator,
+        distributed: DistributedContext,
         *,
+        policy_fn: PolicyFn,
+        reference_policy_fn: PolicyFn,
         rollout_temperature: float,
         loss_parallel_enabled: bool = False,
     ) -> None:
@@ -1072,9 +1093,12 @@ class StandardGRPOLossComputer(GRPOLossComputer):
                 "per rank, risking OOM."
             )
         super().__init__(
-            module,
+            rollout,
             reward_manager,
             metrics_aggregator,
+            distributed,
+            policy_fn=policy_fn,
+            reference_policy_fn=reference_policy_fn,
             rollout_temperature=rollout_temperature,
             loss_parallel_enabled=loss_parallel_enabled,
         )
@@ -1082,7 +1106,6 @@ class StandardGRPOLossComputer(GRPOLossComputer):
     def _policy_loss(self, context: GRPOLossContext) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Evaluate the configured policy objective on materialized logits."""
 
-        module = self.module
         rollout_batch = context.rollout_batch
         prompt_ids = rollout_batch["prompt_ids"]
         prompt_mask = rollout_batch["prompt_mask"]
@@ -1094,7 +1117,7 @@ class StandardGRPOLossComputer(GRPOLossComputer):
         model_input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         model_attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
-        policy_outputs = module.policy(
+        policy_outputs = self.policy_fn()(
             input_ids=model_input_ids,
             attention_mask=model_attention_mask,
             use_cache=False,
@@ -1109,9 +1132,10 @@ class StandardGRPOLossComputer(GRPOLossComputer):
         # Without a reference model the KL term is identically zero, which is what the old
         # ``per_token_logps.detach()`` fallback expressed.
         ref_per_token_logps = per_token_logps.detach()
-        if module.reference_model is not None:
+        reference_model = self.reference_policy_fn()
+        if reference_model is not None:
             with torch.no_grad():
-                ref_outputs = module.reference_model(
+                ref_outputs = reference_model(
                     input_ids=model_input_ids,
                     attention_mask=model_attention_mask,
                     use_cache=False,
@@ -1135,7 +1159,7 @@ class StandardGRPOLossComputer(GRPOLossComputer):
         )
 
         per_token_kl = approx_kl_divergence(per_token_logps, ref_per_token_logps)
-        kl_beta = float(module.config.rollout.kl_beta)
+        kl_beta = float(self.rollout.kl_beta)
         if kl_beta != 0.0:
             loss = loss + kl_beta * algos.agg_loss(
                 loss_mat=per_token_kl,
@@ -1169,10 +1193,13 @@ class StandardGRPOLossComputer(GRPOLossComputer):
 
 
 def create_grpo_loss_computer(
-    module: Any,
-    reward_manager: Any,
-    metrics_aggregator: Any,
+    rollout: GRPORolloutConfig,
+    reward_manager: RewardScorer,
+    metrics_aggregator: GRPOMetricsAggregator,
+    distributed: DistributedContext,
     *,
+    policy_fn: PolicyFn,
+    reference_policy_fn: PolicyFn,
     use_liger_kernel: bool,
     rollout_temperature: float,
     loss_parallel_enabled: bool = False,
@@ -1185,16 +1212,19 @@ def create_grpo_loss_computer(
     PyTorch path is used (with a warning) instead of quietly training a different objective.
     """
 
-    algorithm = resolve_grpo_algorithm(module.config.rollout)
+    algorithm = resolve_grpo_algorithm(rollout)
     if use_liger_kernel and algorithm.preset.liger_supported:
         # Imported lazily: the Liger path needs the optional ``liger_kernel`` package and
         # this module is imported by every training entry point.
         from lightning_grpo.models.grpo.liger_loss import LigerGRPOLossComputer
 
         return LigerGRPOLossComputer(
-            module,
+            rollout,
             reward_manager,
             metrics_aggregator,
+            distributed,
+            policy_fn=policy_fn,
+            reference_policy_fn=reference_policy_fn,
             rollout_temperature=rollout_temperature,
             loss_parallel_enabled=loss_parallel_enabled,
             compiled=compiled,
@@ -1206,9 +1236,12 @@ def create_grpo_loss_computer(
             stacklevel=2,
         )
     return StandardGRPOLossComputer(
-        module,
+        rollout,
         reward_manager,
         metrics_aggregator,
+        distributed,
+        policy_fn=policy_fn,
+        reference_policy_fn=reference_policy_fn,
         rollout_temperature=rollout_temperature,
         loss_parallel_enabled=loss_parallel_enabled,
     )

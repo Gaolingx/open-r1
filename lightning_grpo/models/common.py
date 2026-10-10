@@ -229,16 +229,15 @@ def load_tokenizer(model_config: ModelConfig) -> PreTrainedTokenizerBase:
 
 
 def compute_per_token_logps(
-    module: Any,
+    policy: torch.nn.Module,
     prompt_ids: torch.Tensor,
     prompt_mask: torch.Tensor,
     completion_ids: torch.Tensor,
     completion_mask: torch.Tensor,
     temperature: float = 1.0,
 ) -> torch.Tensor:
-    """Compute old policy log-probabilities for generated completion tokens."""
+    """Compute policy log-probabilities for generated completion tokens."""
 
-    policy = module.policy if hasattr(module, "policy") else module
     input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
     logits_to_keep = completion_ids.size(1)

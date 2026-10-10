@@ -3,23 +3,26 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from open_r1.rewards import get_reward_funcs
 
+if TYPE_CHECKING:
+    from lightning_grpo.utils.configs.grpo import GRPORewardConfig
+
 
 class GRPORewardManager:
     """Build and evaluate reward functions for GRPO rollouts."""
 
-    def __init__(self, config: Any, tokenizer: Any, device: torch.device) -> None:
-        self.config = config
-        self.reward_config = config.reward
+    def __init__(self, reward: GRPORewardConfig, tokenizer: Any, device: torch.device) -> None:
+        self.reward = reward
         self.tokenizer = tokenizer
         self.device = device
+        self.reward_names: list[str] = list(reward.reward_funcs)
         self.reward_funcs = get_reward_funcs(self._build_reward_script_args())
-        reward_weights = self.reward_config.reward_weights
+        reward_weights = self.reward.reward_weights
         if reward_weights is not None:
             if len(reward_weights) != len(self.reward_funcs):
                 raise ValueError(
@@ -30,7 +33,7 @@ class GRPORewardManager:
             self.reward_weight_tensor = torch.ones(len(self.reward_funcs), dtype=torch.float32)
 
     def _build_reward_script_args(self) -> SimpleNamespace:
-        reward = self.reward_config
+        reward = self.reward
         return SimpleNamespace(
             reward_funcs=reward.reward_funcs,
             code_language=reward.code_language,

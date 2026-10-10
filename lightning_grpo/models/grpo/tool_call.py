@@ -504,7 +504,7 @@ class GRPOToolCallMixin:
 
         with torch.no_grad():
             old_per_token_logps = compute_per_token_logps(
-                self,
+                self.policy,
                 prompt_ids_tensor,
                 prompt_mask_tensor,
                 completion_ids_tensor,

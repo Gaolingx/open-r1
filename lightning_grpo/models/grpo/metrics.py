@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Sequence
 
 import torch
-import torch.nn.functional as F
 
-from lightning_grpo.models.grpo.loss import masked_mean, resolve_grpo_algorithm
+from lightning_grpo.models.grpo.contracts import MetricsSink
+from lightning_grpo.models.grpo.loss import masked_mean
 
 
 def _missing_reward_to_zero(values: torch.Tensor) -> torch.Tensor:
@@ -17,38 +17,24 @@ def _missing_reward_to_zero(values: torch.Tensor) -> torch.Tensor:
 
 
 class GRPOMetricsAggregator:
-    """Aggregate distributed metrics and log them through Lightning."""
+    """Aggregate GRPO metrics and publish them through an injected sink.
 
-    def __init__(self, module: Any) -> None:
-        self.module = module
+    Only the two things it actually needs are injected: a :class:`MetricsSink` to publish
+    the metrics and the clip/reward names that shape the logged dict. Distributed gathering
+    lives on :class:`~lightning_grpo.models.grpo.contracts.DistributedContext` and is
+    performed by the loss computer, which is what owns the gathered tensors.
+    """
 
-    def gather_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        """All-gather ``tensor`` across ranks, tolerating per-rank shape differences."""
-
-        trainer = self.module.trainer
-        if trainer is None or getattr(trainer, "world_size", 1) <= 1:
-            return tensor
-
-        if tensor.dim() == 0:
-            return self.module.all_gather(tensor).reshape(-1)
-
-        local_size = torch.tensor(tensor.shape, dtype=torch.long, device=tensor.device)
-        gathered_sizes = self.module.all_gather(local_size).reshape(-1, tensor.dim())
-        max_size = gathered_sizes.max(dim=0).values.tolist()
-
-        gathered = self.module.all_gather(self._pad_to_shape(tensor, max_size))
-        return gathered.reshape(-1, *max_size[1:])
-
-    @staticmethod
-    def _pad_to_shape(tensor: torch.Tensor, shape: list[int]) -> torch.Tensor:
-        """Right-pad ``tensor`` with zeros up to ``shape`` (no-op when it already matches)."""
-
-        padding: list[int] = []
-        for size, target in zip(reversed(tensor.shape), reversed(shape)):
-            padding.extend((0, target - size))
-        if not any(padding):
-            return tensor
-        return F.pad(tensor, padding)
+    def __init__(
+        self,
+        sink: MetricsSink,
+        *,
+        clip_reporting: str,
+        reward_names: Sequence[str],
+    ) -> None:
+        self.sink = sink
+        self.clip_reporting = clip_reporting
+        self.reward_names = list(reward_names)
 
     def build_training_metrics(
         self,
@@ -66,7 +52,6 @@ class GRPOMetricsAggregator:
         global_is_region_clipped: torch.Tensor,
         global_is_cispo_clipped: torch.Tensor,
         global_advantages: torch.Tensor,
-        reward_names: list[str],
         global_shaped_rewards: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         # ``global_shaped_rewards`` carries reward-shaping terms that are not part of any
@@ -103,7 +88,7 @@ class GRPOMetricsAggregator:
             "clip_ratio_region": masked_mean(global_is_region_clipped, global_loss_mask),
             "cispo_clip_ratio": masked_mean(global_is_cispo_clipped, global_loss_mask),
         }
-        for index, reward_name in enumerate(reward_names):
+        for index, reward_name in enumerate(self.reward_names):
             # A missing reward is NaN for that (sample, function) pair; scoring it as 0 here
             # matches the ``nansum`` used for the total reward above.
             per_func = _missing_reward_to_zero(global_rewards_per_func[:, index])
@@ -114,9 +99,9 @@ class GRPOMetricsAggregator:
     def log_metrics(self, prefix: str, loss: torch.Tensor, metrics: dict[str, torch.Tensor], *, on_step: bool, on_epoch: bool) -> None:
         """Log the loss plus the already-aggregated metrics."""
 
-        module = self.module
-        module.log(f"{prefix}/loss", loss, prog_bar=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True)
-        module.log(f"{prefix}/reward", metrics["reward"], prog_bar=True, on_step=on_step, on_epoch=on_epoch, sync_dist=False)
+        sink = self.sink
+        sink.log(f"{prefix}/loss", loss, prog_bar=True, on_step=on_step, on_epoch=on_epoch, sync_dist=True)
+        sink.log(f"{prefix}/reward", metrics["reward"], prog_bar=True, on_step=on_step, on_epoch=on_epoch, sync_dist=False)
 
         # Bulk-log the remaining metrics through a single call to minimize logger overhead.
         logged: dict[str, torch.Tensor] = {
@@ -134,14 +119,14 @@ class GRPOMetricsAggregator:
             f"{prefix}/completions/min_terminated_length": metrics["terminated_length_min"],
             f"{prefix}/completions/max_terminated_length": metrics["terminated_length_max"],
         }
-        if resolve_grpo_algorithm(module.config.rollout).preset.clip_reporting == "cispo":
+        if self.clip_reporting == "cispo":
             logged[f"{prefix}/cispo_clip_ratio"] = metrics["cispo_clip_ratio"]
         else:
             logged[f"{prefix}/clip_ratio/low"] = metrics["clip_ratio_low"]
             logged[f"{prefix}/clip_ratio/high"] = metrics["clip_ratio_high"]
             logged[f"{prefix}/clip_ratio/region"] = metrics["clip_ratio_region"]
-        for reward_name in module.config.reward.reward_funcs:
+        for reward_name in self.reward_names:
             logged[f"{prefix}/rewards/{reward_name}/mean"] = metrics[f"reward/{reward_name}"]
             logged[f"{prefix}/rewards/{reward_name}/std"] = metrics[f"reward_std/{reward_name}"]
 
-        module.log_dict(logged, on_step=on_step, on_epoch=on_epoch, sync_dist=False)
+        sink.log_dict(logged, on_step=on_step, on_epoch=on_epoch, sync_dist=False)
