@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import logging
 import os
 import socket
 from typing import List, Optional, Sequence
@@ -11,16 +12,48 @@ from torch import Tensor
 from transformers import GenerationConfig
 
 
-def ensure_master_addr_port() -> None:
-    """Ensure torch distributed rendezvous environment variables are set."""
+logger = logging.getLogger(__name__)
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    if "MASTER_PORT" in os.environ:
-        return
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("", 0))
-        os.environ["MASTER_PORT"] = str(sock.getsockname()[1])
+def _is_port_free(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
+def _find_free_port() -> int:
+    candidates = (29500, 23456, 12355, 12345)
+    for p in candidates:
+        if _is_port_free(p):
+            return p
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def ensure_master_addr_port(addr: str | None = None, port: int | None = None) -> None:
+    """
+    Ensure `MASTER_ADDR`/`MASTER_PORT` are set safely.
+
+    - Respects existing environment variables.
+    - Defaults `MASTER_ADDR` to localhost if unset.
+    - Chooses a free TCP port if `MASTER_PORT` is unset to avoid collisions.
+    - If `MASTER_PORT` is set to `"0"` or `"auto"`, it is resolved to a free port.
+    """
+    os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR") or addr or "localhost"
+
+    env_port = os.environ.get("MASTER_PORT", "").strip().lower()
+    if port is None and env_port not in {"", "0", "auto"}:
+        try:
+            port = int(env_port)
+        except ValueError:
+            pass
+
+    os.environ["MASTER_PORT"] = str(_find_free_port() if port in (None, 0) else port)
 
 
 @dataclass
@@ -54,6 +87,9 @@ class RolloutEngine(ABC):
     def update_policy(self, model: torch.nn.Module):
         pass
 
+    def shutdown(self) -> None:
+        """Release engine-owned resources. Engines without long-lived resources need not override this."""
+
 
 def load_generation_config(sampling_config_path: Optional[str], fallback: GenerationConfig) -> GenerationConfig:
     """Load rollout sampling config, falling back to the model generation config."""
@@ -63,13 +99,18 @@ def load_generation_config(sampling_config_path: Optional[str], fallback: Genera
     return GenerationConfig.from_dict(fallback.to_dict())
 
 
-def looks_like_fsdp_enabled(model: torch.nn.Module) -> bool:
+def detect_fsdp_version(model: torch.nn.Module) -> Optional[int]:
+    """Return the FSDP version sharding ``model``, or ``None`` when it is not sharded at all."""
+
     if model is None:
-        return False
+        return None
     for module in model.modules():
-        if module.__class__.__name__ in {"FullyShardedDataParallel", "FSDPModule"}:
-            return True
-    return any(hasattr(param, "full_tensor") for param in model.state_dict().values())
+        name = module.__class__.__name__
+        if name == "FullyShardedDataParallel":
+            return 1
+        if name == "FSDPModule":
+            return 2
+    return 2 if any(hasattr(param, "full_tensor") for param in model.state_dict().values()) else None
 
 
 def sampled_token_logprobs(

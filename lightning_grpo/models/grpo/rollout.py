@@ -55,6 +55,10 @@ class LocalGenerateRolloutCoordinator:
         # is currently attached to the module (tensor parallel / FSDP2 / compile re-bind it).
         self.policy_fn = policy_fn
         model_name_or_path = context.model.tokenizer_name_or_path or context.model.model_name_or_path
+        # ``rollout.vllm.trust_remote_code`` overrides the model-level flag; unset inherits it.
+        vllm_trust_remote_code = context.rollout.vllm.trust_remote_code
+        if vllm_trust_remote_code is None:
+            vllm_trust_remote_code = context.model.trust_remote_code
         self.rollout_engine = engine_factory(
             engine_type=context.rollout.engine,
             policy_model=policy_fn(),
@@ -67,12 +71,18 @@ class LocalGenerateRolloutCoordinator:
             world_size=context.world_size,
             local_rank=context.local_rank,
             global_rank=context.global_rank,
+            trust_remote_code=vllm_trust_remote_code,
         )
 
     def update_policy(self) -> None:
         """Refresh the rollout engine's policy weights or model handle."""
 
         self.rollout_engine.update_policy(self.policy_fn())
+
+    def shutdown(self) -> None:
+        """Release the rollout engine and any inference resources it holds."""
+
+        self.rollout_engine.shutdown()
 
     def resolve_num_generations(self, training: bool) -> int:
         """Return the number of completions sampled per prompt."""

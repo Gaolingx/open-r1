@@ -45,8 +45,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         self.tokenizer = load_tokenizer(config.model)
         self.reference_model = self._build_reference_model()
         self.setup_tool_calling()
-        # Collaborators are built in ``configure_model``: they must see the policy that
-        # tensor parallelism / FSDP2 / compile produce, not the raw one loaded here.
+
         self.metrics_aggregator: GRPOMetricsAggregator | None = None
         self.rollout_coordinator: LocalGenerateRolloutCoordinator | None = None
         self.reward_manager: GRPORewardManager | None = None
@@ -211,6 +210,9 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
 
         # Clean up tool executor resources
         self.shutdown_tool_calling()
+        # Release the rollout engine (colocated vLLM weights / server communicator) before exporting.
+        if self.rollout_coordinator is not None:
+            self.rollout_coordinator.shutdown()
 
         export_dir = self.config.output_dir + "/hf_final"
         exported_paths = export_configured_model(self.policy, self.config.model, export_dir, tokenizer=self.tokenizer)

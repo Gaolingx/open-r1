@@ -68,6 +68,8 @@ class VLLMConfig:
     max_num_seqs: Optional[int] = None
     enable_sleep_mode: bool = False
     model_impl: str = "auto"
+    #: ``None`` inherits ``ModelConfig.trust_remote_code``.
+    trust_remote_code: Optional[bool] = None
     # Generation overrides
     repetition_penalty: float = 1.0
     structured_outputs_regex: Optional[str] = None

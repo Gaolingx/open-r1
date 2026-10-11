@@ -19,7 +19,7 @@ from lightning_grpo.models.grpo.rollout_module.utils import (
     pad_sequences,
     truncate_completions,
     load_generation_config,
-    looks_like_fsdp_enabled,
+    detect_fsdp_version,
     sampled_token_logprobs,
 )
 from lightning_grpo.utils.configs.grpo import VLLMConfig
@@ -94,6 +94,7 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
         world_size: int = 1,
         local_rank: int = 0,
         global_rank: int = 0,
+        trust_remote_code: bool = False,
     ) -> None:
         from lightning_grpo.models.grpo.rollout_module.vllm.vllm_generation import VLLMGeneration
 
@@ -109,8 +110,13 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
         model_for_vllm = self._prepare_model_for_vllm(policy_model)
         self.engine = VLLMGeneration(
             model=model_for_vllm,
-            accelerator=_LightningVLLMAcceleratorAdapter(self.device, world_size, local_rank, global_rank),
-            is_fsdp_enabled=looks_like_fsdp_enabled(policy_model),
+            accelerator=_LightningVLLMAcceleratorAdapter(
+                self.device,
+                world_size,
+                local_rank,
+                global_rank,
+                model=model_for_vllm,
+            ),
             processing_class=tokenizer,
             mode=vllm_config.mode,
             structured_outputs_regex=vllm_config.structured_outputs_regex,
@@ -125,6 +131,7 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
             max_num_seqs=vllm_config.max_num_seqs,
             enable_sleep_mode=vllm_config.enable_sleep_mode,
             model_impl=vllm_config.model_impl,
+            trust_remote_code=trust_remote_code,
             repetition_penalty=vllm_config.repetition_penalty,
             temperature=self.generation_config.temperature or 1.0,
             top_p=self.generation_config.top_p or 1.0,
@@ -178,6 +185,14 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
         llm = getattr(self.engine, "llm", None)
         if llm is not None:
             del self.engine.llm
+        vllm_client = getattr(self.engine, "vllm_client", None)
+        if vllm_client is not None:
+            vllm_client.close_communicator()
+            del self.engine.vllm_client
+        tp_group = getattr(self.engine, "tp_group", None)
+        if tp_group is not None and dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group(tp_group)
+            del self.engine.tp_group
 
     @staticmethod
     def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -227,15 +242,33 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
 
 
 class _LightningVLLMAcceleratorAdapter:
-    """Minimal Accelerate-compatible adapter used by TRL's vLLM generation helper."""
+    """Minimal Accelerate-compatible adapter used by TRL's vLLM generation helper.
 
-    def __init__(self, device: torch.device, world_size: int, local_rank: int, global_rank: int) -> None:
+    ``VLLMGeneration`` takes an ``accelerate.Accelerator``; this repo trains with Lightning, so the
+    handful of attributes it actually reads are provided here. ``state`` is what ``DistributedBackend``
+    inspects to pick a weight-gathering strategy: Lightning shards through ``fully_shard`` rather than
+    through Accelerate, so the sharding of ``model`` is reported as ``fsdp_plugin``.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        world_size: int,
+        local_rank: int,
+        global_rank: int,
+        *,
+        model: Optional[torch.nn.Module] = None,
+    ) -> None:
         self.device = device
         self.num_processes = world_size
         self.local_process_index = local_rank
         self.process_index = global_rank
         self.is_main_process = global_rank == 0
-        self.state = SimpleNamespace(deepspeed_plugin=None, fsdp_plugin=SimpleNamespace(fsdp_version=2))
+        fsdp_version = detect_fsdp_version(model)
+        self.state = SimpleNamespace(
+            deepspeed_plugin=None,
+            fsdp_plugin=None if fsdp_version is None else SimpleNamespace(fsdp_version=fsdp_version),
+        )
 
     def wait_for_everyone(self) -> None:
         if dist.is_initialized():
@@ -255,6 +288,7 @@ def create_rollout_engine(
     world_size: int = 1,
     local_rank: int = 0,
     global_rank: int = 0,
+    trust_remote_code: bool = False,
     **kwargs: Any,
 ) -> RolloutEngine:
     if engine_type == "torch":
@@ -275,5 +309,6 @@ def create_rollout_engine(
             world_size=world_size,
             local_rank=local_rank,
             global_rank=global_rank,
+            trust_remote_code=trust_remote_code,
         )
     raise ValueError(f"Not Support Rollout Engine Type: {engine_type}")
