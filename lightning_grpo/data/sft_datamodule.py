@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Optional
 
 from datasets import Dataset, IterableDataset
@@ -23,11 +24,7 @@ from lightning_grpo.models.common import load_tokenizer
 
 
 SFT_PACKED_FEATURES = packed_features("input_ids", "labels")
-"""On-disk schema for packed SFT rows: `input_ids`, `labels`, and `doc_starts`.
-
-The all-ones `attention_mask` of the previous pipeline is rebuilt by the collator, so
-only the tokens and their label mask are cached.
-"""
+"""On-disk schema for packed SFT rows; the collator rebuilds the all-ones `attention_mask`."""
 
 
 class SkipSFTSampleError(ValueError):
@@ -40,6 +37,9 @@ class SFTDataModule(ChatTemplateDataModule):
     Chat samples are tokenized into `input_ids`/`labels`, packed into max-length rows,
     and collated with the shared `PackedCausalLMCollator`, which rebuilds the attention
     mask instead of caching it.
+
+    Labels are built on the untruncated conversation and only then cut to `max_seq_length`,
+    keeping the tail, so truncation never silently drops assistant supervision.
     """
 
     def __init__(
@@ -62,6 +62,7 @@ class SFTDataModule(ChatTemplateDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         """Load and preprocess train and validation datasets."""
 
+        self._validate_assistant_only_loss_support()
         dataset_dict = self.load_dataset_dict()
 
         train_split = dataset_dict[self.data_config.train_split]
@@ -77,6 +78,54 @@ class SFTDataModule(ChatTemplateDataModule):
                 dataset_dict[val_split_name],
                 desc="Tokenizing and packing SFT validation dataset",
             )
+
+    def _validate_assistant_only_loss_support(self) -> None:
+        """Fail fast when assistant-only labels cannot be built for this tokenizer/config.
+
+        Without a usable assistant mask every sample raises during preprocessing and is
+        turned into a warning, so training would silently run on an empty dataset.
+        """
+
+        if not self.data_config.assistant_only_loss:
+            return
+        if self.data_config.assistant_response_template or self.data_config.assistant_response_template_ids:
+            return
+
+        has_generation_block = bool(
+            re.search(r"\{\%-?\s*generation\s*-?\%\}", getattr(self.tokenizer, "chat_template", None) or "")
+        )
+        if has_generation_block:
+            # A generation block can still yield an all-false mask, so probe one conversation.
+            try:
+                processed = self.chat_processor.tokenize(
+                    [{"role": "user", "content": "ping"}, {"role": "assistant", "content": "pong"}],
+                    add_generation_prompt=False,
+                    tools=None,
+                    max_length=None,
+                    return_assistant_tokens_mask=True,
+                    truncation=False,
+                )
+            except Exception as exc:  # re-raised with configuration guidance
+                raise RuntimeError(
+                    "data.assistant_only_loss=True could not obtain an assistant token mask from the tokenizer. "
+                    f"Tokenizer error: {type(exc).__name__}: {exc}. Configure data.assistant_response_template or "
+                    "data.assistant_response_template_ids, or set data.assistant_only_loss=False."
+                ) from exc
+
+            if any(self._extract_assistant_mask(processed)):
+                return
+
+        reason = (
+            "the tokenizer returned an all-false mask for a minimal chat sample"
+            if has_generation_block
+            else "the tokenizer chat template has no '{% generation %}' block"
+        )
+        raise RuntimeError(
+            f"data.assistant_only_loss=True needs an assistant token mask, but {reason} and no "
+            "data.assistant_response_template/data.assistant_response_template_ids is configured. Every sample would "
+            "be skipped and training would see no batches. Configure a response template, use a tokenizer whose chat "
+            "template marks generations, or set data.assistant_only_loss=False."
+        )
 
     def _build_dataset(
         self,
@@ -102,44 +151,25 @@ class SFTDataModule(ChatTemplateDataModule):
 
     @staticmethod
     def _extract_assistant_mask(processed: dict[str, Any]) -> list[bool]:
-        """Normalize assistant-token masks returned by chat templates across tokenizer variants."""
+        """Read the assistant-token mask emitted by `return_assistant_tokens_mask=True`."""
 
-        raw_mask = processed.get("assistant_masks")
-        if raw_mask is None:
-            raw_mask = processed.get("assistant_mask")
-        if raw_mask is None:
-            return []
-        return [bool(value) for value in raw_mask]
+        return [bool(value) for value in processed.get("assistant_masks") or []]
 
     @staticmethod
     def _find_subsequence_starts(sequence: list[int], subsequence: list[int]) -> list[int]:
         """Return all start offsets where a token subsequence appears."""
 
-        if not subsequence or len(subsequence) > len(sequence):
+        width = len(subsequence)
+        if not width:
             return []
-        template_len = len(subsequence)
-        return [
-            index
-            for index in range(len(sequence) - template_len + 1)
-            if sequence[index: index + template_len] == subsequence
-        ]
-
-    @staticmethod
-    def _next_marker_start(marker_starts: list[int], after: int, sequence_len: int) -> int:
-        """Return the next marker offset after a position, or the sequence end."""
-
-        return next((start for start in marker_starts if start > after), sequence_len)
+        return [start for start in range(len(sequence) - width + 1) if sequence[start: start + width] == subsequence]
 
     @staticmethod
     def _message_has_text(message: dict[str, Any]) -> bool:
         """Return whether a message has non-empty text content."""
 
         content = message.get("content", "")
-        if isinstance(content, str):
-            return bool(content.strip())
-        if content is None:
-            return False
-        return bool(content)
+        return bool(content.strip() if isinstance(content, str) else content)
 
     def _build_transform(
         self,
@@ -154,7 +184,6 @@ class SFTDataModule(ChatTemplateDataModule):
 
         extract_assistant_mask = self._extract_assistant_mask
         find_subsequence_starts = self._find_subsequence_starts
-        next_marker_start = self._next_marker_start
         message_has_text = self._message_has_text
 
         def assistant_response_template_ids() -> list[int]:
@@ -180,36 +209,30 @@ class SFTDataModule(ChatTemplateDataModule):
             *,
             add_generation_prompt: bool,
             return_assistant_tokens_mask: bool = False,
-        ) -> dict[str, Any] | None:
+        ) -> dict[str, Any]:
+            # Labels must be built on the full conversation: truncating here cuts the target tail.
             return chat_processor.tokenize(
                 messages,
                 add_generation_prompt=add_generation_prompt,
                 tools=tools,
-                max_length=data_config.max_seq_length,
+                max_length=None,
                 return_assistant_tokens_mask=return_assistant_tokens_mask,
+                truncation=False,
             )
 
-        def split_prompt_and_completion(
-            messages: list[dict[str, Any]],
-        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        def prompt_messages_only(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if messages and messages[-1].get("role") == "assistant":
-                return messages[:-1], [messages[-1]]
-            return list(messages), []
+                return messages[:-1]
+            return list(messages)
 
         def prompt_token_count(messages: list[dict[str, Any]], tools: Any) -> int:
-            prompt_messages, _ = split_prompt_and_completion(messages)
+            prompt_messages = prompt_messages_only(messages)
             processed = apply_chat_template_tokenize(
                 prompt_messages,
                 tools,
                 add_generation_prompt=should_add_generation_prompt(prompt_messages),
             )
             return len(processed["input_ids"])
-
-        def completion_mask_from_prompt_len(full_ids: list[int], prompt_len: int) -> list[bool]:
-            """Build a completion mask from tokenized prompt length."""
-
-            prompt_len = min(prompt_len, len(full_ids))
-            return [index >= prompt_len for index in range(len(full_ids))]
 
         def labels_from_response_template(full_ids: list[int]) -> list[int]:
             response_template_ids = assistant_response_template_ids()
@@ -228,11 +251,7 @@ class SFTDataModule(ChatTemplateDataModule):
                 )
 
             current_instruction_template_ids = instruction_template_ids()
-            instruction_starts = (
-                find_subsequence_starts(full_ids, current_instruction_template_ids)
-                if current_instruction_template_ids
-                else []
-            )
+            instruction_starts = find_subsequence_starts(full_ids, current_instruction_template_ids)
             if current_instruction_template_ids and not instruction_starts:
                 raise RuntimeError(
                     "Configured instruction template was not found in the tokenized sample. Check that "
@@ -249,7 +268,7 @@ class SFTDataModule(ChatTemplateDataModule):
             labels = [data_config.ignore_index] * len(full_ids)
             for response_start in response_starts:
                 label_start = response_start + len(response_template_ids)
-                label_end = next_marker_start(all_marker_starts, response_start, len(full_ids))
+                label_end = next((start for start in all_marker_starts if start > response_start), len(full_ids))
                 labels[label_start:label_end] = full_ids[label_start:label_end]
             return labels
 
@@ -257,16 +276,19 @@ class SFTDataModule(ChatTemplateDataModule):
             messages: list[dict[str, Any]],
             tools: Any,
             full_ids: list[int],
-            processed: dict[str, Any] | None,
+            processed: dict[str, Any],
         ) -> list[int]:
             labels = list(full_ids)
 
             if data_config.completion_only_loss:
-                completion_mask = completion_mask_from_prompt_len(full_ids, prompt_token_count(messages, tools))
-                labels = [token_id if mask else data_config.ignore_index for token_id, mask in zip(labels, completion_mask)]
+                prompt_len = prompt_token_count(messages, tools)
+                labels = [
+                    token_id if index >= prompt_len else data_config.ignore_index
+                    for index, token_id in enumerate(labels)
+                ]
 
             if data_config.assistant_only_loss:
-                assistant_mask = extract_assistant_mask(processed or {}) if processed is not None else []
+                assistant_mask = extract_assistant_mask(processed)
                 if assistant_mask and any(assistant_mask):
                     if len(assistant_mask) != len(full_ids):
                         raise RuntimeError("Assistant token mask length does not match tokenized input length.")
@@ -283,55 +305,51 @@ class SFTDataModule(ChatTemplateDataModule):
             return labels
 
         def validate_messages_for_training(messages: list[dict[str, Any]]) -> None:
-            user_messages = [message for message in messages if message.get("role") == "user"]
-            assistant_messages = [message for message in messages if message.get("role") == "assistant"]
-            if not user_messages:
-                raise SkipSFTSampleError("missing user message")
-            if not assistant_messages:
-                raise SkipSFTSampleError("missing assistant message")
-            if not any(message_has_text(message) for message in user_messages):
-                raise SkipSFTSampleError("empty prompt")
-            if not any(message_has_text(message) for message in assistant_messages):
-                raise SkipSFTSampleError("empty response")
+            if not any(message.get("role") == "user" and message_has_text(message) for message in messages):
+                raise SkipSFTSampleError("no user message with text")
+            if not any(message.get("role") == "assistant" and message_has_text(message) for message in messages):
+                raise SkipSFTSampleError("no assistant message with text")
 
         def tokenize_sample(sample: dict[str, Any]) -> dict[str, list[int]]:
             messages, tools = prepare_messages(sample)
             validate_messages_for_training(messages)
             add_generation_prompt = should_add_generation_prompt(messages)
-            needs_assistant_mask = data_config.assistant_only_loss
 
             processed = apply_chat_template_tokenize(
                 messages,
                 tools,
                 add_generation_prompt=add_generation_prompt,
-                return_assistant_tokens_mask=needs_assistant_mask,
+                return_assistant_tokens_mask=data_config.assistant_only_loss,
             )
 
             input_ids = list(processed["input_ids"])
             labels = build_labels(messages, tools, input_ids, processed)
             if not any(label != data_config.ignore_index for label in labels):
                 raise SkipSFTSampleError("assistant mask produced no trainable labels")
+
+            max_length = data_config.max_seq_length
+            if len(input_ids) > max_length:
+                # The SFT goal sits at the conversation end, so drop history from the front.
+                # `SequencePacker` never truncates, so the length invariant must hold here.
+                input_ids = input_ids[-max_length:]
+                labels = labels[-max_length:]
+                if not any(label != data_config.ignore_index for label in labels):
+                    raise SkipSFTSampleError("supervised target cut off by max_seq_length")
+
             return {"input_ids": input_ids, "labels": labels}
 
         def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
             tokenized_samples: list[dict[str, list[int]]] = []
-            skipped_reasons: dict[str, int] = {}
+            skipped: list[str] = []
 
             for raw_sample in iter_batch_samples(batch):
                 try:
                     tokenized_samples.append(tokenize_sample(raw_sample))
                 except Exception as exc:
-                    exc_message = str(exc)
-                    reason = f"preprocessing error: {type(exc).__name__}"
-                    if exc_message:
-                        reason = f"{reason}: {exc_message}"
-                    skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+                    skipped.append(f"{type(exc).__name__}: {exc}")
 
-            if skipped_reasons:
-                rank_zero_warn(
-                    "Skipped SFT samples: "
-                    + ", ".join(f"{reason}={count}" for reason, count in sorted(skipped_reasons.items()))
-                )
+            if skipped:
+                rank_zero_warn(f"Skipped {len(skipped)} SFT sample(s): {sorted(set(skipped))}")
 
             return packer.pack(
                 {

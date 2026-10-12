@@ -158,10 +158,18 @@ class ChatTemplateProcessor:
         *,
         add_generation_prompt: bool = False,
         tools: Any = None,
-        max_length: int,
+        max_length: Optional[int],
         return_assistant_tokens_mask: bool = False,
+        truncation: bool = True,
     ) -> dict[str, Any]:
-        """Tokenize chat messages through tokenizer templates with a text fallback."""
+        """Tokenize chat messages through tokenizer templates with a text fallback.
+
+        Pass ``truncation=False`` to tokenize the whole conversation (``max_length`` is then
+        ignored); callers that need supervision targets intact should build labels on the full
+        sequence and cut afterwards, since truncating here can drop assistant target tokens.
+        """
+
+        effective_max_length = max_length if truncation else None
 
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
@@ -170,8 +178,8 @@ class ChatTemplateProcessor:
                     tokenize=True,
                     add_generation_prompt=add_generation_prompt,
                     tools=tools,
-                    truncation=True,
-                    max_length=max_length,
+                    truncation=truncation,
+                    max_length=effective_max_length,
                     return_dict=True,
                     return_assistant_tokens_mask=return_assistant_tokens_mask,
                 )
@@ -190,8 +198,8 @@ class ChatTemplateProcessor:
         )
         tokenized = self.tokenizer(
             text,
-            truncation=True,
-            max_length=max_length,
+            truncation=truncation,
+            max_length=effective_max_length,
             padding=False,
             add_special_tokens=False,
         )
