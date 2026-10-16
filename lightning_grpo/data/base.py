@@ -823,27 +823,33 @@ class ChatTemplateDataModule(BaseDataModule):
         if self.data_config.packing_enabled:
             raise ValueError(f"data.packing_enabled is not supported for {task}: {reason}")
 
-    def prepare_messages(self, sample: Mapping[str, Any]) -> tuple[list[dict[str, Any]], Any]:
+    @staticmethod
+    def prepare_messages(
+        sample: Mapping[str, Any],
+        *,
+        data_config: DataConfig,
+        system_prompt: Optional[str] = None,
+    ) -> tuple[list[dict[str, Any]], Any]:
         """Read one dataset row as OpenAI messages plus tool definitions.
 
         Only the OpenAI shape is supported, so this validates the row and applies the
         system-prompt policy; it never rewrites one format into another.
         """
 
-        messages = sample.get(self.data_config.messages_column)
+        messages = sample.get(data_config.messages_column)
         if not messages:
             raise KeyError(
-                f"Sample carries no non-empty '{self.data_config.messages_column}' column. "
+                f"Sample carries no non-empty '{data_config.messages_column}' column. "
                 "Chat datasets must provide OpenAI messages: a list of "
                 "{'role', 'content'} dicts."
             )
         return preprocess_chat_messages(
             messages,
-            tools=sample.get(self.data_config.tools_column),
+            tools=sample.get(data_config.tools_column),
             system_prompt=sample_system_prompt(
-                self.system_prompt,
-                self.data_config.add_system_ratio,
+                system_prompt,
+                data_config.add_system_ratio,
                 messages,
-                seed=self.data_config.split_seed,
+                seed=data_config.split_seed,
             ),
         )

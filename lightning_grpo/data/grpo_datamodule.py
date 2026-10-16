@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import json
 from typing import Any, Optional
 
@@ -110,7 +111,12 @@ class GRPODataModule(ChatTemplateDataModule):
         chat_processor = self.chat_processor
         messages_column = self.data_config.messages_column
         add_generation_prompt = self.data_config.add_generation_prompt
-        prepare_messages = self.prepare_messages
+
+        prepare_messages = partial(
+            self.prepare_messages,
+            data_config=self.data_config,
+            system_prompt=self.system_prompt,
+        )
 
         def preprocess_batch(batch: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
             prompt_texts: list[str] = []

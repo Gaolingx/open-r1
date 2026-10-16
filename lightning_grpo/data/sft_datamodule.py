@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import re
 from typing import Any, Callable, Optional
 
@@ -180,7 +181,12 @@ class SFTDataModule(ChatTemplateDataModule):
         tokenizer = self.tokenizer
         chat_processor = self.chat_processor
         data_config = self.data_config
-        prepare_messages = self.prepare_messages
+
+        prepare_messages = partial(
+            self.prepare_messages,
+            data_config=data_config,
+            system_prompt=self.system_prompt,
+        )
 
         extract_assistant_mask = self._extract_assistant_mask
         find_subsequence_starts = self._find_subsequence_starts
