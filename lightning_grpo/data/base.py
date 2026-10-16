@@ -8,6 +8,7 @@ import json
 import random
 from typing import Any, Callable, Optional
 
+import pyarrow as pa
 import torch
 from datasets import (
     Dataset,
@@ -15,8 +16,6 @@ from datasets import (
     Features,
     IterableDataset,
     IterableDatasetDict,
-    Sequence as ArrowSequence,
-    Value,
     concatenate_datasets,
     interleave_datasets,
     load_dataset,
@@ -41,25 +40,28 @@ SYSTEM_PROMPTS = [
 ]
 
 
-def iter_batch_samples(batch: dict[str, list[Any]]) -> list[dict[str, Any]]:
-    """Convert a dict-of-lists batch into a list of row dictionaries."""
+def iter_batch_samples(batch: Mapping[str, Sequence[Any]]) -> list[dict[str, Any]]:
+    """Convert a batch of columns into a list of row dictionaries."""
 
-    if not batch:
-        return []
-    batch_size = len(next(iter(batch.values())))
-    return [
-        {key: value[index] for key, value in batch.items()}
-        for index in range(batch_size)
-    ]
+    return [dict(zip(batch, values)) for values in zip(*batch.values())]
+
+
+def decode_arrow_batch(batch: pa.Table, features: Features) -> dict[str, list[Any]]:
+    """Turn an Arrow batch into the decoded columns the Python path yields.
+
+    Arrow batches keep `Json`/media columns in their storage encoding -- a chat dataset's
+    `messages` column arrives as a JSON string -- while `Dataset.map` decodes the same
+    column before calling the transform.
+    """
+
+    columns = {name: batch.column(name).to_pylist() for name in batch.column_names}
+    return features.decode_batch(columns)
 
 
 def _stable_row_seed(content: Any, seed: int) -> int:
     """Derive a stable 64-bit RNG seed from a row's content and the split seed."""
 
-    try:
-        payload = json.dumps(content, sort_keys=True, ensure_ascii=True, default=str)
-    except (TypeError, ValueError):
-        payload = repr(content)
+    payload = json.dumps(content, sort_keys=True, ensure_ascii=True, default=str)
     digest = hashlib.blake2b(payload.encode("utf-8"), digest_size=8).digest()
     return seed ^ int.from_bytes(digest, "little")
 
@@ -160,16 +162,10 @@ class ChatTemplateProcessor:
         tools: Any = None,
         max_length: Optional[int],
         return_assistant_tokens_mask: bool = False,
-        truncation: bool = True,
     ) -> dict[str, Any]:
-        """Tokenize chat messages through tokenizer templates with a text fallback.
+        """Tokenize chat messages through tokenizer templates with a text fallback."""
 
-        Pass ``truncation=False`` to tokenize the whole conversation (``max_length`` is then
-        ignored); callers that need supervision targets intact should build labels on the full
-        sequence and cut afterwards, since truncating here can drop assistant target tokens.
-        """
-
-        effective_max_length = max_length if truncation else None
+        truncation = max_length is not None
 
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
@@ -179,7 +175,7 @@ class ChatTemplateProcessor:
                     add_generation_prompt=add_generation_prompt,
                     tools=tools,
                     truncation=truncation,
-                    max_length=effective_max_length,
+                    max_length=max_length,
                     return_dict=True,
                     return_assistant_tokens_mask=return_assistant_tokens_mask,
                 )
@@ -199,7 +195,7 @@ class ChatTemplateProcessor:
         tokenized = self.tokenizer(
             text,
             truncation=truncation,
-            max_length=effective_max_length,
+            max_length=max_length,
             padding=False,
             add_special_tokens=False,
         )
@@ -216,6 +212,20 @@ def resolve_shuffle_state(data_config: DataConfig) -> bool:
     """Resolve DataLoader shuffle state from data configuration."""
 
     return bool(data_config.shuffle and not data_config.streaming)
+
+
+def dataset_column_names(dataset: Dataset | IterableDataset) -> list[str]:
+    """Return a dataset's column names, resolving them for a streaming dataset.
+
+    `IterableDataset.column_names` stays `None` until the first batch has been read, so
+    every transform that needs the names upfront (renaming, selecting, dropping the
+    source columns in `map`) would silently skip its work. `_resolve_features` peeks a
+    single example to record the schema without touching the data.
+    """
+
+    if isinstance(dataset, IterableDataset) and dataset.column_names is None:
+        dataset = dataset._resolve_features()
+    return list(dataset.column_names)
 
 
 def rename_dataset_columns(
@@ -238,20 +248,18 @@ def rename_dataset_columns(
     if not column_mapping:
         return dataset
 
-    existing = getattr(dataset, "column_names", None)
-    if existing is not None:
-        available = set(existing)
-        for source, target in column_mapping.items():
-            if source not in available:
-                raise ValueError(
-                    f"column_mapping renames '{source}', but the dataset has no such column. "
-                    f"Available columns: {sorted(available)}."
-                )
-            if target in available and target != source:
-                raise ValueError(
-                    f"column_mapping would rename '{source}' to '{target}', but '{target}' "
-                    "already exists in the dataset."
-                )
+    available = set(dataset_column_names(dataset))
+    for source, target in column_mapping.items():
+        if source not in available:
+            raise ValueError(
+                f"column_mapping renames '{source}', but the dataset has no such column. "
+                f"Available columns: {sorted(available)}."
+            )
+        if target in available and target != source:
+            raise ValueError(
+                f"column_mapping would rename '{source}' to '{target}', but '{target}' "
+                "already exists in the dataset."
+            )
 
     for source, target in column_mapping.items():
         dataset = dataset.rename_column(source, target)
@@ -281,17 +289,10 @@ def select_dataset_columns(
 
     if not columns:
         return dataset
-    existing_columns = getattr(dataset, "column_names", None)
-    if not existing_columns:
+    existing = dataset_column_names(dataset)
+    selected = [name for name in columns if name in set(existing)]
+    if not selected or set(selected) == set(existing):
         return dataset
-    existing = set(existing_columns)
-    selected = [name for name in columns if name in existing]
-    if not selected or set(selected) == existing:
-        return dataset
-    if isinstance(dataset, IterableDataset):
-        # Streaming datasets cannot select columns, only drop the ones we do not want.
-        dropped = [name for name in existing_columns if name not in existing.intersection(selected)]
-        return dataset.remove_columns(dropped) if dropped else dataset
     return dataset.select_columns(selected)
 
 
@@ -431,6 +432,14 @@ def apply_chat_template(
 DOC_STARTS_COLUMN = "doc_starts"
 """Column recording where each packed document starts inside a packed row."""
 
+TOKEN_DTYPE = pa.int32()
+"""Arrow type of every packed token column.
+
+Declaring it matters: `pyarrow` infers `int64` for plain Python integer lists, which
+doubles the on-disk footprint, while `int32` covers any realistic vocabulary as well as
+any `ignore_index`.
+"""
+
 
 class SequencePacker:
     """Pack whole token sequences into fixed-length rows.
@@ -452,10 +461,12 @@ class SequencePacker:
       skipped sequence is kept for a later row. Sequences move at most ``lookahead``
       positions and the fill ratio rises to ~95%+.
 
-    ``Dataset.map`` requires the output to keep the input row count, so ``pack`` emits
-    at most one row per input sequence and fills the remainder with placeholder rows
-    that ``has_packed_documents`` filters out afterwards. Streaming pipelines have no
-    such invariant and can set ``emit_placeholders=False``.
+    ``pack`` returns a `pyarrow.Table` instead of a dict of columns, which is what lets
+    packing run inside `Dataset.map` despite changing the row count: `datasets` requires
+    equal lengths only when it merges a returned dict into the input row, and replaces
+    the input outright when the transform returns a table. Placeholder rows and the
+    `filter` that used to drop them are unnecessary as a result, for streaming and
+    in-memory datasets alike.
     """
 
     def __init__(
@@ -464,85 +475,82 @@ class SequencePacker:
         *,
         lookahead: int = 0,
         enabled: bool = True,
-        emit_placeholders: bool = True,
     ) -> None:
         self.max_seq_length = int(max_seq_length)
         self.lookahead = max(0, int(lookahead))
         self.enabled = bool(enabled)
-        self.emit_placeholders = bool(emit_placeholders)
 
     def plan(self, lengths: Sequence[int]) -> list[list[int]]:
-        """Group source indices into rows that each fit ``max_seq_length``.
+        """Group source indices into rows that each fit ``max_seq_length``."""
 
-        Returns one inner list per output row holding the indices of the sequences it
-        contains; an empty inner list is a placeholder row.
-        """
-
-        row_count = len(lengths)
         if not self.enabled:
             # Packing disabled: every sequence keeps its own row.
-            return [[index] for index in range(row_count)]
+            return [[index] for index in range(len(lengths))]
 
         rows: list[list[int]] = []
-        queue = list(range(row_count))
-        buffer: list[int] = []
-        buffer_length = 0
+        queue = list(range(len(lengths)))
+        row: list[int] = []
+        row_length = 0
 
         while queue:
-            window = min(len(queue), 1 + self.lookahead)
-            candidate = -1
-            for position in range(window):
-                index = queue[position]
-                if buffer_length + lengths[index] > self.max_seq_length:
-                    continue
-                # Largest sequence that still fits keeps rows full.
-                if candidate < 0 or lengths[index] > lengths[queue[candidate]]:
-                    candidate = position
+            window = queue[: 1 + self.lookahead]
+            # The largest sequence that still fits keeps rows full.
+            candidate = max(
+                (
+                    position
+                    for position, index in enumerate(window)
+                    if row_length + lengths[index] <= self.max_seq_length
+                ),
+                key=lambda position: lengths[window[position]],
+                default=-1,
+            )
 
             if candidate < 0:
-                if not buffer:
-                    # Defensive: a sequence longer than max_seq_length (a tokenizer that
-                    # ignores its own max_length) still goes in rather than looping.
-                    candidate = 0
-                else:
-                    # Nothing in the window fits, so close the row and try again.
-                    rows.append(buffer)
-                    buffer, buffer_length = [], 0
+                if row:
+                    # Nothing in the window fits next to what is already held.
+                    rows.append(row)
+                    row, row_length = [], 0
                     continue
+                # An empty row means the sequence itself is longer than max_seq_length.
+                candidate = 0
 
             index = queue.pop(candidate)
-            buffer.append(index)
-            buffer_length += lengths[index]
+            row.append(index)
+            row_length += lengths[index]
+            if row_length >= self.max_seq_length:
+                rows.append(row)
+                row, row_length = [], 0
 
-            if buffer_length >= self.max_seq_length:
-                rows.append(buffer)
-                buffer, buffer_length = [], 0
-
-        if buffer:
-            rows.append(buffer)
-
-        if self.emit_placeholders:
-            rows.extend([] for _ in range(row_count - len(rows)))
+        if row:
+            rows.append(row)
         return rows
 
-    def pack(self, columns: Mapping[str, Sequence[Sequence[int]]]) -> dict[str, list[list[int]]]:
-        """Concatenate the planned rows of every parallel column.
+    def pack(self, columns: Mapping[str, Sequence[Sequence[int]]]) -> pa.Table:
+        """Concatenate the planned rows of every parallel column into one Arrow table.
 
         ``columns`` holds the per-sequence token columns to pack (for example
-        ``{"input_ids": ids, "labels": labels}``). ``doc_starts`` is added to the
-        result because it is what lets the collator rebuild the boundary loss mask.
+        ``{"input_ids": ids, "labels": labels}``), all describing the same sequences.
+        ``doc_starts`` is appended because it is what lets the collator rebuild the
+        boundary loss mask.
         """
 
-        if not columns:
-            raise ValueError("SequencePacker.pack requires at least one column to pack.")
         lengths = [len(sequence) for sequence in next(iter(columns.values()))]
+        for name, sequences in columns.items():
+            if [len(sequence) for sequence in sequences] != lengths:
+                raise ValueError(
+                    f"SequencePacker.pack requires parallel columns, but '{name}' does not "
+                    "describe the same sequences as the first column."
+                )
+
         plan = self.plan(lengths)
         packed = {
             name: [[token for index in row for token in sequences[index]] for row in plan]
             for name, sequences in columns.items()
         }
         packed[DOC_STARTS_COLUMN] = compute_doc_starts(plan, lengths)
-        return packed
+        return pa.table(
+            {name: pa.array(values, type=pa.list_(TOKEN_DTYPE)) for name, values in packed.items()}
+        )
 
 
 def compute_doc_starts(plan: Sequence[Sequence[int]], lengths: Sequence[int]) -> list[list[int]]:
@@ -557,26 +565,6 @@ def compute_doc_starts(plan: Sequence[Sequence[int]], lengths: Sequence[int]) ->
             offset += lengths[index]
         starts_by_row.append(starts)
     return starts_by_row
-
-
-def has_packed_documents(row: Mapping[str, Any]) -> bool:
-    """Return True for real packed rows and False for packing placeholders."""
-
-    return len(row[DOC_STARTS_COLUMN]) > 0
-
-
-def packed_features(*token_columns: str, dtype: str = "int32") -> Features:
-    """Arrow schema for packed rows: `int32` token columns plus `doc_starts`.
-
-    Declaring ``int32`` matters: ``datasets`` infers ``int64`` for plain Python integer
-    lists, which doubles the Arrow footprint, while ``int32`` covers any realistic
-    vocabulary and any ``ignore_index``. ``doc_starts`` costs O(rows + documents)
-    rather than O(tokens), so it is essentially free next to the tokens it describes.
-    """
-
-    columns = {name: ArrowSequence(Value(dtype)) for name in token_columns}
-    columns[DOC_STARTS_COLUMN] = ArrowSequence(Value(dtype))
-    return Features(columns)
 
 
 def resolve_pad_token_id(tokenizer: Any) -> int:
@@ -623,7 +611,8 @@ class PackedCausalLMCollator:
         """Right-pad a batch of token sequences into a single long tensor.
 
         ``torch.nn.utils.rnn.pad_sequence`` cannot pad a zero-length sequence, and a
-        packing placeholder row is exactly that, so pad explicitly instead.
+        document that tokenizes to nothing (a tokenizer with neither BOS nor EOS) is
+        exactly that, so pad explicitly instead.
         """
 
         max_length = max((len(sequence) for sequence in sequences), default=0)
@@ -664,12 +653,11 @@ class PackedCausalLMCollator:
     def _mask_document_boundaries(self, labels: torch.Tensor, batch: list[dict[str, Any]]) -> None:
         """Ignore the token that starts a new document inside a packed row."""
 
-        sequence_length = labels.shape[1]
         for row, item in enumerate(batch):
-            for start in item.get(DOC_STARTS_COLUMN) or ():
-                # Offset 0 is never a prediction target after the internal shift, and
-                # anything past the real sequence belongs to a placeholder's tail.
-                if 0 < start < sequence_length:
+            # Offset 0 is never a prediction target after the internal shift, so the
+            # first document of a row is already handled.
+            for start in item[DOC_STARTS_COLUMN]:
+                if start > 0:
                     labels[row, start] = self.ignore_index
 
 
@@ -699,78 +687,59 @@ class BaseDataModule(LightningDataModule):
     def map_dataset(
         self,
         dataset: Dataset | IterableDataset,
-        preprocess_fn: Callable[..., dict[str, Any]],
+        preprocess_fn: Callable[..., Any],
         desc: str,
+        *,
+        table_output: bool = False,
         **kwargs: Any,
     ) -> Dataset | IterableDataset:
-        """Apply a shared batched dataset preprocessing transform."""
+        """Apply a shared batched dataset preprocessing transform.
 
+        A transform that returns a dict of columns is merged into the input row, so it
+        cannot change the row count. One that returns a `pyarrow.Table` replaces the
+        input instead -- `table_output=True` -- which is what lets packing collapse rows.
+        """
+
+        transform = preprocess_fn
         if isinstance(dataset, IterableDataset):
-            remove_columns = list(dataset.column_names) if dataset.column_names else None
-            return dataset.map(
-                preprocess_fn,
+            if table_output:
+                # `IterableDataset.map` only lets a returned table change the row count
+                # when its input batch is an Arrow table too. Switching back to `None`
+                # keeps the dataloader handing plain dict rows to the collator.
+                features = dataset._resolve_features().features
+                dataset = dataset.with_format("arrow")
+
+                def transform(batch: pa.Table) -> Any:
+                    return preprocess_fn(decode_arrow_batch(batch, features))
+
+            mapped = dataset.map(
+                transform,
                 batched=True,
                 batch_size=self.data_config.preprocessing_batch_size,
-                remove_columns=remove_columns,
+                remove_columns=dataset_column_names(dataset),
                 **kwargs,
             )
+            return mapped.with_format(None) if table_output else mapped
 
         return dataset.map(
-            preprocess_fn,
+            transform,
             batched=True,
             batch_size=self.data_config.preprocessing_batch_size,
             num_proc=self.data_config.num_workers,
-            remove_columns=list(dataset.column_names),
+            remove_columns=dataset_column_names(dataset),
             load_from_cache_file=self.data_config.preprocessing_use_cache,
             keep_in_memory=self.data_config.preprocessing_keep_in_memory,
             desc=desc,
             **kwargs,
         )
 
-    def map_packed_dataset(
-        self,
-        dataset: Dataset | IterableDataset,
-        preprocess_fn: Callable[..., dict[str, Any]],
-        desc: str,
-        *,
-        features: Optional[Features] = None,
-        drop_placeholders: bool = True,
-    ) -> Dataset | IterableDataset:
-        """Map a packing transform and drop the placeholder rows it emits.
-
-        `Dataset.map` cannot change the row count, so a packing transform emits at most
-        one row per input row and pads the rest with empty placeholders. Filtering them
-        out is index based, so the packed Arrow file is reused rather than rewritten.
-        """
-
-        if isinstance(dataset, IterableDataset):
-            packed = self.map_dataset(dataset, preprocess_fn, desc=desc)
-            return packed.filter(has_packed_documents) if drop_placeholders else packed
-
-        packed = self.map_dataset(dataset, preprocess_fn, desc=desc, features=features)
-        if not drop_placeholders:
-            return packed
-        return packed.filter(
-            has_packed_documents,
-            num_proc=self.data_config.num_workers,
-            load_from_cache_file=self.data_config.preprocessing_use_cache,
-            keep_in_memory=self.data_config.preprocessing_keep_in_memory,
-            desc=f"{desc} (dropping pack placeholders)",
-        )
-
-    def build_sequence_packer(
-        self,
-        max_seq_length: int,
-        *,
-        emit_placeholders: bool = True,
-    ) -> SequencePacker:
+    def build_sequence_packer(self, max_seq_length: int) -> SequencePacker:
         """Construct a packer from the shared data configuration."""
 
         return SequencePacker(
             max_seq_length,
             lookahead=self.data_config.packing_lookahead,
             enabled=self.data_config.packing_enabled,
-            emit_placeholders=emit_placeholders,
         )
 
     def _build_dataloader(

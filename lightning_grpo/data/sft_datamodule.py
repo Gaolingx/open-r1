@@ -6,6 +6,7 @@ from functools import partial
 import re
 from typing import Any, Callable, Optional
 
+import pyarrow as pa
 from datasets import Dataset, IterableDataset
 from lightning.pytorch.utilities import rank_zero_warn
 
@@ -17,15 +18,10 @@ from lightning_grpo.data.base import (
     PackedCausalLMCollator,
     SequencePacker,
     iter_batch_samples,
-    packed_features,
     resolve_pad_token_id,
     resolve_shuffle_state,
 )
 from lightning_grpo.models.common import load_tokenizer
-
-
-SFT_PACKED_FEATURES = packed_features("input_ids", "labels")
-"""On-disk schema for packed SFT rows; the collator rebuilds the all-ones `attention_mask`."""
 
 
 class SkipSFTSampleError(ValueError):
@@ -104,7 +100,6 @@ class SFTDataModule(ChatTemplateDataModule):
                     tools=None,
                     max_length=None,
                     return_assistant_tokens_mask=True,
-                    truncation=False,
                 )
             except Exception as exc:  # re-raised with configuration guidance
                 raise RuntimeError(
@@ -134,21 +129,11 @@ class SFTDataModule(ChatTemplateDataModule):
         *,
         desc: str,
     ) -> Dataset | IterableDataset:
-        """Tokenize chat samples, pack them into max-length rows, drop placeholders."""
+        """Tokenize chat samples and pack them into max-length rows."""
 
-        packer = self.build_sequence_packer(
-            self.data_config.max_seq_length,
-            # Streaming datasets have no fixed row count that must be preserved.
-            emit_placeholders=not isinstance(dataset, IterableDataset),
-        )
+        packer = self.build_sequence_packer(self.data_config.max_seq_length)
         transform = self._build_transform(packer)
-        return self.map_packed_dataset(
-            dataset,
-            transform,
-            desc=desc,
-            features=SFT_PACKED_FEATURES,
-            drop_placeholders=self.data_config.packing_enabled,
-        )
+        return self.map_dataset(dataset, transform, desc=desc, table_output=True)
 
     @staticmethod
     def _extract_assistant_mask(processed: dict[str, Any]) -> list[bool]:
@@ -175,8 +160,8 @@ class SFTDataModule(ChatTemplateDataModule):
     def _build_transform(
         self,
         packer: SequencePacker,
-    ) -> Callable[[dict[str, list[Any]]], dict[str, list[list[int]]]]:
-        """Build the row -> packed token columns transform."""
+    ) -> Callable[[dict[str, list[Any]]], pa.Table]:
+        """Build the row -> packed token table transform."""
 
         tokenizer = self.tokenizer
         chat_processor = self.chat_processor
@@ -223,7 +208,6 @@ class SFTDataModule(ChatTemplateDataModule):
                 tools=tools,
                 max_length=None,
                 return_assistant_tokens_mask=return_assistant_tokens_mask,
-                truncation=False,
             )
 
         def prompt_messages_only(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -344,7 +328,7 @@ class SFTDataModule(ChatTemplateDataModule):
 
             return {"input_ids": input_ids, "labels": labels}
 
-        def preprocess_batch(batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
+        def preprocess_batch(batch: dict[str, list[Any]]) -> pa.Table:
             tokenized_samples: list[dict[str, list[int]]] = []
             skipped: list[str] = []
 

@@ -4,27 +4,18 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import pyarrow as pa
 from datasets import Dataset, IterableDataset
 
 from lightning_grpo.data.base import (
     BaseDataModule,
     PackedCausalLMCollator,
     SequencePacker,
-    packed_features,
     resolve_pad_token_id,
     resolve_shuffle_state,
 )
 from lightning_grpo.models.common import load_tokenizer
 from lightning_grpo.utils.configs.pretrain import PretrainConfig
-
-
-PACKED_FEATURES = packed_features("input_ids")
-"""On-disk schema for packed pretraining rows: `input_ids` plus `doc_starts`.
-
-`input_ids` stores every token exactly once; the all-ones `attention_mask` and the
-`labels` copy of the previous pipeline are rebuilt by the collator instead of being
-cached, which removed two of the three token arrays from the Arrow files.
-"""
 
 
 class PretrainTokenizeAndPack:
@@ -33,7 +24,11 @@ class PretrainTokenizeAndPack:
     Documents are never split across rows and never shrunk to make room, so the only
     short rows are the tails of a packing batch, which the collator pads. That turns
     most padding tokens into real training tokens. `SequencePacker` documents the
-    lookahead and placeholder-row semantics.
+    lookahead and table-output semantics.
+
+    Cached rows hold `input_ids` and `doc_starts` only: the all-ones `attention_mask`
+    and the `labels` copy are rebuilt by the collator, which removes two of the three
+    token arrays from the Arrow files.
     """
 
     def __init__(
@@ -63,7 +58,7 @@ class PretrainTokenizeAndPack:
             tokens.append(self.eos_token_id)
         return tokens
 
-    def __call__(self, batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
+    def __call__(self, batch: dict[str, list[Any]]) -> pa.Table:
         """Tokenize one batch of raw texts and pack them into full-length rows."""
 
         texts = [str(text) for text in batch[self.text_column]]
@@ -92,27 +87,15 @@ class PretrainDataModule(BaseDataModule):
         )
 
     def _build_dataset(self, dataset: Dataset | IterableDataset, *, desc: str) -> Dataset | IterableDataset:
-        """Tokenize raw text, pack whole documents into max-length rows, drop placeholders."""
+        """Tokenize raw text and pack whole documents into max-length rows."""
 
-        packer = self.build_sequence_packer(
-            self.config.data.max_seq_length,
-            # Streaming datasets have no fixed row count that must be preserved.
-            emit_placeholders=not isinstance(dataset, IterableDataset),
-        )
         transform = PretrainTokenizeAndPack(
             self.tokenizer,
             text_column=self.config.data.text_column,
             max_seq_length=self.config.data.max_seq_length,
-            packer=packer,
+            packer=self.build_sequence_packer(self.config.data.max_seq_length),
         )
-
-        return self.map_packed_dataset(
-            dataset,
-            transform,
-            desc=desc,
-            features=PACKED_FEATURES,
-            drop_placeholders=self.config.data.packing_enabled,
-        )
+        return self.map_dataset(dataset, transform, desc=desc, table_output=True)
 
     def setup(self, stage: Optional[str] = None) -> None:
         """Load, tokenize, and pack the pretraining dataset."""
