@@ -33,7 +33,7 @@ class LoRAConfig:
     alpha: int = 32
     dropout: float = 0.05
     bias: Literal["none", "all", "lora_only"] = "none"
-    target_modules: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
+    target_modules: list[str] | str = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
     modules_to_save: list[str] = field(default_factory=list)
     lora_kwargs: dict[str, Any] = field(default_factory=dict)
 
