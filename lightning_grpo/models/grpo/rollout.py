@@ -47,7 +47,7 @@ class LocalGenerateRolloutCoordinator:
         *,
         engine_factory: EngineFactory = create_rollout_engine,
     ) -> None:
-        self.rollout = context.rollout
+        self.rollout_config = context.rollout
         self.model = context.model
         self.tokenizer = context.tokenizer
         self.device = context.device
@@ -87,15 +87,15 @@ class LocalGenerateRolloutCoordinator:
     def resolve_num_generations(self, training: bool) -> int:
         """Return the number of completions sampled per prompt."""
 
-        return self.rollout.num_generations if training else self.rollout.num_generations_eval
+        return self.rollout_config.num_generations if training else self.rollout_config.num_generations_eval
 
     def _max_prompt_length(self) -> int:
         """Return a prompt window that leaves room for at least one completion token."""
 
-        max_total_length = self.rollout.max_total_length
+        max_total_length = self.rollout_config.max_total_length
         if max_total_length <= 1:
             raise ValueError("rollout.max_total_length must be greater than 1 for GRPO loss computation.")
-        return min(self.rollout.max_prompt_length, max_total_length - 1)
+        return min(self.rollout_config.max_prompt_length, max_total_length - 1)
 
     def _tokenize_prompts(self, prompts: list[str]) -> dict[str, torch.Tensor]:
         """Left-pad prompts and truncate to the configured prompt window."""
@@ -139,9 +139,9 @@ class LocalGenerateRolloutCoordinator:
             prompt_ids=encoded["input_ids"],
             attention_mask=encoded["attention_mask"],
             num_generations=num_generations,
-            max_new_tokens=self.rollout.max_completion_length,
-            temperature=self.rollout.temperature if temperature is None else temperature,
-            top_p=self.rollout.top_p,
+            max_new_tokens=self.rollout_config.max_completion_length,
+            temperature=self.rollout_config.temperature if temperature is None else temperature,
+            top_p=self.rollout_config.top_p,
             greedy=greedy,
         )
 
@@ -155,7 +155,7 @@ class LocalGenerateRolloutCoordinator:
     def remax_baseline_enabled(self) -> bool:
         """Whether the configured advantage estimator needs a greedy baseline rollout."""
 
-        return str(self.rollout.advantage_estimator) == "remax"
+        return str(self.rollout_config.advantage_estimator) == "remax"
 
     def _remax_baseline_rollout(
         self,
@@ -173,7 +173,7 @@ class LocalGenerateRolloutCoordinator:
         the loss can consume them positionally.
         """
 
-        baseline_temperature = float(self.rollout.remax_baseline_temperature)
+        baseline_temperature = float(self.rollout_config.remax_baseline_temperature)
         greedy = baseline_temperature <= 0.0
         result = self._generate(
             prompts,
@@ -312,7 +312,7 @@ class LocalGenerateRolloutCoordinator:
             prompt_encoded = self._tokenize_prompts(prompts[::num_generations])
         prompt_ids = prompt_encoded["input_ids"].repeat_interleave(num_generations, dim=0)
         prompt_mask = prompt_encoded["attention_mask"].repeat_interleave(num_generations, dim=0)
-        completion_budget = self.rollout.max_total_length - prompt_ids.size(1)
+        completion_budget = self.rollout_config.max_total_length - prompt_ids.size(1)
         if completion_budget <= 0:
             raise RuntimeError(
                 "Tokenized prompts leave no room for completion tokens. "
@@ -331,7 +331,7 @@ class LocalGenerateRolloutCoordinator:
             old_logps = old_per_token_logps[:, :max_completion].to(self.device) * completion_mask.to(old_per_token_logps.dtype)
         else:
             with torch.no_grad():
-                old_logps = compute_per_token_logps(self.policy_fn(), prompt_ids, prompt_mask, completion_ids, completion_mask, self.rollout.temperature)
+                old_logps = compute_per_token_logps(self.policy_fn(), prompt_ids, prompt_mask, completion_ids, completion_mask, self.rollout_config.temperature)
         if engine_completion_truncated is not None:
             engine_truncated = engine_completion_truncated.to(device=completion_ids.device, dtype=torch.bool)
             completion_truncated = (engine_truncated | (pre_crop_lengths > max_completion)).to(torch.long)
