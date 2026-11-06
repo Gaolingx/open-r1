@@ -164,7 +164,7 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
             # VLLMGeneration.generate expects prompts to be expanded to one row per requested completion.
             # In server mode it de-duplicates with prompts[::num_generations]; in colocate mode it samples n=1.
             repeated_prompts = [ids for ids in prompt_id_lists for _ in range(num_generations)]
-            generated_prompt_ids, completion_id_lists, logprobs, logprob_token_ids = self.engine.generate(
+            generated_prompt_ids, completion_id_lists, logprobs, logprob_token_ids, _sampling_mask = self.engine.generate(
                 prompts=repeated_prompts,
                 images=None,
                 num_generations=num_generations,

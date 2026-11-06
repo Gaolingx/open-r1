@@ -87,6 +87,11 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         configure_fully_shard(self.policy, self.config.distributed, self.config.precision, self.device_mesh)
         self.policy = compile_model_if_configured(self.policy, self.config.model)
 
+        # Lightning moves the model to the device only after this hook returns, but the vLLM weight sync below
+        # runs over a NCCL communicator that rejects CPU tensors. A no-op once FSDP2 has already sharded onto
+        # the device.
+        self.policy.to(self.device)
+
         def policy_provider() -> torch.nn.Module:
             """Return the policy as it is bound right now, not as it was when loaded."""
 

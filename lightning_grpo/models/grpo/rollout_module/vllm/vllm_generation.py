@@ -21,7 +21,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
-from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
+from accelerate.utils import is_peft_model
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, is_bitsandbytes_available
@@ -32,7 +32,7 @@ from transformers.utils import (
     is_torch_xpu_available,
 )
 
-from ..distributed import DistributedBackend
+from ..distributed import DistributedBackend, broadcast_object_list, gather_object
 from ..extras.profiling import ProfilingContext
 from ..import_utils import is_vllm_available
 from ..utils import ensure_master_addr_port

@@ -17,6 +17,61 @@
 from contextlib import contextmanager
 
 
+# Process group backing the object collectives below, created on first use.
+_OBJECT_GROUP: object | None = None
+_OBJECT_GROUP_RESOLVED = False
+
+
+def _object_group():
+    """Process group for object collectives, or ``None`` when running single-process.
+
+    A replacement for `accelerate.utils.gather_object` needs one because Lightning's ``ModelParallelStrategy``
+    initializes the default group with ``device_id=<this rank's GPU>``. PyTorch picks the staging device for object
+    collectives from the group's backends, so payloads are staged in CUDA tensors, and on this stack that collective
+    is rejected with ``Attempt to perform collective on tensor not on device passed to init_process_group``. A gloo
+    group has no device binding and carries the same payloads.
+
+    ``new_group`` is itself a collective, so it can only be created once every rank runs the same call site, which
+    is why this is resolved lazily rather than in a constructor.
+    """
+
+    global _OBJECT_GROUP, _OBJECT_GROUP_RESOLVED
+    if not _OBJECT_GROUP_RESOLVED:
+        _OBJECT_GROUP_RESOLVED = True
+
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            _OBJECT_GROUP = dist.new_group(backend="gloo")
+    return _OBJECT_GROUP
+
+
+def gather_object(obj):
+    """Drop-in for `accelerate.utils.gather_object`, flattened the same way."""
+
+    group = _object_group()
+    if group is None:
+        return obj
+
+    import torch.distributed as dist
+
+    gathered: list = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(gathered, obj, group=group)
+    return [item for rank_objects in gathered for item in rank_objects]
+
+
+def broadcast_object_list(object_list, from_process: int = 0) -> None:
+    """Drop-in for `accelerate.utils.broadcast_object_list`."""
+
+    group = _object_group()
+    if group is None:
+        return
+
+    import torch.distributed as dist
+
+    dist.broadcast_object_list(object_list, src=from_process, group=group)
+
+
 class DistributedBackend:
     """Abstracts distributed backend specifics (DeepSpeed ZeRO, FSDP) behind a uniform API.
 
