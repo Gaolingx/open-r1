@@ -1,9 +1,18 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
+from transformers.utils import is_torch_xpu_available
+from accelerate import PartialState
 
-from trl import ModelConfig, get_kbit_device_map, get_quantization_config
+from trl import ModelConfig, get_quantization_config
 
 from ..configs import GRPOConfig, SFTConfig
+
+
+def get_kbit_device_map() -> dict[str, int] | None:
+    if torch.cuda.is_available() or is_torch_xpu_available():
+        return {"": PartialState().local_process_index}
+    else:
+        return None
 
 
 def get_tokenizer(model_args: ModelConfig, training_args: SFTConfig | GRPOConfig) -> PreTrainedTokenizer:
