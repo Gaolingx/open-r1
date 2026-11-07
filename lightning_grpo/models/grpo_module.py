@@ -9,7 +9,7 @@ import lightning as L
 import torch
 import torch.distributed as dist
 
-from lightning_grpo.models.common import (
+from lightning_grpo.utils.modeling_common import (
     build_optimizer,
     build_scheduler,
     compile_model_if_configured,

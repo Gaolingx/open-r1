@@ -18,7 +18,7 @@ from lightning.pytorch.utilities import rank_zero_only, rank_zero_info
 from transformers.optimization import get_scheduler
 
 from lightning_grpo.callbacks.router_bias import RouterBiasUpdateCallback
-from lightning_grpo.models.common import load_tokenizer, get_gathered_state_dict, save_pth_weights_direct
+from lightning_grpo.utils.modeling_common import load_tokenizer, get_gathered_state_dict, save_pth_weights_direct
 from lightning_grpo.utils.configs.base import LoggingConfig, ModelConfig, TrainingBaseConfig
 from lightning_grpo.utils.modeling import resolve_export_model
 from lightning_grpo.utils.config import save_json_config

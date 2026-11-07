@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from lightning_grpo.models.common import compute_per_token_logps
+from lightning_grpo.utils.modeling_common import compute_per_token_logps
 from lightning_grpo.models.grpo.contracts import EngineFactory, PolicyFn
 from lightning_grpo.models.grpo.rollout_module.rollout_engine import create_rollout_engine
 from lightning_grpo.models.grpo.rollout_module.utils import RolloutResult

@@ -1,4 +1,4 @@
-"""Shared optimization helpers for Lightning modules."""
+"""Shared model/optimizer helpers used by the Lightning modules."""
 
 from __future__ import annotations
 
@@ -16,19 +16,6 @@ from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.base import OptimizationConfig, ModelConfig
 from lightning_grpo.utils.parallel.tp_utils import gather_state_dict_for_save
-
-DTYPE_MAP = {
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-    "fp64": torch.float64,
-}
-
-
-def resolve_torch_dtype(model_param_dtype: str) -> torch.dtype:
-    """Resolve the parameter dtype from configuration."""
-
-    return DTYPE_MAP[model_param_dtype]
 
 
 def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] | None:

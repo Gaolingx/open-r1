@@ -9,8 +9,9 @@ from torch.distributed.device_mesh import DeviceMesh
 import torch
 import torch.nn as nn
 
-from lightning_grpo.models.common import get_transformer_backbone_model, resolve_torch_dtype
+from lightning_grpo.utils.modeling_common import get_transformer_backbone_model
 from lightning_grpo.utils.configs.base import DistributedConfig, PrecisionConfig
+from lightning_grpo.utils.dtype import resolve_torch_dtype
 from lightning_grpo.utils.parallel.fsdp_utils import get_fsdp_reshard_after_forward_policy
 
 

@@ -8,7 +8,7 @@ import lightning as L
 import torch
 
 from lightning_grpo.utils.configs.sft import SFTConfig
-from lightning_grpo.models.common import (
+from lightning_grpo.utils.modeling_common import (
     compile_model_if_configured,
     count_trainable_parameters,
     build_optimizer,

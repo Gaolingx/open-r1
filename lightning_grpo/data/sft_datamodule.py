@@ -21,7 +21,7 @@ from lightning_grpo.data.base import (
     resolve_pad_token_id,
     resolve_shuffle_state,
 )
-from lightning_grpo.models.common import load_tokenizer
+from lightning_grpo.utils.modeling_common import load_tokenizer
 
 
 class SkipSFTSampleError(ValueError):

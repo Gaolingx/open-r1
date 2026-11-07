@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.distributed.tensor import DTensor
 
-from lightning_grpo.models.common import get_lm_head_model, get_transformer_backbone_model
+from lightning_grpo.utils.modeling_common import get_lm_head_model, get_transformer_backbone_model
 from lightning_grpo.models.grpo.contracts import DistributedContext, PolicyFn, RewardScorer
 from lightning_grpo.models.grpo.loss import GRPOLossComputer
 

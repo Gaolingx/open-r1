@@ -26,7 +26,7 @@ from trl.chat_template_utils import (
     parse_response,
     supports_tool_calling,
 )
-from lightning_grpo.models.common import compute_per_token_logps
+from lightning_grpo.utils.modeling_common import compute_per_token_logps
 from lightning_grpo.models.grpo.rollout_module.utils import pad_sequences
 
 

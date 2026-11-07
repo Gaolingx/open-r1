@@ -10,7 +10,7 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, GenerationConfig, PreTrainedModel, AutoConfig
 from lightning.pytorch.utilities import rank_zero_info
 
-from lightning_grpo.models.common import resolve_torch_dtype
+from lightning_grpo.utils.dtype import resolve_torch_dtype
 from lightning_grpo.utils.models.loader import build_configured_model_class
 from lightning_grpo.utils.configs.base import ModelConfig, PrecisionConfig
 

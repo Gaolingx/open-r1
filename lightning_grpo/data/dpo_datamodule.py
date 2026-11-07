@@ -19,7 +19,7 @@ from lightning_grpo.data.base import (
     iter_batch_samples,
     sample_system_prompt,
 )
-from lightning_grpo.models.common import load_tokenizer
+from lightning_grpo.utils.modeling_common import load_tokenizer
 
 
 class DPOBatchCollator:

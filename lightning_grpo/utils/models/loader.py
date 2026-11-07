@@ -9,8 +9,8 @@ from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from transformers.utils import check_torch_load_is_safe
 from safetensors.torch import load_file as safe_load_file
 
-from lightning_grpo.models.common import resolve_torch_dtype
 from lightning_grpo.utils.configs.base import ModelConfig, PrecisionConfig
+from lightning_grpo.utils.dtype import resolve_torch_dtype
 
 SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
 WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
