@@ -694,10 +694,9 @@ def _call_advantage_estimator(fn: Any, token_level_rewards: torch.Tensor, **kwar
 
 @dataclass
 class GRPORolloutRewards:
-    """Rewards of the current rollout batch, locally and gathered across ranks."""
+    """Rewards of the current rollout batch after shaping, gathered across ranks."""
 
-    local: torch.Tensor
-    global_rewards: torch.Tensor
+    global_shaped_rewards: torch.Tensor
     global_per_func: torch.Tensor
     weights: torch.Tensor
 
@@ -804,7 +803,7 @@ class GRPOLossComputer(ABC):
         return loss_mask
 
     def _compute_rewards(self, rollout_batch: dict[str, Any]) -> GRPORolloutRewards:
-        """Score the completions locally, then gather the per-function rewards."""
+        """Score the completions locally, shape them, then gather the shaped totals."""
 
         rewards, rewards_per_func = self.reward_manager.compute_rewards(
             prompts=rollout_batch["prompts"],
@@ -813,14 +812,12 @@ class GRPOLossComputer(ABC):
             metadata=rollout_batch["metadata"],
         )
         rewards = self._apply_overlong_penalty(rollout_batch, rewards)
-        global_per_func = self.distributed.gather(rewards_per_func.detach())
-        weights = self.reward_manager.reward_weight_tensor.to(global_per_func.device)
-        global_rewards = (global_per_func * weights.unsqueeze(0)).nansum(dim=-1)
         return GRPORolloutRewards(
-            local=rewards.detach(),
-            global_rewards=global_rewards,
-            global_per_func=global_per_func,
-            weights=weights,
+            # The penalty lives outside every reward function, so the shaped total must be
+            # gathered; re-aggregating ``rewards_per_func`` would drop it.
+            global_shaped_rewards=self.distributed.gather(rewards.detach()),
+            global_per_func=self.distributed.gather(rewards_per_func.detach()),
+            weights=self.reward_manager.reward_weight_tensor.to(rewards_per_func.device),
         )
 
     def _apply_overlong_penalty(self, rollout_batch: dict[str, Any], rewards: torch.Tensor) -> torch.Tensor:
@@ -865,7 +862,7 @@ class GRPOLossComputer(ABC):
         # gathered tensor independent of the per-rank padded completion width. As a
         # consequence sequence statistics are computed over completions (as intended)
         # rather than over padded tokens.
-        token_level_rewards = rewards.global_rewards.unsqueeze(-1)
+        token_level_rewards = rewards.global_shaped_rewards.unsqueeze(-1)
         estimator_kwargs: dict[str, Any] = {
             "response_mask": torch.ones_like(token_level_rewards),
             "index": global_sample_ids.cpu().numpy(),
@@ -1024,7 +1021,7 @@ class GRPOLossComputer(ABC):
         return self.metrics_aggregator.build_training_metrics(
             global_rewards_per_func=rewards.global_per_func,
             reward_weights=rewards.weights,
-            global_shaped_rewards=rewards.global_rewards,
+            global_shaped_rewards=rewards.global_shaped_rewards,
             num_generations=num_generations,
             global_per_token_kl=self.distributed.gather(local_metrics["per_token_kl"].detach()),
             global_loss_mask=self.distributed.gather(local_metrics["loss_mask"].detach()),
