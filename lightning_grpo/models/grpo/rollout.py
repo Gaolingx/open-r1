@@ -9,10 +9,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from lightning_grpo.utils.modeling_common import compute_per_token_logps
-from lightning_grpo.models.grpo.contracts import EngineFactory, PolicyFn
+from lightning_grpo.models.grpo.contracts import EngineFactory, PolicyFn, uses_greedy_baseline
 from lightning_grpo.models.grpo.rollout_module.rollout_engine import create_rollout_engine
 from lightning_grpo.models.grpo.rollout_module.utils import RolloutResult
-from lightning_grpo.data.base import apply_chat_template
 
 if TYPE_CHECKING:
     from lightning_grpo.utils.configs.base import ModelConfig
@@ -145,32 +144,24 @@ class LocalGenerateRolloutCoordinator:
             greedy=greedy,
         )
 
-    @torch.no_grad()
-    def _generate_once(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-        """Generate one completion for each prompt and return padded completion ids."""
-
-        result = self._generate(prompts, num_generations=1)
-        return result.completion_ids, result.completion_mask, result.completions_text
-
     def remax_baseline_enabled(self) -> bool:
         """Whether the configured advantage estimator needs a greedy baseline rollout."""
 
-        return str(self.rollout_config.advantage_estimator) == "remax"
+        return uses_greedy_baseline(self.rollout_config.advantage_estimator)
 
     def _remax_baseline_rollout(
         self,
         prompts: list[str],
         batch_metadata: list[dict[str, Any]],
-        num_generations: int,
         prompt_encoded: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, Any]:
         """Greedy completions used as the ReMax reward baseline.
 
         ReMax subtracts the reward of a greedily decoded completion from the sampled
         rewards, so the baseline must come from the same policy at the same optimizer step.
-        ``rollout.remax_baseline_temperature`` selects greedy decoding (0) or a cold sample,
-        and the per-completion entries are expanded to match the sampled rollout order so
-        the loss can consume them positionally.
+        ``rollout.remax_baseline_temperature`` selects greedy decoding (0) or a cold sample.
+        One baseline per prompt is returned; the loss repeats it over the sampled
+        completions, so identical text is not scored once per generation.
         """
 
         baseline_temperature = float(self.rollout_config.remax_baseline_temperature)
@@ -182,30 +173,17 @@ class LocalGenerateRolloutCoordinator:
             greedy=greedy,
             temperature=None if greedy else baseline_temperature,
         )
-        baseline_completions = list(result.completions_text)
-        if len(baseline_completions) != len(prompts):
+        completions = list(result.completions_text)
+        completion_id_lists = list(result.completion_id_lists)
+        if not len(completions) == len(completion_id_lists) == len(prompts):
             raise RuntimeError(
-                f"ReMax baseline rollout returned {len(baseline_completions)} completions for "
-                f"{len(prompts)} prompts."
+                f"ReMax baseline rollout returned {len(completions)} completions and "
+                f"{len(completion_id_lists)} id lists for {len(prompts)} prompts."
             )
-        baseline_id_lists = list(result.completion_id_lists)
-
-        completions: list[str] = []
-        completion_id_lists: list[list[int]] = []
-        metadata: list[dict[str, Any]] = []
-        for index, completion in enumerate(baseline_completions):
-            base_metadata = batch_metadata[index] if index < len(batch_metadata) else {}
-            baseline_ids = list(baseline_id_lists[index]) if index < len(baseline_id_lists) else []
-            for _ in range(num_generations):
-                completions.append(completion)
-                completion_id_lists.append(baseline_ids)
-                metadata.append(
-                    self._metadata_for_generation(base_metadata, completion, [completion], unfinished=False)
-                )
         return {
             "baseline_completions": completions,
-            "baseline_completion_id_lists": completion_id_lists,
-            "baseline_metadata": metadata,
+            "baseline_completion_id_lists": [list(ids) for ids in completion_id_lists],
+            "baseline_metadata": self._generation_metadata(batch_metadata, completions),
         }
 
     def _batch_metadata(self, batch: dict[str, list[Any]]) -> list[dict[str, Any]]:
@@ -224,7 +202,13 @@ class LocalGenerateRolloutCoordinator:
             metadata.append(dict(parsed) if isinstance(parsed, dict) else {})
         return metadata
 
-    def _metadata_for_generation(self, base_metadata: dict[str, Any], completion: str, turn_outputs: list[str] | None = None, unfinished: bool = False) -> dict[str, Any]:
+    def _metadata_for_generation(
+        self,
+        base_metadata: dict[str, Any],
+        completion: str,
+        turn_outputs: list[str] | None = None,
+        unfinished: bool = False,
+    ) -> dict[str, Any]:
         """Preserve dataset metadata and add rollout-specific fields."""
 
         metadata = dict(base_metadata)
@@ -237,52 +221,44 @@ class LocalGenerateRolloutCoordinator:
         metadata["unfinished"] = unfinished
         return metadata
 
-    def _render_messages(self, messages: list[dict[str, Any]], tools: Any, *, add_generation_prompt: bool, open_thinking: bool) -> str:
-        """Render a chat state while tolerating tokenizers without custom kwargs."""
+    def _generation_metadata(
+        self,
+        batch_metadata: list[dict[str, Any]],
+        completions: list[str],
+        num_generations: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Repeat each prompt's metadata over its completions.
 
-        try:
-            return apply_chat_template(
-                self.tokenizer,
-                messages,
-                add_generation_prompt=add_generation_prompt,
-                tools=tools,
-                open_thinking=open_thinking,
-            )
-        except TypeError:
-            return apply_chat_template(
-                self.tokenizer,
-                messages,
-                add_generation_prompt=add_generation_prompt,
-                tools=tools,
-            )
+        ``completions`` is prompt-major with ``num_generations`` rows per prompt, which is
+        the order the rollout engine returns and the order the loss consumes.
+        """
+
+        metadata: list[dict[str, Any]] = []
+        for index, completion in enumerate(completions):
+            sample_index = index // num_generations
+            base_metadata = batch_metadata[sample_index] if sample_index < len(batch_metadata) else {}
+            metadata.append(self._metadata_for_generation(base_metadata, completion))
+        return metadata
 
     def _rollout_reasoning(self, batch: dict[str, list[Any]], *, num_generations: int) -> dict[str, Any]:
         """Generate single-turn reasoning RL completions."""
 
         prompts = list(batch["prompt_text"])
-        expanded_prompts = [prompt for prompt in prompts for _ in range(num_generations)]
         # Tokenize the prompt batch exactly once: generation and packing share the encoding.
         prompt_encoded = self._tokenize_prompts(prompts)
         result = self._generate(prompts, num_generations=num_generations, encoded=prompt_encoded)
-        completion_ids = result.completion_ids
-        completion_mask = result.completion_mask
         completions = result.completions_text
         old_per_token_logps = result.per_token_logps if result.per_token_logps.numel() > 0 else None
         batch_metadata = self._batch_metadata(batch)
-        metadata = []
-        for index, completion in enumerate(completions):
-            sample_index = index // num_generations
-            base_metadata = batch_metadata[sample_index] if sample_index < len(batch_metadata) else {}
-            metadata.append(self._metadata_for_generation(base_metadata, completion, [completion], unfinished=False))
         baseline = None
         if self.remax_baseline_enabled():
-            baseline = self._remax_baseline_rollout(prompts, batch_metadata, num_generations, prompt_encoded)
+            baseline = self._remax_baseline_rollout(prompts, batch_metadata, prompt_encoded)
         return self._pack_rollout(
-            expanded_prompts,
-            completion_ids,
-            completion_mask,
+            prompts,
+            result.completion_ids,
+            result.completion_mask,
             completions,
-            metadata,
+            self._generation_metadata(batch_metadata, completions, num_generations),
             num_generations=num_generations,
             old_per_token_logps=old_per_token_logps,
             prompt_encoded=prompt_encoded,
@@ -306,10 +282,10 @@ class LocalGenerateRolloutCoordinator:
         """Pack generated samples into tensors consumed by the GRPO loss."""
 
         tokenizer = self.tokenizer
-        # ``prompts`` holds one entry per completion; the base encoding covers one entry per
-        # prompt, so expand it to match ``completion_ids`` instead of tokenizing again.
+        # ``prompts`` holds one entry per prompt (prompt-major), so the prompt encoding is
+        # expanded to the per-completion rows instead of tokenizing again.
         if prompt_encoded is None:
-            prompt_encoded = self._tokenize_prompts(prompts[::num_generations])
+            prompt_encoded = self._tokenize_prompts(prompts)
         prompt_ids = prompt_encoded["input_ids"].repeat_interleave(num_generations, dim=0)
         prompt_mask = prompt_encoded["attention_mask"].repeat_interleave(num_generations, dim=0)
         completion_budget = self.rollout_config.max_total_length - prompt_ids.size(1)
@@ -347,7 +323,7 @@ class LocalGenerateRolloutCoordinator:
             "old_per_token_logps": old_logps.detach(),
             "completion_truncated": completion_truncated,
             "sample_ids": sample_ids,
-            "prompts": prompts[::num_generations],
+            "prompts": list(prompts),
             "completions": completions,
             "completion_id_lists": [row[row != tokenizer.pad_token_id].tolist() for row in completion_ids.detach().cpu()],
             "metadata": metadata,

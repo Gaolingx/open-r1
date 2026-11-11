@@ -31,6 +31,15 @@ PolicyFn = Callable[[], Any]
 #: Builds a rollout engine from the keyword arguments accepted by ``create_rollout_engine``.
 EngineFactory = Callable[..., Any]
 
+#: Advantage estimator that needs an extra, greedily decoded baseline rollout.
+REMAX_ESTIMATOR = "remax"
+
+
+def uses_greedy_baseline(advantage_estimator: Any) -> bool:
+    """Whether ``advantage_estimator`` consumes a greedy baseline rollout (ReMax)."""
+
+    return str(advantage_estimator) == REMAX_ESTIMATOR
+
 
 def _pad_to_shape(tensor: torch.Tensor, shape: list[int]) -> torch.Tensor:
     """Right-pad ``tensor`` with zeros up to ``shape`` (no-op when it already matches)."""

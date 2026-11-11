@@ -2,17 +2,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import logging
 import os
 import socket
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 from torch import Tensor
 from transformers import GenerationConfig
-
-
-logger = logging.getLogger(__name__)
 
 
 def _is_port_free(port: int, host: str = "127.0.0.1") -> bool:
@@ -60,9 +56,6 @@ def ensure_master_addr_port(addr: str | None = None, port: int | None = None) ->
 class RolloutResult:
     """Structured rollout outputs shared by all rollout backends."""
 
-    output_ids: torch.Tensor
-    prompt_ids: torch.Tensor
-    prompt_mask: torch.Tensor
     completion_ids: torch.Tensor
     completion_mask: torch.Tensor
     per_token_logps: torch.Tensor
@@ -72,7 +65,6 @@ class RolloutResult:
 
 
 class RolloutEngine(ABC):
-    tokenizer = None
 
     @abstractmethod
     def generate(self, prompt_ids: Tensor, attention_mask: Tensor, num_generations: int, max_new_tokens: int, temperature: float = 0.8, top_p: float = 1.0, *, greedy: bool = False) -> RolloutResult:

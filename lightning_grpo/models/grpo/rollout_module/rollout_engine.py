@@ -53,8 +53,6 @@ class TorchRolloutEngine(RolloutEngine):
             ).clone()
 
         prompt_len = prompt_ids.size(1)
-        repeated_prompt_ids = prompt_ids.repeat_interleave(num_generations, dim=0)
-        repeated_prompt_mask = attention_mask.repeat_interleave(num_generations, dim=0)
         completion_ids = output_ids[:, prompt_len:]
         completion_ids, completion_mask, completion_truncated, completion_id_lists = truncate_completions(
             completion_ids,
@@ -62,11 +60,7 @@ class TorchRolloutEngine(RolloutEngine):
             self.tokenizer.eos_token_id,
         )
         completions_text = self.tokenizer.batch_decode(completion_id_lists, skip_special_tokens=True)
-        output_ids = torch.cat([repeated_prompt_ids, completion_ids], dim=1)
         return RolloutResult(
-            output_ids=output_ids,
-            prompt_ids=repeated_prompt_ids,
-            prompt_mask=repeated_prompt_mask,
             completion_ids=completion_ids,
             completion_mask=completion_mask,
             per_token_logps=torch.empty((completion_ids.size(0), 0), dtype=torch.float32, device=completion_ids.device),
@@ -164,13 +158,13 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
             # VLLMGeneration.generate expects prompts to be expanded to one row per requested completion.
             # In server mode it de-duplicates with prompts[::num_generations]; in colocate mode it samples n=1.
             repeated_prompts = [ids for ids in prompt_id_lists for _ in range(num_generations)]
-            generated_prompt_ids, completion_id_lists, logprobs, logprob_token_ids, _sampling_mask = self.engine.generate(
+            _, completion_id_lists, logprobs, logprob_token_ids, _sampling_mask = self.engine.generate(
                 prompts=repeated_prompts,
                 images=None,
                 num_generations=num_generations,
             )
             per_token_logps_list = sampled_token_logprobs(logprobs, completion_id_lists, logprob_token_ids)
-            return self._build_rollout_result(generated_prompt_ids, completion_id_lists, per_token_logps_list, prompt_ids.device)
+            return self._build_rollout_result(completion_id_lists, per_token_logps_list, prompt_ids.device)
         finally:
             self.engine.max_completion_length = old_max_completion_length
             self.engine.temperature = old_temperature
@@ -208,13 +202,10 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
 
     def _build_rollout_result(
         self,
-        prompt_ids_list: list[list[int]],
         completion_ids_list: list[list[int]],
         logprobs_list: list[list[float]] | None,
         device: torch.device,
     ) -> RolloutResult:
-        repeated_prompt_ids = pad_sequences(prompt_ids_list, self.tokenizer.pad_token_id, device)
-        repeated_prompt_mask = (repeated_prompt_ids != self.tokenizer.pad_token_id).long()
         completion_ids_tensor = pad_sequences(completion_ids_list, self.tokenizer.pad_token_id, device)
         completion_ids, completion_mask, completion_truncated, completion_id_lists = truncate_completions(
             completion_ids_tensor,
@@ -227,11 +218,7 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
             aligned_logprobs = [row[:len(ids)] for row, ids in zip(logprobs_list, completion_id_lists, strict=True)]
             per_token_logps = pad_float_sequences(aligned_logprobs, completion_ids.size(1), device)
         completions_text = self.tokenizer.batch_decode(completion_id_lists, skip_special_tokens=True)
-        output_ids = torch.cat([repeated_prompt_ids, completion_ids], dim=1)
         return RolloutResult(
-            output_ids=output_ids,
-            prompt_ids=repeated_prompt_ids,
-            prompt_mask=repeated_prompt_mask,
             completion_ids=completion_ids,
             completion_mask=completion_mask,
             per_token_logps=per_token_logps,

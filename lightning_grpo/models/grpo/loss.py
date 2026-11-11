@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.parallel import loss_parallel
 
-from lightning_grpo.models.grpo.contracts import DistributedContext, PolicyFn, RewardScorer
+from lightning_grpo.models.grpo.contracts import DistributedContext, PolicyFn, RewardScorer, uses_greedy_baseline
 from lightning_grpo.utils.loss import core_algos as algos
 
 if TYPE_CHECKING:
@@ -760,7 +760,7 @@ class GRPOLossComputer(ABC):
         self.rollout_temperature = rollout_temperature
         self.loss_parallel_enabled = loss_parallel_enabled
         self.algorithm = resolve_grpo_algorithm(rollout)
-        self._uses_greedy_baseline = self.algorithm.advantage_estimator == "remax"
+        self._uses_greedy_baseline = uses_greedy_baseline(self.algorithm.advantage_estimator)
 
     # ------------------------------------------------------------------ API
     @abstractmethod
@@ -875,7 +875,9 @@ class GRPOLossComputer(ABC):
             **self.algorithm.actor_config.extra,
         }
         if self._uses_greedy_baseline:
-            estimator_kwargs["reward_baselines"] = self._remax_baselines(rollout_batch)
+            estimator_kwargs["reward_baselines"] = self._remax_baselines(
+                rollout_batch, num_generations=num_generations
+            )
 
         estimator = algos.get_adv_estimator_fn(self.algorithm.advantage_estimator)
         global_advantages = _call_advantage_estimator(estimator, token_level_rewards, **estimator_kwargs).squeeze(-1)
@@ -887,7 +889,7 @@ class GRPOLossComputer(ABC):
         )
         return GRPOAdvantages(local=local_advantages, global_advantages=global_advantages)
 
-    def _remax_baselines(self, rollout_batch: dict[str, Any]) -> torch.Tensor:
+    def _remax_baselines(self, rollout_batch: dict[str, Any], *, num_generations: int) -> torch.Tensor:
         """Score the greedy baseline completions produced by the rollout coordinator."""
 
         baselines = rollout_batch.get("baseline_completions")
@@ -897,15 +899,19 @@ class GRPOLossComputer(ABC):
                 "rollout.advantage_estimator='remax' so the rollout coordinator generates it."
             )
         prompts = list(rollout_batch["prompts"])
-        repeats = max(1, len(baselines) // max(1, len(prompts)))
+        if len(prompts) != len(baselines):
+            raise RuntimeError(
+                f"ReMax baseline rollout holds {len(baselines)} completions for {len(prompts)} prompts."
+            )
         _, baseline_per_func = self.reward_manager.compute_rewards(
-            prompts=[prompt for prompt in prompts for _ in range(repeats)],
+            prompts=prompts,
             completions=list(baselines),
             completion_id_lists=rollout_batch["baseline_completion_id_lists"],
             metadata=rollout_batch["baseline_metadata"],
         )
         weights = self.reward_manager.reward_weight_tensor.to(baseline_per_func.device)
         local_baselines = (baseline_per_func * weights.unsqueeze(0)).nansum(dim=-1)
+        local_baselines = local_baselines.repeat_interleave(num_generations)
         return self.distributed.gather(local_baselines.detach())
 
     def _local_advantages(
