@@ -15,6 +15,7 @@ import torch
 from lightning_grpo.models.grpo.contracts import DistributedContext
 from lightning_grpo.models.grpo.loss import (
     GRPO_ALGORITHM_PRESETS,
+    GRPORolloutRewards,
     approx_kl_divergence,
     entropy_from_logits,
     masked_mean,
@@ -263,6 +264,44 @@ class TestAdvantageComputation:
         assert gather.calls > 0
         assert advantages.global_advantages.numel() == 8
         assert torch.allclose(advantages.local, advantages.global_advantages[:4])
+
+    def test_gathered_group_ids_are_offset_per_rank(self, monkeypatch) -> None:
+        """Rank-local ids restart at zero, so the gather must offset them per rank."""
+
+        groups_per_rank = 2
+
+        class RankOneGather:
+            """Simulate rank 1 calling ``all_gather`` with its offset group ids."""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+                self.calls += 1
+                if self.calls % 2 == 1:
+                    return torch.cat([tensor, tensor])
+                return torch.cat([tensor - groups_per_rank, tensor], dim=0)
+
+        distributed = DistributedContext(rank=1, world_size=2, all_gather_fn=RankOneGather())
+        computer, _ = build_loss_computer(
+            rollout_config(loss_type="grpo", max_completion_length=COMPLETION_LEN), distributed=distributed
+        )
+        rewards = GRPORolloutRewards(
+            global_shaped_rewards=torch.tensor([2.0, 0.0, 1.0, 3.0, 2.0, 0.0, 1.0, 3.0]),
+            global_per_func=torch.zeros(8, 1),
+            weights=torch.ones(1),
+        )
+        captured: dict[str, object] = {}
+
+        def fake_estimator(token_level_rewards: torch.Tensor, **kwargs):
+            captured["index"] = kwargs["index"]
+            return torch.zeros_like(token_level_rewards), None
+
+        monkeypatch.setattr(algos, "get_adv_estimator_fn", lambda name: fake_estimator)
+
+        computer._compute_advantages(make_rollout_batch(), rewards, num_generations=NUM_GENERATIONS)
+
+        assert captured["index"].tolist() == [0, 0, 1, 1, 2, 2, 3, 3]
 
     def test_misaligned_ranks_raise_a_clear_error(self) -> None:
         def reordering_gather(tensor: torch.Tensor) -> torch.Tensor:

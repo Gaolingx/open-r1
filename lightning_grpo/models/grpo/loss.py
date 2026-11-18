@@ -848,13 +848,15 @@ class GRPOLossComputer(ABC):
     ) -> GRPOAdvantages:
         """Run the configured advantage estimator over the *global* rollout batch.
 
-        Normalizing on the gathered batch (rather than per rank) keeps every prompt
-        group complete: with ``num_generations`` completions per prompt, a rank-local
-        batch would otherwise split groups across ranks and change the baseline.
+        Each rank generates complete groups for its own prompts, but numbers those
+        groups from zero, so the raw ids collide after the gather. The offset below
+        keeps the groups distinct; normalizing on the gathered batch is what makes the
+        cross-rank metrics and the globally-whitened estimators consistent.
         """
 
         sample_ids = rollout_batch["sample_ids"].detach()
-        global_sample_ids = self.distributed.gather(sample_ids)
+        local_group_ids = self._global_group_ids(sample_ids, num_generations=num_generations)
+        global_sample_ids = self.distributed.gather(local_group_ids)
 
         # Every estimator reachable from here is outcome-only: the scalar reward sits on the
         # last valid token and the resulting advantage is broadcast over the sequence. A
@@ -881,7 +883,7 @@ class GRPOLossComputer(ABC):
         local_advantages = self._local_advantages(
             global_advantages,
             global_sample_ids,
-            sample_ids,
+            local_group_ids,
             num_generations=num_generations,
         )
         return GRPOAdvantages(local=local_advantages, global_advantages=global_advantages)
@@ -911,18 +913,26 @@ class GRPOLossComputer(ABC):
         local_baselines = local_baselines.repeat_interleave(num_generations)
         return self.distributed.gather(local_baselines.detach())
 
+    def _global_group_ids(self, sample_ids: torch.Tensor, *, num_generations: int) -> torch.Tensor:
+        """Offset the rank-local prompt-group ids so gathered groups stay distinct."""
+
+        if num_generations <= 0:
+            raise ValueError("num_generations must be positive.")
+        groups_per_rank = sample_ids.numel() // num_generations
+        return sample_ids + int(self.distributed.rank) * groups_per_rank
+
     def _local_advantages(
         self,
         global_advantages: torch.Tensor,
         global_sample_ids: torch.Tensor,
-        local_sample_ids: torch.Tensor,
+        local_group_ids: torch.Tensor,
         *,
         num_generations: int,
     ) -> torch.Tensor:
         """Recover this rank's slice of the globally normalized advantages."""
 
         global_size = global_advantages.numel()
-        local_size = local_sample_ids.numel()
+        local_size = local_group_ids.numel()
         if local_size == 0 or global_size % local_size != 0:
             raise RuntimeError(
                 f"Gathered reward batch ({global_size}) is not a whole multiple of the local "
@@ -930,13 +940,13 @@ class GRPOLossComputer(ABC):
             )
         start = int(self.distributed.rank) * local_size
         stop = start + local_size
-        if not torch.equal(global_sample_ids[start:stop].to(local_sample_ids.device), local_sample_ids):
+        if not torch.equal(global_sample_ids[start:stop].to(local_group_ids.device), local_group_ids):
             raise RuntimeError(
                 "Failed to recover this rank's advantages from the gathered reward tensor. "
                 "Ensure every rank receives the same local rollout batch size."
             )
 
-        local_advantages = global_advantages[start:stop].to(local_sample_ids.device)
+        local_advantages = global_advantages[start:stop].to(local_group_ids.device)
         keep = self._zero_advantage_group_mask(global_advantages, num_generations)
         if keep is not None:
             local_advantages = local_advantages * keep[start:stop].to(local_advantages.dtype)
