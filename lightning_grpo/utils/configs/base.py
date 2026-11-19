@@ -44,6 +44,7 @@ class ModelConfig:
 
     model_name_or_path: str = None
     model_revision: str = "main"
+    load_weights: bool = True
     custom_model: bool = False
     tokenizer_name_or_path: Optional[str] = None
     model_generation_config_path: Optional[str] = None

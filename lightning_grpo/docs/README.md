@@ -337,6 +337,18 @@ model:
 > `tie_word_embeddings: true`，报 `Missing key(s): lm_head.weight`）。这类模型请用
 > `custom_model: false`。
 
+> ⚠️ `custom_model: true` 默认会从 `model_name_or_path` 加载分片权重
+> （`pytorch_model.bin.index.json` / `model.safetensors.index.json`）。若目录里只有
+> `config.json` + tokenizer + 自定义 `modeling_*.py`（即 `*-Base-zero` 这类零初始化目录），
+> 必须显式关闭权重加载，否则报
+> `ValueError: Can't find a checkpoint index (...)`：
+>
+> ```yaml
+> model:
+>   custom_model: true
+>   load_weights: false   # 从头预训练 / 随机初始化
+> ```
+
 ### 自定义 architecture（如 NekoMind）
 
 仓库里的 `lightning_grpo/module/nekomind/` 提供了 NekoMindMoe2 的

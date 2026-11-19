@@ -5,6 +5,7 @@ import os
 import torch
 
 from functools import partial
+from lightning.pytorch.utilities import rank_zero_info
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from transformers.utils import check_torch_load_is_safe
 from safetensors.torch import load_file as safe_load_file
@@ -37,7 +38,13 @@ def build_configured_model_class(
         dtype=resolve_torch_dtype(precision_config.model_param_dtype),
     ).cpu()
 
-    load_sharded_checkpoint(model, model_config.model_name_or_path)
+    if model_config.load_weights:
+        load_sharded_checkpoint(model, model_config.model_name_or_path)
+    else:
+        rank_zero_info(
+            "[model] load_weights=false; skipping checkpoint load and training "
+            f"from randomly initialized weights ({model_config.model_name_or_path})."
+        )
     return model
 
 
