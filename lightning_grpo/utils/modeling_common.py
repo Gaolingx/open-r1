@@ -20,8 +20,8 @@ from lightning_grpo.utils.parallel.tp.tensor_parallel import gather_state_dict_f
 
 def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] | None:
     """
-    Internal helper to gather sharded TP/FSDP weights.
-    Must be called on all ranks if TP is enabled.
+    Internal helper to gather sharded TP/EP/FSDP weights.
+    Must be called on all ranks if TP or EP is enabled.
     """
     options = StateDictOptions(full_state_dict=True, cpu_offload=True)
 
@@ -30,8 +30,9 @@ def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] |
     tp_plan = getattr(model, "tp_plan", None)
     device_mesh = getattr(model, "_device_mesh", None)
     tp_size = getattr(model, "_tp_size", 1) or 1
+    ep_size = getattr(model, "_ep_size", 1) or 1
 
-    if tp_plan and device_mesh and tp_size > 1:
+    if (tp_plan and device_mesh and tp_size > 1) or ep_size > 1:
         gathered_sd = {}
         current_device = torch.device(f"cuda:{torch.cuda.current_device()}")
 

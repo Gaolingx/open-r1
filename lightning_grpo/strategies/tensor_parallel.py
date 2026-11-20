@@ -113,6 +113,25 @@ def expand_tp_plan(model: nn.Module, plan: dict[str, str]) -> dict[str, str]:
     return expanded_plan
 
 
+def _drop_expert_parallel_rules(
+    plan: dict[str, str],
+    ep_plan: dict[str, str] | None,
+) -> dict[str, str]:
+    """Drop the TP rules on modules EP already shards or hooks.
+
+    The two plans use the same names for the experts module and its weights, and the
+    TP module rule would install a second forward on top of the dispatch forward.
+    """
+    if not ep_plan:
+        return plan
+    ep_names = tuple(ep_plan)
+    return {
+        name: style
+        for name, style in plan.items()
+        if not any(name == ep_name or name.startswith(f"{ep_name}.") for ep_name in ep_names)
+    }
+
+
 def apply_custom_tensor_parallel(
     model: nn.Module,
     device_mesh: torch.distributed.device_mesh.DeviceMesh,
@@ -133,7 +152,11 @@ def apply_custom_tensor_parallel(
     rank_zero_info(f"Tensor-parallel plan for {type(model).__name__}: {final_plan}")
 
     tp_mesh = device_mesh["tensor_parallel"] if "tensor_parallel" in device_mesh.mesh_dim_names else device_mesh
-    return apply_tensor_parallelism(model, tp_mesh, expand_tp_plan(model, final_plan))
+    expanded_plan = _drop_expert_parallel_rules(
+        expand_tp_plan(model, final_plan),
+        getattr(model, "_ep_plan_expanded", None),
+    )
+    return apply_tensor_parallelism(model, tp_mesh, expanded_plan)
 
 
 def configure_tensor_parallel(

@@ -27,6 +27,7 @@ from lightning_grpo.utils.modeling_common import (
 )
 from lightning_grpo.models.grpo.loss import compute_liger_dpo_loss, compute_standard_dpo_loss
 from lightning_grpo.models.grpo.liger_loss import LigerDPOLossComputer
+from lightning_grpo.strategies.expert_parallel import configure_expert_parallel
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
@@ -88,11 +89,13 @@ class DPOLightningModule(L.LightningModule):
         if self.config.liger_kernel.patch_model_enabled():
             apply_liger_kernel(model=self.model, kernel_config=self.config.liger_kernel.kernel_config)
 
+        configure_expert_parallel(self.model, self.config.distributed, self.device_mesh)
         configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
         self.model = compile_model_if_configured(self.model, self.config.model)
 
         # Also shard the reference model
+        configure_expert_parallel(self.ref_model, self.config.distributed, self.device_mesh)
         configure_tensor_parallel(self.ref_model, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.ref_model, self.config.distributed, self.config.precision, self.device_mesh)
 

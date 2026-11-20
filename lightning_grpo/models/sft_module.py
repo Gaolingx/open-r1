@@ -18,6 +18,7 @@ from lightning_grpo.utils.modeling_common import (
 )
 from lightning_grpo.models.grpo.loss import resolve_token_stats, compute_standard_sft_loss
 from lightning_grpo.models.grpo.liger_loss import compute_liger_sft_loss
+from lightning_grpo.strategies.expert_parallel import configure_expert_parallel
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
@@ -50,6 +51,7 @@ class SFTLightningModule(L.LightningModule):
         if self.config.liger_kernel.patch_model_enabled():
             apply_liger_kernel(model=self.model, kernel_config=self.config.liger_kernel.kernel_config)
 
+        configure_expert_parallel(self.model, self.config.distributed, self.device_mesh)
         configure_tensor_parallel(
             self.model,
             self.config.distributed,

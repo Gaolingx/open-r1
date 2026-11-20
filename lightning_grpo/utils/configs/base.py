@@ -223,6 +223,15 @@ class TensorParallelConfig:
 
 
 @dataclass
+class ExpertParallelConfig:
+    """Expert parallel plan configuration for MoE models."""
+
+    plan: Literal["auto", "none", "default", "config"] = "auto"
+    plan_overrides: dict[str, str] = field(default_factory=dict)
+    implementation: str = "auto"
+
+
+@dataclass
 class DistributedConfig:
     """Distributed strategy configuration for Lightning."""
 
@@ -233,6 +242,7 @@ class DistributedConfig:
     sync_batchnorm: bool = False
     data_parallel_size: int | str = "auto"
     tensor_parallel_size: int | str = "auto"
+    expert_parallel_size: int = 1
     find_unused_parameters: bool = False
     gradient_as_bucket_view: bool = True
     fsdp_cpu_offload: bool = False
@@ -241,6 +251,7 @@ class DistributedConfig:
     fsdp_backward_prefetch: bool = True
     fsdp_fully_shard_kwargs: dict[str, Any] = field(default_factory=dict)
     tensor_parallel: TensorParallelConfig = field(default_factory=TensorParallelConfig)
+    expert_parallel: ExpertParallelConfig = field(default_factory=ExpertParallelConfig)
     model_parallel_kwargs: dict[str, Any] = field(default_factory=dict)
 
 

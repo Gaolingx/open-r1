@@ -23,6 +23,7 @@ from lightning_grpo.models.grpo.loss import GRPOLossComputer, create_grpo_loss_c
 from lightning_grpo.models.grpo.metrics import GRPOMetricsAggregator
 from lightning_grpo.models.grpo.reward import GRPORewardManager
 from lightning_grpo.models.grpo.tool_call import GRPOToolCallMixin
+from lightning_grpo.strategies.expert_parallel import configure_expert_parallel
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.configs.grpo import GRPOConfig
@@ -83,6 +84,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         if self.config.liger_kernel.patch_model_enabled():
             apply_liger_kernel(model=self.policy, kernel_config=self.config.liger_kernel.kernel_config)
 
+        configure_expert_parallel(self.policy, self.config.distributed, self.device_mesh)
         configure_tensor_parallel(self.policy, self.config.distributed, self.device_mesh)
         configure_fully_shard(self.policy, self.config.distributed, self.config.precision, self.device_mesh)
         self.policy = compile_model_if_configured(self.policy, self.config.model)
@@ -117,6 +119,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         )
         self.rollout_coordinator.update_policy()
         if self.reference_model is not None:
+            configure_expert_parallel(self.reference_model, self.config.distributed, self.device_mesh)
             configure_tensor_parallel(self.reference_model, self.config.distributed, self.device_mesh)
             configure_fully_shard(self.reference_model, self.config.distributed, self.config.precision, self.device_mesh)
 

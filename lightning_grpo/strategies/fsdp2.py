@@ -32,12 +32,14 @@ def configure_fully_shard(
         return
 
     dp_mesh = device_mesh["data_parallel"]
-    if dp_mesh.size() <= 1:
+    expert_mesh = getattr(model, "_expert_mesh", None)
+    if dp_mesh.size() <= 1 and expert_mesh is None:
         return
 
     _apply_fsdp(
         model=model,
         dp_mesh=dp_mesh,
+        expert_mesh=expert_mesh,
         param_dtype=resolve_torch_dtype(precision_config.fsdp_param_dtype),
         reduce_dtype=resolve_torch_dtype(precision_config.fsdp_reduce_dtype),
         pp_enabled=False,
@@ -47,6 +49,36 @@ def configure_fully_shard(
         backward_prefetch=distributed_config.fsdp_backward_prefetch,
         reshard_after_forward_policy=distributed_config.fsdp_reshard_after_forward,
     )
+
+
+def _shard_expert_modules(
+    model: nn.Module,
+    efsdp_mesh: DeviceMesh,
+    dp_size: int,
+    mp_policy: MixedPrecisionPolicy,
+    shard_kwargs: dict[str, Any],
+    cpu_offload: bool,
+) -> None:
+    """Shard the EP dispatch modules on the expert view of the ranks.
+
+    The experts hold one EP shard per rank, so their FSDP axis is ``efsdp``. An EP
+    group holds ``ep_size / tp_size`` distinct batches, hence the expert gradient
+    spans ``dp_size`` batches while its FSDP group only has ``efsdp`` ranks.
+    """
+    expert_fsdp_config = {"mesh": efsdp_mesh, "mp_policy": mp_policy, **shard_kwargs}
+    if cpu_offload:
+        expert_fsdp_config["offload_policy"] = CPUOffloadPolicy()
+
+    expert_modules = [
+        module for module in model.modules() if getattr(module, "_ep_dispatch_experts", False)
+    ]
+    for module in expert_modules:
+        fully_shard(module, **expert_fsdp_config, reshard_after_forward=True)
+        module.set_gradient_divide_factor(float(dp_size))
+        if efsdp_mesh.size() > 1:
+            # `set_gradient_divide_factor` uses PREMUL_SUM for factors other than the
+            # group size, which non-NCCL backends reject (torch#190747).
+            module.set_force_sum_reduction_for_comms(True)
 
 
 def _apply_fsdp(
@@ -60,6 +92,7 @@ def _apply_fsdp(
     forward_prefetch: bool = True,
     backward_prefetch: bool = True,
     reshard_after_forward_policy: str = "default",
+    expert_mesh: DeviceMesh | None = None,
 ) -> None:
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -93,6 +126,19 @@ def _apply_fsdp(
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         reshard_after_forward_policy, pp_enabled
     )
+
+    if expert_mesh is not None:
+        _shard_expert_modules(
+            model,
+            expert_mesh["efsdp"],
+            dp_mesh.size(),
+            mp_policy,
+            shard_kwargs,
+            cpu_offload,
+        )
+
+    if dp_mesh.size() <= 1:
+        return
 
     base_model = get_transformer_backbone_model(model)
     tie_embeddings = getattr(model.config, "tie_word_embeddings", False)
