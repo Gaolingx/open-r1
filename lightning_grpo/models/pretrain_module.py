@@ -50,7 +50,12 @@ class PretrainLightningModule(L.LightningModule):
         if self.config.liger_kernel.patch_model_enabled():
             apply_liger_kernel(model=self.model, kernel_config=self.config.liger_kernel.kernel_config)
 
-        configure_tensor_parallel(self.model, self.config.distributed, self.device_mesh)
+        configure_tensor_parallel(
+            self.model,
+            self.config.distributed,
+            self.device_mesh,
+            liger_fused_ce=self.config.liger_kernel.liger_ce_enabled(),
+        )
         configure_fully_shard(self.model, self.config.distributed, self.config.precision, self.device_mesh)
         self.model = compile_model_if_configured(self.model, self.config.model)
 
