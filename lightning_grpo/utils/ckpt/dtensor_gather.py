@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from torch.distributed._functional_collectives import AsyncCollectiveTensor
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
@@ -55,6 +56,13 @@ def gather_full_tensor(tensor: Any) -> Any:
             local = placement._to_replicate_tensor(local, mesh, mesh_dim, logical_shape)
         elif isinstance(placement, Partial):
             local = placement._reduce_value(local, mesh, mesh_dim)
+
+    # Collectives are async. `Shard._to_replicate_tensor` returns the raw
+    # ``AsyncCollectiveTensor`` (the strided one reshapes it, which waits implicitly), and
+    # ``.cpu()` on a CPU tensor is a no-op, so the wrapper would reach ``torch.save``
+    # and produce a file that ``torch.load(weights_only=True)`` refuses.
+    if isinstance(local, AsyncCollectiveTensor):
+        local = local.wait()
 
     return local
 
