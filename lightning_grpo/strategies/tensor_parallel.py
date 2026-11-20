@@ -132,8 +132,18 @@ def apply_custom_tensor_parallel(
             param_plan = _get_parameter_tp_plan(full_param_name, final_plan)
 
             if param_plan:
-                tp_layer.empty_param = param
-                sharded_data = tp_layer.shard_tensor(
+                # A module-level rule (e.g. `moe_tp_experts`) only installs the
+                # communication hooks; the weights of such a module are sharded by
+                # their *own* rules (`experts.gate_up_proj` -> packed_colwise).
+                # Resolve the style per parameter, otherwise the module style is
+                # applied to it, and `moe_tp_experts` -- a no-op sharder -- would
+                # leave the weights replicated while the output hook still sums
+                # every rank's copy, inflating the routed-expert output by tp_size.
+                shard_layer = ALL_PARALLEL_STYLES[param_plan]
+                shard_layer.device_mesh = tp_mesh
+                shard_layer.rank = rank
+                shard_layer.empty_param = param
+                sharded_data = shard_layer.shard_tensor(
                     param.data,
                     device=param.device,
                     dtype=param.dtype
@@ -141,7 +151,7 @@ def apply_custom_tensor_parallel(
                 new_param = nn.Parameter(sharded_data, requires_grad=param.requires_grad)
                 setattr(module, param_name, new_param)
 
-                tp_layer.update_module_attributes(module)
+                shard_layer.update_module_attributes(module)
 
         # Handling DTensor conversion (focus on lm_head and loss_parallel)
         if name == "lm_head" and tp_config.loss_parallel:
