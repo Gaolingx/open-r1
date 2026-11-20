@@ -7,30 +7,39 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from peft import PeftModel
 from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.optimization import get_scheduler
 from transformers.trainer_utils import unwrap_peft_model
 from lightning.pytorch.utilities import rank_zero_info
 
+from lightning_grpo.utils.ckpt import gather_full_tensor
 from lightning_grpo.utils.configs.base import OptimizationConfig, ModelConfig
 
 
+@torch.no_grad()
 def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] | None:
     """Gather sharded TP/EP/FSDP weights to full CPU tensors on rank 0.
 
-    Every sharded parameter is a ``DTensor``, so DCP's full state dict materializes all of
-    them (TP, EP and FSDP shards alike). Must be called on all ranks.
+    DCP's full state dict redistributes every parameter to ``Replicate``, which torch 2.10
+    rejects for the ``_StridedShard`` placements of packed weights. Keep the sharded
+    ``DTensor`` entries and materialize them with the per-placement primitives instead.
+    Must be called on all ranks.
     """
-    gathered_sd = get_model_state_dict(
-        model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
-    )
+    is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+    sharded_sd = get_model_state_dict(model)
 
-    if dist.is_initialized() and dist.get_rank() != 0:
-        return None
+    gathered_sd: dict[str, Any] = {}
+    for key, value in sharded_sd.items():
+        if isinstance(value, torch.Tensor):
+            value = gather_full_tensor(value)
+            if is_rank0:
+                gathered_sd[key] = value.detach().cpu()
+        elif is_rank0:
+            gathered_sd[key] = value
 
-    return gathered_sd
+    return gathered_sd if is_rank0 else None
 
 
 def compile_model_if_configured(model: torch.nn.Module, model_config: ModelConfig) -> torch.nn.Module:

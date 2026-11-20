@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+import warnings
 from typing import TYPE_CHECKING
 
 from transformers.utils import logging
@@ -25,7 +26,7 @@ from .parallel_utils import (
     _use_local_dtensor_params,
     replace_layer_number_by_wildcard,
 )
-from .utils import _warning_once_on_rank_zero
+from .utils import _get_torch_distributed_rank, _warning_once_on_rank_zero
 
 
 if TYPE_CHECKING:
@@ -680,3 +681,27 @@ def gather_state_dict_for_save(
         else:
             gathered[key] = tensor
     return gathered
+
+
+# BC: these moved to expert_parallel.py in v5.21, keep the old import path with a warning until v5.23.
+# Lazy import because expert_parallel.py imports from this file (circular import otherwise).
+_MOVED_TO_EXPERT_PARALLEL = (
+    "MoEParamShard",
+    "EpDispatchExpertsParallel",
+    "apply_expert_parallelism",
+)
+
+
+def __getattr__(name: str):
+    if name in _MOVED_TO_EXPERT_PARALLEL:
+        from . import expert_parallel
+
+        if _get_torch_distributed_rank() == 0:
+            warnings.warn(
+                f"`transformers.distributed.tensor_parallel.{name}` is deprecated and will be removed in v5.23: "
+                f"import it from `transformers.distributed.expert_parallel` instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+        return getattr(expert_parallel, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
