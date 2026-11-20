@@ -54,7 +54,7 @@ def test_lm_head_follows_loss_parallel_when_liger_ce_is_disabled():
     model = _model(tp_plan={"lm_head": "colwise_gather_output"})
 
     assert get_resolved_tp_plan(model, _tp())["lm_head"] == "colwise_gather_output"
-    assert get_resolved_tp_plan(model, _tp(loss_parallel=True))["lm_head"] == "colwise"
+    assert get_resolved_tp_plan(model, _tp(loss_parallel=True))["lm_head"] == "colwise_loss_parallel"
 
 
 def test_lm_head_is_dropped_when_liger_fused_ce_is_enabled():

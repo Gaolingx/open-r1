@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
-from typing import Dict, Any, Optional
-
-from torch.distributed.tensor import distribute_tensor, Shard, Replicate, DTensor
 from lightning.pytorch.utilities import rank_zero_info
+from torch.distributed.tensor import Replicate, Shard
+
 from lightning_grpo.utils.configs.base import DistributedConfig
-from lightning_grpo.utils.parallel.tp_utils import (
+from lightning_grpo.utils.parallel.tp.parallel_utils import (
     ALL_PARALLEL_STYLES,
-    _get_parameter_tp_plan,
-    add_tensor_parallel_hooks_to_module,
+    _get_parameter_plan,
+)
+from lightning_grpo.utils.parallel.tp.tensor_parallel import (
+    ColwiseParallel,
+    apply_tensor_parallelism,
+)
+
+# Loss parallel computes the cross-entropy on a vocabulary-sharded `DTensor`, while the
+# stock `colwise` style turns its output into a local tensor. Keep the shard as a DTensor.
+ALL_PARALLEL_STYLES.register(
+    "colwise_loss_parallel",
+    ColwiseParallel(input_layouts=Replicate(), output_layouts=Shard(-1), use_local_output=False),
 )
 
 
@@ -25,7 +36,7 @@ def _tp_enabled(distributed_config: DistributedConfig) -> bool:
     return distributed_config.tensor_parallel_size > 1
 
 
-def _qualify_base_model_tp_plan(model: nn.Module, plan: Dict[str, str]) -> Dict[str, str]:
+def _qualify_base_model_tp_plan(model: nn.Module, plan: dict[str, str]) -> dict[str, str]:
     """Rewrite base-model-relative rule names to fully-qualified module names.
 
     ``config.base_model_tp_plan`` is written against the base model (``layers.*.mlp``),
@@ -48,7 +59,7 @@ def get_resolved_tp_plan(
     tp_config: Any,
     *,
     liger_fused_ce: bool = False,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     resolved_plan = {}
 
     if tp_config.plan in ["auto", "default"]:
@@ -74,35 +85,32 @@ def get_resolved_tp_plan(
                 "loss bypasses the tensor-parallel gather hook."
             )
     elif lm_head_key in resolved_plan:
-        resolved_plan[lm_head_key] = "colwise" if tp_config.loss_parallel else "colwise_gather_output"
+        resolved_plan[lm_head_key] = (
+            "colwise_loss_parallel" if tp_config.loss_parallel else "colwise_gather_output"
+        )
 
     return resolved_plan
 
 
-def wrap_module_parameters_as_dtensor(module, device_mesh, tp_plan_name):
-    """Wrap the already sharded Parameter as a DTensor."""
-    tp_mesh = device_mesh["tensor_parallel"] if "tensor_parallel" in device_mesh.mesh_dim_names else device_mesh
+def expand_tp_plan(model: nn.Module, plan: dict[str, str]) -> dict[str, str]:
+    """Replace the wildcards of the plan's rules with the model's layer numbers.
 
-    for param_name, param in module.named_parameters(recurse=False):
-        # 1. Automatically determine shard dimensions
-        # Linear.weight: [out_features, in_features]
-        # Linear.bias: [out_features]
-        if "colwise" in tp_plan_name:
-            # Colwise: Weights are sharded along dim 0, biases are sharded along dim 0
-            sharding_dim = 0
-        elif "rowwise" in tp_plan_name:
-            # Rowwise: Weights are sharded along dim 1, biases are usually not sharded (Replicate)
-            sharding_dim = 1 if param.ndim > 1 else -1
-        else:
-            continue
-        dist_spec = [Shard(sharding_dim)] if sharding_dim != -1 else [Replicate()]
+    ``apply_tensor_parallelism`` looks entries up by concrete name, and shards a
+    module's own parameters before installing that module's forward.
+    """
+    expanded_plan = {}
 
-        # 2. Use from_local to wrap, without copying memory.
-        # Note: At this time, param.data must already be a local shard that has been split by shard tensor.
-        dt_param = DTensor.from_local(param.data, tp_mesh, dist_spec)
+    for module_name, module in model.named_modules():
+        module_style = _get_parameter_plan(module_name, plan, is_weight=False)
+        for param_name, _ in module.named_parameters(recurse=False):
+            name = f"{module_name}.{param_name}" if module_name else param_name
+            param_style = _get_parameter_plan(name, plan, is_weight=True)
+            if param_style is not None:
+                expanded_plan[name] = param_style
+        if module_style is not None:
+            expanded_plan[module_name] = module_style
 
-        new_param = nn.Parameter(dt_param, requires_grad=param.requires_grad)
-        setattr(module, param_name, new_param)
+    return expanded_plan
 
 
 def apply_custom_tensor_parallel(
@@ -113,70 +121,19 @@ def apply_custom_tensor_parallel(
     liger_fused_ce: bool = False,
 ):
     final_plan = get_resolved_tp_plan(model, tp_config, liger_fused_ce=liger_fused_ce)
+    if not final_plan:
+        return model
+
+    if unsupported := set(final_plan.values()) - set(ALL_PARALLEL_STYLES.keys()):
+        raise ValueError(
+            f"Unsupported tensor-parallel styles {sorted(unsupported)}. "
+            f"Supported styles are {list(ALL_PARALLEL_STYLES.keys())}"
+        )
+
     rank_zero_info(f"Tensor-parallel plan for {type(model).__name__}: {final_plan}")
 
     tp_mesh = device_mesh["tensor_parallel"] if "tensor_parallel" in device_mesh.mesh_dim_names else device_mesh
-    rank = tp_mesh.get_local_rank()
-
-    for name, module in model.named_modules():
-        plan_name = _get_parameter_tp_plan(name, final_plan, is_weight=False)
-        if plan_name is None:
-            continue
-
-        tp_layer = ALL_PARALLEL_STYLES[plan_name]
-        tp_layer.device_mesh = tp_mesh
-        tp_layer.rank = rank
-
-        for param_name, param in module.named_parameters(recurse=False):
-            full_param_name = f"{name}.{param_name}"
-            param_plan = _get_parameter_tp_plan(full_param_name, final_plan)
-
-            if param_plan:
-                # A module-level rule (e.g. `moe_tp_experts`) only installs the
-                # communication hooks; the weights of such a module are sharded by
-                # their *own* rules (`experts.gate_up_proj` -> packed_colwise).
-                # Resolve the style per parameter, otherwise the module style is
-                # applied to it, and `moe_tp_experts` -- a no-op sharder -- would
-                # leave the weights replicated while the output hook still sums
-                # every rank's copy, inflating the routed-expert output by tp_size.
-                shard_layer = ALL_PARALLEL_STYLES[param_plan]
-                shard_layer.device_mesh = tp_mesh
-                shard_layer.rank = rank
-                shard_layer.empty_param = param
-                sharded_data = shard_layer.shard_tensor(
-                    param.data,
-                    device=param.device,
-                    dtype=param.dtype
-                )
-                new_param = nn.Parameter(sharded_data, requires_grad=param.requires_grad)
-                setattr(module, param_name, new_param)
-
-                shard_layer.update_module_attributes(module)
-
-        # Handling DTensor conversion (focus on lm_head and loss_parallel)
-        if name == "lm_head" and tp_config.loss_parallel:
-            # Wrap the locally segmented Tensor into a DTensor
-            wrap_module_parameters_as_dtensor(module, tp_mesh, plan_name)
-
-            # Remove the old hook (ColwiseParallel will register all_reduce_backward)
-            # because DTensor will handle these internally automatically.
-            if hasattr(module, "_forward_pre_hooks"): module._forward_pre_hooks.clear()
-            if hasattr(module, "_forward_hooks"): module._forward_hooks.clear()
-
-            # Input into the DTensor field
-            module.register_forward_pre_hook(
-                lambda mod, inputs: (distribute_tensor(inputs[0], tp_mesh, [Replicate()]),)
-            )
-        else:
-            # Non loss parallel modules use the original Hook
-            add_tensor_parallel_hooks_to_module(
-                model=model,
-                module=module,
-                layer_name=name,
-                current_module_plan=plan_name,
-                device_mesh=tp_mesh
-            )
-    return model
+    return apply_tensor_parallelism(model, tp_mesh, expand_tp_plan(model, final_plan))
 
 
 def configure_tensor_parallel(

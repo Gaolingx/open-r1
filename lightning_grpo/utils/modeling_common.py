@@ -15,7 +15,7 @@ from transformers.trainer_utils import unwrap_peft_model
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.base import OptimizationConfig, ModelConfig
-from lightning_grpo.utils.parallel.tp_utils import gather_state_dict_for_save
+from lightning_grpo.utils.parallel.tp.tensor_parallel import gather_state_dict_for_save
 
 
 def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] | None:
@@ -29,7 +29,7 @@ def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] |
 
     tp_plan = getattr(model, "tp_plan", None)
     device_mesh = getattr(model, "_device_mesh", None)
-    tp_size = getattr(model, "_tp_size", 1)
+    tp_size = getattr(model, "_tp_size", 1) or 1
 
     if tp_plan and device_mesh and tp_size > 1:
         gathered_sd = {}
@@ -37,12 +37,7 @@ def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] |
 
         for k, v in raw_state_dict.items():
             temp_dict = {k: v.to(current_device)}
-            temp_gathered = gather_state_dict_for_save(
-                state_dict=temp_dict,
-                tp_plan=tp_plan,
-                device_mesh=device_mesh,
-                tp_size=tp_size
-            )
+            temp_gathered = gather_state_dict_for_save(temp_dict, tp_plan, device_mesh, tp_size)
             gathered_sd[k] = temp_gathered[k].cpu()
 
         torch.cuda.empty_cache()
