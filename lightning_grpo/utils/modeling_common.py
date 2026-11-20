@@ -15,39 +15,19 @@ from transformers.trainer_utils import unwrap_peft_model
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.configs.base import OptimizationConfig, ModelConfig
-from lightning_grpo.utils.parallel.tp.tensor_parallel import gather_state_dict_for_save
 
 
 def get_gathered_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor] | None:
+    """Gather sharded TP/EP/FSDP weights to full CPU tensors on rank 0.
+
+    Every sharded parameter is a ``DTensor``, so DCP's full state dict materializes all of
+    them (TP, EP and FSDP shards alike). Must be called on all ranks.
     """
-    Internal helper to gather sharded TP/EP/FSDP weights.
-    Must be called on all ranks if TP or EP is enabled.
-    """
-    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    gathered_sd = get_model_state_dict(
+        model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+    )
 
-    raw_state_dict = get_model_state_dict(model, options=options)
-
-    tp_plan = getattr(model, "tp_plan", None)
-    device_mesh = getattr(model, "_device_mesh", None)
-    tp_size = getattr(model, "_tp_size", 1) or 1
-    ep_size = getattr(model, "_ep_size", 1) or 1
-
-    if (tp_plan and device_mesh and tp_size > 1) or ep_size > 1:
-        gathered_sd = {}
-        current_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-        for k, v in raw_state_dict.items():
-            temp_dict = {k: v.to(current_device)}
-            temp_gathered = gather_state_dict_for_save(temp_dict, tp_plan, device_mesh, tp_size)
-            gathered_sd[k] = temp_gathered[k].cpu()
-
-        torch.cuda.empty_cache()
-    else:
-        gathered_sd = raw_state_dict
-
-    if dist.is_initialized():
-        if dist.get_rank() == 0:
-            return gathered_sd
+    if dist.is_initialized() and dist.get_rank() != 0:
         return None
 
     return gathered_sd
