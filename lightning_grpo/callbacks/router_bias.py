@@ -64,14 +64,6 @@ router output, so it covers the realized (post-bias, post-grouped-top-k) load
   so raw ``|b|`` random-walks as ``~0.8 * gamma * sqrt(steps)`` even on a healthy router
   (measured: 0.0437 raw vs 0.0127 centered). ``bias_abs_mean`` is that CENTERED magnitude;
   ``bias_dc`` is the raw per-layer mean, logged only to make the drift visible.
-* ``router/bias_promote_imbalance`` -- which side the centred bias is net working on. The
-  sign is the direction of the router's OWN PRIOR, not of the current load (the bias has
-  already flattened that): ``b_c > 0`` = the raw scores *under*-select the expert, so the
-  bias props it up; ``b_c < 0`` = over-selected, held back. A *mass* split cannot express
-  this (``mass(b+) - mass(|b-|) == sum(b) == E * dc``, and after centring the two masses are
-  equal by construction), so the asymmetry is a HEADCOUNT: ``(P - S) / (P + S)``, ``P``/``S``
-  = experts with ``b_c > 0`` / ``b_c < 0``. 0.0 = the two camps are equally populated,
-  ``> 0`` = more experts propped up than held back; range ``[-1, 1]``.
 * ``router/bias_promote_max`` / ``bias_suppress_max`` -- the two tail extremes, kept because
   they CAN disagree with the headcount and neither alone is conclusive (measured: 73/27 by
   count while suppression was 1.75x stronger per expert). ``bias_abs_max`` was just the larger
@@ -392,9 +384,6 @@ class RouterBiasUpdateCallback(Callback):
             bias_dc = bias.mean()
             centered = bias - bias.mean(dim=-1, keepdim=True)
             bias_abs_mean = centered.abs().mean()
-            # Signed headcount (P - S) / (P + S); all-zero bias still reads 0.0.
-            signs = torch.sign(centered)
-            bias_promote_imbalance = signs.mean() / signs.abs().mean().clamp_min(1.0e-8)
             bias_promote_max = centered.max()
             bias_suppress_max = centered.min()
 
@@ -407,6 +396,5 @@ class RouterBiasUpdateCallback(Callback):
             pl_module.log("router/dead_experts", dead_experts.to(device), **log_kwargs)
             pl_module.log("router/bias_abs_mean", bias_abs_mean.to(device), **log_kwargs)
             pl_module.log("router/bias_dc", bias_dc.to(device), **log_kwargs)
-            pl_module.log("router/bias_promote_imbalance", bias_promote_imbalance.to(device), **log_kwargs)
             pl_module.log("router/bias_promote_max", bias_promote_max.to(device), **log_kwargs)
             pl_module.log("router/bias_suppress_max", bias_suppress_max.to(device), **log_kwargs)
