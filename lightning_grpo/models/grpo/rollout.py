@@ -71,6 +71,7 @@ class LocalGenerateRolloutCoordinator:
             local_rank=context.local_rank,
             global_rank=context.global_rank,
             trust_remote_code=vllm_trust_remote_code,
+            profile_config=context.rollout.profile,
         )
 
     def update_policy(self) -> None:

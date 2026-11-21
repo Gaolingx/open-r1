@@ -78,6 +78,16 @@ class VLLMConfig:
 
 
 @dataclass
+class RolloutProfileConfig:
+    """Wall-clock profiling of rollout generation."""
+
+    #: Report at most once every N rollout calls (1 reports every call).
+    update_every_n_steps: int = 1
+    #: Also acts as the on/off switch: the profiler is built only when this is true.
+    report_to_wandb: bool = False
+
+
+@dataclass
 class GRPORolloutConfig:
     """Rollout and policy-gradient hyperparameters for GRPO.
 
@@ -92,6 +102,7 @@ class GRPORolloutConfig:
     engine: Literal["torch", "vllm"] = "torch"
     vllm: VLLMConfig = field(default_factory=VLLMConfig)
     tool_calling: ToolCallingConfig = field(default_factory=ToolCallingConfig)
+    profile: RolloutProfileConfig = field(default_factory=RolloutProfileConfig)
     num_generations: int = 4
     num_generations_eval: int = 1
     max_prompt_length: int = 1024

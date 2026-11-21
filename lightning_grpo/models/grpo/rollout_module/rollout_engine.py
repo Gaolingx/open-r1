@@ -12,6 +12,7 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel
 from transformers import PreTrainedTokenizerBase
 
+from lightning_grpo.models.grpo.rollout_module.extras.profiling import ProfilingContext
 from lightning_grpo.models.grpo.rollout_module.utils import (
     RolloutEngine,
     RolloutResult,
@@ -22,7 +23,7 @@ from lightning_grpo.models.grpo.rollout_module.utils import (
     detect_fsdp_version,
     sampled_token_logprobs,
 )
-from lightning_grpo.utils.configs.grpo import VLLMConfig
+from lightning_grpo.utils.configs.grpo import RolloutProfileConfig, VLLMConfig
 
 
 # ===== PyTorch Rollout Engine =====
@@ -89,6 +90,7 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
         local_rank: int = 0,
         global_rank: int = 0,
         trust_remote_code: bool = False,
+        profile_config: Optional[RolloutProfileConfig] = None,
     ) -> None:
         from lightning_grpo.models.grpo.rollout_module.vllm.vllm_generation import VLLMGeneration
 
@@ -97,6 +99,18 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
         self.world_size = world_size
         self.local_rank = local_rank
         self.global_rank = global_rank
+        profile_config = profile_config or RolloutProfileConfig()
+        self._profile_every = max(1, int(profile_config.update_every_n_steps))
+        self._profiler = (
+            ProfilingContext(
+                name="vllm_generation.generate",
+                report_to=["wandb"],
+                is_main_process=global_rank == 0,
+            )
+            if profile_config.report_to_wandb
+            else None
+        )
+        self._rollout_calls = 0
         self.generation_config = load_generation_config(sampling_config_path, SimpleNamespace(to_dict=lambda: {}))
         self.generation_config.max_new_tokens = self.generation_config.max_new_tokens or max_completion_length
         self._policy_model = policy_model
@@ -162,6 +176,7 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
                 prompts=repeated_prompts,
                 images=None,
                 num_generations=num_generations,
+                profiler=self._profiler_for_call(),
             )
             per_token_logps_list = sampled_token_logprobs(logprobs, completion_id_lists, logprob_token_ids)
             return self._build_rollout_result(completion_id_lists, per_token_logps_list, prompt_ids.device)
@@ -169,6 +184,16 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
             self.engine.max_completion_length = old_max_completion_length
             self.engine.temperature = old_temperature
             self.engine.top_p = old_top_p
+
+    def _profiler_for_call(self) -> Optional[ProfilingContext]:
+        """Return the profiler on every ``update_every_n_steps``-th rollout call."""
+
+        if self._profiler is None:
+            return None
+        self._rollout_calls += 1
+        if (self._rollout_calls - 1) % self._profile_every != 0:
+            return None
+        return self._profiler
 
     def update_policy(self, model: torch.nn.Module):
         self._policy_model = model
@@ -276,6 +301,7 @@ def create_rollout_engine(
     local_rank: int = 0,
     global_rank: int = 0,
     trust_remote_code: bool = False,
+    profile_config: Optional[RolloutProfileConfig] = None,
     **kwargs: Any,
 ) -> RolloutEngine:
     if engine_type == "torch":
@@ -297,5 +323,6 @@ def create_rollout_engine(
             local_rank=local_rank,
             global_rank=global_rank,
             trust_remote_code=trust_remote_code,
+            profile_config=profile_config,
         )
     raise ValueError(f"Not Support Rollout Engine Type: {engine_type}")
