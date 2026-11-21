@@ -376,6 +376,7 @@ distributed:
   num_nodes: 1
   sync_batchnorm: false
   data_parallel_size: auto
+  data_parallel_replicate_size: 1   # HSDP：DP 轴拆成 replicate × shard，1 = 纯 FSDP
   tensor_parallel_size: auto
   fsdp_reshard_after_forward: default   # default | never | always
   fsdp_cpu_offload: false
@@ -391,6 +392,12 @@ distributed:
 
 - `strategy: fsdp2` / `model_parallel` 走 Lightning `ModelParallelStrategy`，
   分片在 `configure_model()` 里通过 `fully_shard` 完成
+- `data_parallel_size: auto` 在单机等于 `num_nodes`（即 1），**开 FSDP/HSDP 必须显式写 DP 大小**
+- `data_parallel_replicate_size: R > 1` 开启 HSDP：DP 轴拆成
+  `(dp_replicate=R, dp_shard=DP/R)`，`R × S` 必须等于 `data_parallel_size`；
+  replicate 组内 all-reduce、shard 组内 reduce-scatter，权重在各 replica 上必须
+  初始一致（不要在按 rank 区分的随机初始化下开启）。EP 启用时 `efsdp` 也要求能被
+  `R` 整除
 - `ddp` 适合小模型 / LoRA（全参数同步，显存占用高）
 - `fsdp_reshard_after_forward: never` 在显存够时更快（少一次 all-gather）
 - `--gpus N` 会覆盖 `devices`

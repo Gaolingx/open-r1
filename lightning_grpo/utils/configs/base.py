@@ -241,6 +241,7 @@ class DistributedConfig:
     accelerator: Literal["auto", "gpu", "cpu"] = "auto"
     sync_batchnorm: bool = False
     data_parallel_size: int | str = "auto"
+    data_parallel_replicate_size: int = 1
     tensor_parallel_size: int | str = "auto"
     expert_parallel_size: int = 1
     find_unused_parameters: bool = False

@@ -8,7 +8,9 @@ from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecision
 from torch.distributed.device_mesh import DeviceMesh
 import torch
 import torch.nn as nn
+from lightning.pytorch.utilities import rank_zero_info
 
+from lightning_grpo.strategies.hsdp import resolve_hsdp_mesh
 from lightning_grpo.utils.modeling_common import get_transformer_backbone_model
 from lightning_grpo.utils.configs.base import DistributedConfig, PrecisionConfig
 from lightning_grpo.utils.dtype import resolve_torch_dtype
@@ -33,13 +35,26 @@ def configure_fully_shard(
 
     dp_mesh = device_mesh["data_parallel"]
     expert_mesh = getattr(model, "_expert_mesh", None)
+    replicate_size = distributed_config.data_parallel_replicate_size
     if dp_mesh.size() <= 1 and expert_mesh is None:
+        if replicate_size > 1:
+            raise ValueError(
+                "data_parallel_replicate_size > 1 requires a data-parallel size > 1; "
+                "set distributed.data_parallel_size explicitly (its 'auto' default is 1 on a single node)."
+            )
         return
+
+    hsdp_mesh = resolve_hsdp_mesh(dp_mesh, replicate_size)
+    if hsdp_mesh.ndim == 2:
+        rank_zero_info(
+            f"Applying HSDP: dp_replicate={replicate_size}, dp_shard={hsdp_mesh.size() // replicate_size}"
+        )
 
     _apply_fsdp(
         model=model,
-        dp_mesh=dp_mesh,
+        dp_mesh=hsdp_mesh,
         expert_mesh=expert_mesh,
+        expert_replicate_size=replicate_size,
         param_dtype=resolve_torch_dtype(precision_config.fsdp_param_dtype),
         reduce_dtype=resolve_torch_dtype(precision_config.fsdp_reduce_dtype),
         pp_enabled=False,
@@ -53,19 +68,30 @@ def configure_fully_shard(
 
 def _shard_expert_modules(
     model: nn.Module,
-    efsdp_mesh: DeviceMesh,
+    expert_mesh: DeviceMesh,
     dp_size: int,
     mp_policy: MixedPrecisionPolicy,
     shard_kwargs: dict[str, Any],
     cpu_offload: bool,
+    replicate_size: int,
 ) -> None:
     """Shard the EP dispatch modules on the expert view of the ranks.
 
     The experts hold one EP shard per rank, so their FSDP axis is ``efsdp``. An EP
     group holds ``ep_size / tp_size`` distinct batches, hence the expert gradient
-    spans ``dp_size`` batches while its FSDP group only has ``efsdp`` ranks.
+    spans ``dp_size`` batches while its FSDP group only has ``efsdp`` ranks. Under
+    HSDP the ``efsdp`` axis is further split into ``(efsdp_replicate, efsdp_shard)``;
+    the divide factor stays ``dp_size`` because the replicate all-reduce sums the
+    same distinct batches rather than adding new ones.
     """
-    expert_fsdp_config = {"mesh": efsdp_mesh, "mp_policy": mp_policy, **shard_kwargs}
+    efsdp_mesh = resolve_hsdp_mesh(
+        expert_mesh["efsdp"],
+        replicate_size,
+        mesh_dim_names=("efsdp_replicate", "efsdp_shard"),
+    )
+    if "mesh" in shard_kwargs:
+        raise ValueError("fsdp_fully_shard_kwargs must not set 'mesh'; it is derived from the device mesh.")
+    expert_fsdp_config = {"mp_policy": mp_policy, **shard_kwargs, "mesh": efsdp_mesh}
     if cpu_offload:
         expert_fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
@@ -93,13 +119,15 @@ def _apply_fsdp(
     backward_prefetch: bool = True,
     reshard_after_forward_policy: str = "default",
     expert_mesh: DeviceMesh | None = None,
+    expert_replicate_size: int = 1,
 ) -> None:
     """
     Apply data parallelism (via FSDP2) to the model.
 
     Args:
         model (nn.Module): The model to apply data parallelism to.
-        dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
+        dp_mesh (DeviceMesh): The device mesh to use for data parallelism. A 2D
+            ``(replicate, shard)`` mesh enables HSDP.
         param_dtype (torch.dtype): The data type to use for model parameters.
         reduce_dtype (torch.dtype): The data type to use for reduction operations.
         pp_enabled (bool): Whether pipeline parallelism is enabled.
@@ -112,14 +140,20 @@ def _apply_fsdp(
             - "default" applies default resharding behavior, implementing "smart defaults" for known optimal scenarios.
             - "always" will enable `reshard_after_forward` for all forward passes.
             - "never" will disable `reshard_after_forward` for all forward passes.
+        expert_mesh (DeviceMesh | None, optional): The ``(efsdp, expert_parallel)``
+            mesh built by the EP strategy. Defaults to None (EP disabled).
+        expert_replicate_size (int, optional): HSDP replicate degree applied to the
+            expert ``efsdp`` axis. Defaults to 1 (pure FSDP over experts).
 
     """
+    if "mesh" in shard_kwargs:
+        raise ValueError("fsdp_fully_shard_kwargs must not set 'mesh'; it is derived from the device mesh.")
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
         cast_forward_inputs=False,
     )
-    fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy, **shard_kwargs}
+    fsdp_config = {"mp_policy": mp_policy, **shard_kwargs, "mesh": dp_mesh}
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
@@ -130,11 +164,12 @@ def _apply_fsdp(
     if expert_mesh is not None:
         _shard_expert_modules(
             model,
-            expert_mesh["efsdp"],
+            expert_mesh,
             dp_mesh.size(),
             mp_policy,
             shard_kwargs,
             cpu_offload,
+            expert_replicate_size,
         )
 
     if dp_mesh.size() <= 1:
