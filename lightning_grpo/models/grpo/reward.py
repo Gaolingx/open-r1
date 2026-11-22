@@ -16,7 +16,8 @@ if TYPE_CHECKING:
 class GRPORewardManager:
     """Build and evaluate reward functions for GRPO rollouts."""
 
-    def __init__(self, reward: GRPORewardConfig, tokenizer: Any, device: torch.device) -> None:
+    def __init__(self, reward: GRPORewardConfig, tokenizer: Any, device: torch.device, *, training_tp_group: torch.distributed.ProcessGroup | None = None) -> None:
+        self.training_tp_group = training_tp_group
         self.reward = reward
         self.tokenizer = tokenizer
         self.device = device
@@ -83,6 +84,17 @@ class GRPORewardManager:
                     reward_kwargs["solution"] = reward_kwargs[alias]
                     break
 
+        group = self.training_tp_group
+        if group is not None and torch.distributed.get_rank(group) != 0:
+            rewards_per_func = torch.empty((len(completions), len(self.reward_funcs)), device=self.device, dtype=torch.float32)
+        else:
+            rewards_per_func = self._score(prompts, completions, completion_id_lists, reward_kwargs)
+        if group is not None:
+            torch.distributed.broadcast(rewards_per_func, group=group, group_src=0)
+        rewards = (rewards_per_func * self.reward_weight_tensor.to(rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
+        return rewards, rewards_per_func
+
+    def _score(self, prompts, completions, completion_id_lists, reward_kwargs) -> torch.Tensor:
         reward_matrix: list[torch.Tensor] = []
         for reward_fn in self.reward_funcs:
             reward_values = reward_fn(
@@ -95,6 +107,4 @@ class GRPORewardManager:
             reward_tensor = torch.tensor(reward_values, device=torch.device(self.device), dtype=torch.float32)
             reward_matrix.append(reward_tensor)
 
-        rewards_per_func = torch.stack(reward_matrix, dim=-1)
-        rewards = (rewards_per_func * self.reward_weight_tensor.to(rewards_per_func.device).unsqueeze(0)).nansum(dim=-1)
-        return rewards, rewards_per_func
+        return torch.stack(reward_matrix, dim=-1)

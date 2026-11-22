@@ -66,6 +66,9 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         """Snapshot rank/world size and the all-gather service for the GRPO collaborators."""
 
         trainer = self.trainer
+        if self.device_mesh is not None:
+            dp = self.device_mesh["data_parallel"]
+            return DistributedContext(dp.get_local_rank(), dp.size(), lambda tensor: self.all_gather(tensor, group=dp.get_group()))
         if dist.is_initialized():
             rank, world_size = dist.get_rank(), dist.get_world_size()
         else:
@@ -79,6 +82,11 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
 
     def configure_model(self) -> None:
         """Apply tensor parallelism, FSDP2, compile, then initialize the GRPO collaborators."""
+
+        tp = self.device_mesh["tensor_parallel"] if self.device_mesh is not None else None
+        self.training_tp_group = tp.get_group() if tp is not None and tp.size() > 1 else None
+        if self.training_tp_group is not None and (self.config.rollout.engine != "vllm" or self.config.rollout.tool_calling.enabled):
+            raise ValueError("GRPO with training TP > 1 requires vLLM rollout with tool calling disabled.")
 
         # Apply liger kernel
         if self.config.liger_kernel.patch_model_enabled():
@@ -111,8 +119,9 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
                 model=self.config.model,
                 tokenizer=self.tokenizer,
                 device=self.device,
-                world_size=distributed.world_size,
-                global_rank=distributed.rank,
+                world_size=self.trainer.world_size,
+                global_rank=self.global_rank,
+                training_tp_group=self.training_tp_group,
                 local_rank=self.local_rank,
             ),
             policy_provider,
@@ -123,7 +132,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
             configure_tensor_parallel(self.reference_model, self.config.distributed, self.device_mesh)
             configure_fully_shard(self.reference_model, self.config.distributed, self.config.precision, self.device_mesh)
 
-        self.reward_manager = GRPORewardManager(self.config.reward, self.tokenizer, device=self.device)
+        self.reward_manager = GRPORewardManager(self.config.reward, self.tokenizer, device=self.device, training_tp_group=self.training_tp_group)
         self.metrics_aggregator = GRPOMetricsAggregator(
             self,
             clip_reporting=resolve_grpo_algorithm(self.config.rollout).preset.clip_reporting,
@@ -149,6 +158,10 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
         """Generate rollouts, compute GRPO loss, and log metrics."""
 
         training = stage == "train"
+        if self.training_tp_group is not None:
+            payload = [{"prompt_text": batch["prompt_text"], "metadata": batch.get("metadata")}]
+            dist.broadcast_object_list(payload, group=self.training_tp_group, group_src=0, device=self.device)
+            batch = payload[0]
         rollout_batch = self.rollout_coordinator.rollout(batch, training=training)
 
         # Run tool calling loop if enabled and executor is initialized

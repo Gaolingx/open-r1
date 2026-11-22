@@ -34,6 +34,7 @@ class RolloutContext:
     world_size: int
     global_rank: int
     local_rank: int
+    training_tp_group: torch.distributed.ProcessGroup | None = None
 
 
 class LocalGenerateRolloutCoordinator:
@@ -72,6 +73,7 @@ class LocalGenerateRolloutCoordinator:
             global_rank=context.global_rank,
             trust_remote_code=vllm_trust_remote_code,
             profile_config=context.rollout.profile,
+            training_tp_group=context.training_tp_group,
         )
 
     def update_policy(self) -> None:

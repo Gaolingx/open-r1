@@ -91,9 +91,11 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
         global_rank: int = 0,
         trust_remote_code: bool = False,
         profile_config: Optional[RolloutProfileConfig] = None,
+        training_tp_group: dist.ProcessGroup | None = None,
     ) -> None:
         from lightning_grpo.models.grpo.rollout_module.vllm.vllm_generation import VLLMGeneration
 
+        self.training_tp_group = training_tp_group
         self.tokenizer = tokenizer
         self.device = torch.device(device) if isinstance(device, str) else device
         self.world_size = world_size
@@ -179,6 +181,12 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
                 profiler=self._profiler_for_call(),
             )
             per_token_logps_list = sampled_token_logprobs(logprobs, completion_id_lists, logprob_token_ids)
+            if self.training_tp_group is not None:
+                payload = [(completion_id_lists, per_token_logps_list)]
+                dist.broadcast_object_list(payload, group=self.training_tp_group, group_src=0, device=prompt_ids.device)
+                completion_id_lists, per_token_logps_list = payload[0]
+                if per_token_logps_list is None:
+                    raise ValueError("Training TP requires sampled token logprobs from vLLM.")
             return self._build_rollout_result(completion_id_lists, per_token_logps_list, prompt_ids.device)
         finally:
             self.engine.max_completion_length = old_max_completion_length
@@ -302,6 +310,7 @@ def create_rollout_engine(
     global_rank: int = 0,
     trust_remote_code: bool = False,
     profile_config: Optional[RolloutProfileConfig] = None,
+    training_tp_group: dist.ProcessGroup | None = None,
     **kwargs: Any,
 ) -> RolloutEngine:
     if engine_type == "torch":
@@ -324,5 +333,6 @@ def create_rollout_engine(
             global_rank=global_rank,
             trust_remote_code=trust_remote_code,
             profile_config=profile_config,
+            training_tp_group=training_tp_group,
         )
     raise ValueError(f"Not Support Rollout Engine Type: {engine_type}")

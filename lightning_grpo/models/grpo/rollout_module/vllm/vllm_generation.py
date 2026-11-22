@@ -32,6 +32,8 @@ from transformers.utils import (
     is_torch_xpu_available,
 )
 
+from lightning_grpo.utils.ckpt import gather_full_tensor
+
 from ..distributed import DistributedBackend, broadcast_object_list, gather_object
 from ..extras.profiling import ProfilingContext
 from ..import_utils import is_vllm_available
@@ -432,7 +434,7 @@ class VLLMGeneration:
 
             if param.is_cpu:
                 param = param.to(self.accelerator.device)
-            param = param.full_tensor()
+            param = gather_full_tensor(param)
 
             yield name, param
 
