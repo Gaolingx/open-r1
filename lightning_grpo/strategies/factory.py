@@ -24,6 +24,16 @@ def configure_cuda_precision(
 
 
 class _DataParallelMeshStrategy(ModelParallelStrategy):
+    @classmethod
+    def from_config(cls, config: DistributedConfig) -> _DataParallelMeshStrategy:
+        if config.tensor_parallel_size not in {"auto", 1}:
+            raise ValueError("tensor_parallel_size > 1 requires tensor_parallel.enabled=True.")
+        return cls(
+            data_parallel_size=config.data_parallel_size,
+            tensor_parallel_size=1,
+            **config.model_parallel_kwargs,
+        )
+
     def set_world_ranks(self) -> None:
         super().set_world_ranks()
         if self._data_parallel_size == "auto":
@@ -43,15 +53,11 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | ModelParall
             gradient_as_bucket_view=config.gradient_as_bucket_view,
         )
     if config.strategy in {"fsdp2", "model_parallel"}:
-        tp_size = config.tensor_parallel_size
-        strategy = ModelParallelStrategy
         if not config.tensor_parallel.enabled:
-            if tp_size not in {"auto", 1}:
-                raise ValueError("tensor_parallel_size > 1 requires tensor_parallel.enabled=True.")
-            strategy, tp_size = _DataParallelMeshStrategy, 1
-        return strategy(
+            return _DataParallelMeshStrategy.from_config(config)
+        return ModelParallelStrategy(
             data_parallel_size=config.data_parallel_size,
-            tensor_parallel_size=tp_size,
+            tensor_parallel_size=config.tensor_parallel_size,
             **config.model_parallel_kwargs,
         )
     raise ValueError(f"Unknown distributed strategy: {config.strategy}")
