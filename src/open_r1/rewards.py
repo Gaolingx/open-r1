@@ -37,9 +37,16 @@ from .utils.competitive_programming import score_submission as cf_score_submissi
 from .utils.competitive_programming import score_subtask
 
 
+def _assistant_answer(completion):
+    message = completion[-1]
+    if message.get("role", "assistant") != "assistant" or message.get("tool_calls"):
+        return ""
+    return message["content"] or ""
+
+
 def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
     """Reward function that checks if the completion is the same as the ground truth."""
-    contents = [completion[0]["content"] for completion in completions]
+    contents = [_assistant_answer(completion) for completion in completions]
     rewards = []
     for content, sol in zip(contents, solution):
         gold_parsed = parse(
@@ -85,7 +92,7 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
 def format_reward(completions, **kwargs):
     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
     pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
-    completion_contents = [completion[0]["content"] for completion in completions]
+    completion_contents = [_assistant_answer(completion) for completion in completions]
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
@@ -108,7 +115,7 @@ def tag_count_reward(completions, **kwargs) -> list[float]:
             count += 0.25
         return count
 
-    contents = [completion[0]["content"] for completion in completions]
+    contents = [_assistant_answer(completion) for completion in completions]
     return [count_tags(c) for c in contents]
 
 
@@ -122,7 +129,7 @@ def reasoning_steps_reward(completions, **kwargs):
         First,|Second,|Next,|Finally, - matches transition words
     """
     pattern = r"(Step \d+:|^\d+\.|\n-|\n\*|First,|Second,|Next,|Finally,)"
-    completion_contents = [completion[0]["content"] for completion in completions]
+    completion_contents = [_assistant_answer(completion) for completion in completions]
     matches = [len(re.findall(pattern, content)) for content in completion_contents]
 
     # Magic number 3 to encourage 3 steps and more, otherwise partial reward
@@ -143,7 +150,7 @@ def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs)
         - For correct answers: reward = 0.5 - (len - min_len)/(max_len - min_len)
         - For incorrect answers: reward = min(0, 0.5 - (len - min_len)/(max_len - min_len))
     """
-    contents = [completion[0]["content"] for completion in completions]
+    contents = [_assistant_answer(completion) for completion in completions]
 
     # First check correctness of answers
     correctness = []
@@ -226,7 +233,7 @@ def get_cosine_scaled_reward(
             max_value_correct: Maximum reward for correct answers
             max_len: Maximum length for scaling
         """
-        contents = [completion[0]["content"] for completion in completions]
+        contents = [_assistant_answer(completion) for completion in completions]
         rewards = []
 
         for content, sol in zip(contents, solution):
@@ -327,7 +334,7 @@ def get_repetition_penalty_reward(ngram_size: int, max_penalty: float, language:
             completions: List of model completions
         """
 
-        contents = [completion[0]["content"] for completion in completions]
+        contents = [_assistant_answer(completion) for completion in completions]
         rewards = []
         for completion in contents:
             if completion == "":
@@ -385,7 +392,7 @@ def ioi_code_reward(completions, test_batch_size: int = 1, provider_type: str = 
 
     code_snippets = [
         # note: grading is automatically skipped if no code is extracted
-        add_includes(extract_code(completion[-1]["content"], "cpp"), problem_id)
+        add_includes(extract_code(_assistant_answer(completion), "cpp"), problem_id)
         for completion, problem_id in zip(completions, kwargs["id"])
     ]
 
@@ -436,9 +443,9 @@ def cf_code_reward(
     languages = kwargs["language"] if "language" in kwargs else [None] * len(completions)
     code_snippets = [
         # note: grading is automatically skipped if a problem has no tests
-        cf_patch_code(extract_code(completion[-1]["content"], language), language)
+        cf_patch_code(extract_code(_assistant_answer(completion), language), language)
         if patch_code
-        else extract_code(completion[-1]["content"], language)
+        else extract_code(_assistant_answer(completion), language)
         for completion, language in zip(completions, languages)
     ]
 
@@ -566,7 +573,7 @@ def code_reward(
     evaluate_code(code_snippet, test_cases)
     """
 
-    code_snippets = [extract_code(completion[-1]["content"]) for completion in completions]
+    code_snippets = [extract_code(_assistant_answer(completion)) for completion in completions]
     verification_info = kwargs["verification_info"]
 
     template = evaluation_script_template
@@ -603,7 +610,7 @@ def get_code_format_reward(language: str = "python"):
         # if there is a language field, use it instead of the default language. This way we can have mixed language training.
         languages = kwargs["language"] if "language" in kwargs else [language] * len(completions)
 
-        completion_contents = [completion[0]["content"] for completion in completions]
+        completion_contents = [_assistant_answer(completion) for completion in completions]
         matches = [
             re.match(
                 rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{sample_language}.*?```.*?\n</answer>$",

@@ -244,6 +244,7 @@ class VLLMRolloutEngineWrapper(RolloutEngine):
             completion_ids_tensor,
             self.tokenizer.pad_token_id,
             self.tokenizer.eos_token_id,
+            lengths=torch.tensor([len(ids) for ids in completion_ids_list], device=device),
         )
         if logprobs_list is None:
             per_token_logps = torch.empty((completion_ids.size(0), 0), dtype=torch.float32, device=device)

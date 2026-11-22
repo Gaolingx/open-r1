@@ -164,8 +164,7 @@ class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
             batch = payload[0]
         rollout_batch = self.rollout_coordinator.rollout(batch, training=training)
 
-        # Run tool calling loop if enabled and executor is initialized
-        if self.tool_executor is not None:
+        if self.config.rollout.tool_calling.enabled:
             rollout_batch = self._run_tool_calling(rollout_batch)
 
         if self.loss_computer is None or self.metrics_aggregator is None:

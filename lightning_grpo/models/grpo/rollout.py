@@ -328,7 +328,7 @@ class LocalGenerateRolloutCoordinator:
             "sample_ids": sample_ids,
             "prompts": list(prompts),
             "completions": completions,
-            "completion_id_lists": [row[row != tokenizer.pad_token_id].tolist() for row in completion_ids.detach().cpu()],
+            "completion_id_lists": [row[mask.bool()].tolist() for row, mask in zip(completion_ids.detach().cpu(), completion_mask.cpu(), strict=True)],
             "metadata": metadata,
         }
         if baseline is not None:

@@ -76,7 +76,6 @@ class GRPOToolCallMixin:
         """Initialize tool-calling state from ``config.rollout.tool_calling``."""
 
         tool_config = self.config.rollout.tool_calling
-        self.tool_executor = None
         self.max_tool_calling_iterations = int(tool_config.max_iterations)
         self.processing_class = self.tokenizer
         self._tokenizer = self.tokenizer
@@ -132,8 +131,6 @@ class GRPOToolCallMixin:
         if not self._sync_tools and not self._async_tools:
             raise ValueError("rollout.tool_calling.enabled=True requires at least one callable in rollout.tool_calling.tools.")
 
-        self.tool_executor = self
-
     def _start_tool_async_loop(self) -> None:
         """Start a background event loop for async tools."""
 
@@ -178,8 +175,9 @@ class GRPOToolCallMixin:
     def _generate_single_turn(self, prompt_id_lists: list[list[int]]) -> tuple[list[list[int]], list[list[float]] | None]:
         """Generate one assistant turn from already-tokenized prompt states."""
 
-        prompt_ids = pad_sequences(prompt_id_lists, self.tokenizer.pad_token_id, self.device)
-        attention_mask = (prompt_ids != self.tokenizer.pad_token_id).long()
+        prompt_ids = pad_sequences([row[::-1] for row in prompt_id_lists], self.tokenizer.pad_token_id, self.device).flip((1,))
+        lengths = torch.tensor([len(row) for row in prompt_id_lists], device=self.device)
+        attention_mask = (torch.arange(prompt_ids.size(1), device=self.device) >= (prompt_ids.size(1) - lengths[:, None])).long()
         result = self.rollout_engine.generate(
             prompt_ids=prompt_ids,
             attention_mask=attention_mask,
@@ -464,9 +462,6 @@ class GRPOToolCallMixin:
     def _run_tool_calling(self, rollout_batch: dict[str, Any]) -> dict[str, Any]:
         """Execute model-requested tools and rebuild rollout tensors for GRPO loss."""
 
-        if self.tool_executor is None:
-            return rollout_batch
-
         prompt_ids_tensor = rollout_batch["prompt_ids"]
         prompt_mask_tensor = rollout_batch["prompt_mask"]
         prompt_ids = [ids[mask.bool()].detach().cpu().tolist() for ids, mask in zip(prompt_ids_tensor, prompt_mask_tensor, strict=True)]
@@ -493,14 +488,15 @@ class GRPOToolCallMixin:
             completion_ids_tensor = completion_ids_tensor[:, : self.max_completion_length]
             completion_ids = [row[: self.max_completion_length] for row in completion_ids]
             tool_mask = [row[: self.max_completion_length] for row in tool_mask]
-        completion_mask = (completion_ids_tensor != self.tokenizer.pad_token_id).long()
+        lengths = torch.tensor([len(row) for row in completion_ids], device=device)
+        completion_mask = (torch.arange(completion_ids_tensor.size(1), device=device) < lengths[:, None]).long()
         tool_mask_tensor = pad_sequences(tool_mask, 0, device)
         if tool_mask_tensor.size(1) > completion_ids_tensor.size(1):
             tool_mask_tensor = tool_mask_tensor[:, : completion_ids_tensor.size(1)]
         elif tool_mask_tensor.size(1) < completion_ids_tensor.size(1):
             pad_width = completion_ids_tensor.size(1) - tool_mask_tensor.size(1)
             tool_mask_tensor = torch.nn.functional.pad(tool_mask_tensor, (0, pad_width), value=0)
-        completion_id_lists = [ids[mask.bool()].detach().cpu().tolist() for ids, mask in zip(completion_ids_tensor, completion_mask, strict=True)]
+        completion_id_lists = completion_ids
 
         with torch.no_grad():
             old_per_token_logps = compute_per_token_logps(

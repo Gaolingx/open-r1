@@ -159,28 +159,17 @@ def truncate_completions(
     completion_ids: torch.Tensor,
     pad_token_id: int,
     eos_token_id: Optional[int | Sequence[int]],
+    lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]]]:
     """Mask tokens after EOS and extract valid completion token lists."""
 
     eos_token_ids = _resolve_eos_token_ids(eos_token_id)
-    if not eos_token_ids:
-        completion_mask = torch.ones_like(completion_ids, dtype=torch.long)
-        completion_id_lists = [row.tolist() for row in completion_ids]
-        completion_truncated = torch.zeros(completion_ids.size(0), dtype=torch.bool, device=completion_ids.device)
-        return completion_ids, completion_mask, completion_truncated, completion_id_lists
-
-    eos_tensor = torch.tensor(eos_token_ids, dtype=completion_ids.dtype, device=completion_ids.device)
-    is_eos = torch.isin(completion_ids, eos_tensor)
-    eos_idx = torch.full((completion_ids.size(0),), completion_ids.size(1), dtype=torch.long, device=completion_ids.device)
-    has_eos = is_eos.any(dim=1)
-    eos_idx[has_eos] = is_eos.int().argmax(dim=1)[has_eos]
-    token_positions = torch.arange(completion_ids.size(1), device=completion_ids.device).expand(completion_ids.size(0), -1)
-    completion_mask = (token_positions <= eos_idx.unsqueeze(1)).long()
+    positions = torch.arange(completion_ids.size(1), device=completion_ids.device)
+    valid = torch.ones_like(completion_ids, dtype=torch.bool) if lengths is None else positions < lengths[:, None]
+    eos_tensor = completion_ids.new_tensor(eos_token_ids)
+    is_eos = torch.isin(completion_ids, eos_tensor) & valid
+    completion_mask = (valid & (is_eos.long().cumsum(dim=1) - is_eos.long() == 0)).long()
     completion_ids = completion_ids.masked_fill(completion_mask == 0, pad_token_id)
     completion_id_lists = [ids[mask.bool()].tolist() for ids, mask in zip(completion_ids, completion_mask, strict=True)]
-    completion_truncated = torch.tensor(
-        [len(ids) == 0 or ids[-1] not in eos_token_ids for ids in completion_id_lists],
-        device=completion_ids.device,
-        dtype=torch.bool,
-    )
+    completion_truncated = ~is_eos.any(dim=1) if eos_token_ids else is_eos.any(dim=1)
     return completion_ids, completion_mask, completion_truncated, completion_id_lists
