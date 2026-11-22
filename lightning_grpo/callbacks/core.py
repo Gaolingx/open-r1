@@ -86,7 +86,9 @@ class CheckpointCallback(ModelCheckpoint):
             return
 
         lightning_module = trainer.lightning_module
-        model = getattr(lightning_module, "model", lightning_module)
+        model = resolve_export_model(lightning_module)
+        if model is None:
+            model = lightning_module
         full_state_dict = get_gathered_state_dict(model)
 
         if trainer.is_global_zero and full_state_dict is not None:
