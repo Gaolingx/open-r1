@@ -23,6 +23,15 @@ def configure_cuda_precision(
     torch.set_float32_matmul_precision("high" if precision_config.tf32 else "highest")
 
 
+class _DataParallelMeshStrategy(ModelParallelStrategy):
+    def set_world_ranks(self) -> None:
+        super().set_world_ranks()
+        if self._data_parallel_size == "auto":
+            self._data_parallel_size = self.world_size
+        elif self._data_parallel_size != self.world_size:
+            raise ValueError(f"With tensor parallelism disabled, data_parallel_size must equal world_size ({self.world_size}).")
+
+
 def build_strategy(config: DistributedConfig) -> str | DDPStrategy | ModelParallelStrategy:
     """Build the Lightning strategy object from configuration."""
 
@@ -34,9 +43,15 @@ def build_strategy(config: DistributedConfig) -> str | DDPStrategy | ModelParall
             gradient_as_bucket_view=config.gradient_as_bucket_view,
         )
     if config.strategy in {"fsdp2", "model_parallel"}:
-        return ModelParallelStrategy(
+        tp_size = config.tensor_parallel_size
+        strategy = ModelParallelStrategy
+        if not config.tensor_parallel.enabled:
+            if tp_size not in {"auto", 1}:
+                raise ValueError("tensor_parallel_size > 1 requires tensor_parallel.enabled=True.")
+            strategy, tp_size = _DataParallelMeshStrategy, 1
+        return strategy(
             data_parallel_size=config.data_parallel_size,
-            tensor_parallel_size=config.tensor_parallel_size,
+            tensor_parallel_size=tp_size,
             **config.model_parallel_kwargs,
         )
     raise ValueError(f"Unknown distributed strategy: {config.strategy}")

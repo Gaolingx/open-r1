@@ -13,6 +13,28 @@ from lightning_grpo.strategies.hsdp import (
 )
 
 
+@pytest.mark.parametrize('nodes,devices', [(1, 8), (2, 4)])
+def test_fsdp_without_tp_uses_entire_world(nodes, devices):
+    from lightning.fabric.plugins.environments import LightningEnvironment
+    from lightning_grpo.strategies.factory import build_strategy
+    from lightning_grpo.utils.configs.base import DistributedConfig
+
+    strategy = build_strategy(DistributedConfig(strategy='fsdp2'))
+    strategy.cluster_environment = LightningEnvironment()
+    strategy.parallel_devices = [torch.device('cpu')] * devices
+    strategy.num_nodes = nodes
+    strategy.set_world_ranks()
+    assert (strategy._data_parallel_size, strategy._tensor_parallel_size) == (nodes * devices, 1)
+
+
+def test_disabled_tp_rejects_explicit_tp_mesh():
+    from lightning_grpo.strategies.factory import build_strategy
+    from lightning_grpo.utils.configs.base import DistributedConfig
+
+    with pytest.raises(ValueError, match='tensor_parallel.enabled'):
+        build_strategy(DistributedConfig(strategy='model_parallel', tensor_parallel_size=2))
+
+
 @pytest.fixture(autouse=True)
 def _clear_mesh_cache():
     _HSDP_MESH_CACHE.clear()

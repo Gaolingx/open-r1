@@ -31,9 +31,7 @@ def _tp_enabled(distributed_config: DistributedConfig) -> bool:
     tp_cfg = distributed_config.tensor_parallel
     if distributed_config.strategy not in {"fsdp2", "model_parallel"}:
         return False
-    if not tp_cfg.enabled:
-        return False
-    return distributed_config.tensor_parallel_size > 1
+    return tp_cfg.enabled
 
 
 def _qualify_base_model_tp_plan(model: nn.Module, plan: dict[str, str]) -> dict[str, str]:

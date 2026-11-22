@@ -40,7 +40,7 @@ def configure_fully_shard(
         if replicate_size > 1:
             raise ValueError(
                 "data_parallel_replicate_size > 1 requires a data-parallel size > 1; "
-                "set distributed.data_parallel_size explicitly (its 'auto' default is 1 on a single node)."
+                "increase the data-parallel world size or reduce the replication factor."
             )
         return
 
