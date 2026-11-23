@@ -22,10 +22,11 @@ from lightning_grpo.strategies.expert_parallel import configure_expert_parallel
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
+from lightning_grpo.utils.parallel.grad_utils import MixedMeshGradientClippingMixin
 from lightning_grpo.utils.liger_kernel.warpper import apply_liger_kernel
 
 
-class SFTLightningModule(L.LightningModule):
+class SFTLightningModule(MixedMeshGradientClippingMixin, L.LightningModule):
     """Lightning module for decoder-only causal LM SFT."""
 
     def __init__(self, config: SFTConfig) -> None:

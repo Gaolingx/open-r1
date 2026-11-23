@@ -19,6 +19,7 @@ from transformers.optimization import get_scheduler
 
 from lightning_grpo.callbacks.router_bias import RouterBiasUpdateCallback
 from lightning_grpo.utils.modeling_common import load_tokenizer, get_gathered_state_dict, save_pth_weights_direct
+from lightning_grpo.utils.parallel.grad_utils import get_total_grad_norm
 from lightning_grpo.utils.configs.base import LoggingConfig, ModelConfig, TrainingBaseConfig
 from lightning_grpo.utils.modeling import resolve_export_model
 from lightning_grpo.utils.config import save_json_config
@@ -237,9 +238,7 @@ class GradParamNormCallback(Callback):
         # Use ``max_norm=float('inf')`` to compute (but not alter) the global
         # gradient norm.  Lightning applies its own ``gradient_clip_val`` later
         # in the training loop, so we deliberately avoid double‑clipping here.
-        total_norm = torch.nn.utils.clip_grad_norm_(
-            pl_module.parameters(), max_norm=float('inf'), error_if_nonfinite=False,
-        )
+        total_norm = get_total_grad_norm(pl_module.parameters(), error_if_nonfinite=False)
 
         grad_norm = total_norm.detach().to(pl_module.device)
         pl_module.log("train/grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False, sync_dist=False)

@@ -31,10 +31,11 @@ from lightning_grpo.strategies.expert_parallel import configure_expert_parallel
 from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.modeling import load_causal_lm
+from lightning_grpo.utils.parallel.grad_utils import MixedMeshGradientClippingMixin
 from lightning_grpo.utils.liger_kernel.warpper import apply_liger_kernel
 
 
-class DPOLightningModule(L.LightningModule):
+class DPOLightningModule(MixedMeshGradientClippingMixin, L.LightningModule):
     """Lightning module for Direct Preference Optimization.
 
     Uses LigerFusedLinearDPOLoss to fuse the LM head projection with the DPO loss

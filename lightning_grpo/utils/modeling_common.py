@@ -15,6 +15,7 @@ from transformers.trainer_utils import unwrap_peft_model
 from lightning.pytorch.utilities import rank_zero_info
 
 from lightning_grpo.utils.ckpt import gather_full_tensor
+from lightning_grpo.utils.parallel.grad_utils import has_mixed_mesh, iter_group_tensors, split_param_groups_by_mesh
 from lightning_grpo.utils.configs.base import OptimizationConfig, ModelConfig
 
 
@@ -76,10 +77,23 @@ def get_lm_head_model(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def build_optimizer(parameters: Any, optimization: OptimizationConfig) -> torch.optim.Optimizer:
-    """Create the optimizer from configuration."""
+    """Create the optimizer from configuration.
+
+    Parameters are grouped by ``DeviceMesh`` first. TP/FSDP weights are DTensors on
+    the dense mesh, EP experts on the expert mesh, and parameters created outside
+    ``fully_shard`` (router bias, ...) stay plain tensors; a single group mixing
+    them makes the optimizer's fused/foreach kernels raise ``got mixed torch.Tensor
+    and DTensor``. One group per mesh keeps those kernels usable.
+    """
 
     optimizer_config = optimization.optimizer
     optimizer_type = optimizer_config.type.lower()
+
+    parameter_list = [parameters] if isinstance(parameters, torch.Tensor) else list(parameters)
+    if has_mixed_mesh(iter_group_tensors(parameter_list)):
+        parameters = split_param_groups_by_mesh(parameter_list)
+    else:
+        parameters = parameter_list
 
     if optimizer_type in {"adamw8bit", "adam8bit"}:
         try:

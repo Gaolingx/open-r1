@@ -28,10 +28,11 @@ from lightning_grpo.strategies.fsdp2 import configure_fully_shard
 from lightning_grpo.strategies.tensor_parallel import configure_tensor_parallel
 from lightning_grpo.utils.configs.grpo import GRPOConfig
 from lightning_grpo.utils.modeling import load_causal_lm
+from lightning_grpo.utils.parallel.grad_utils import MixedMeshGradientClippingMixin
 from lightning_grpo.utils.liger_kernel.warpper import apply_liger_kernel
 
 
-class GRPOLightningModule(GRPOToolCallMixin, L.LightningModule):
+class GRPOLightningModule(MixedMeshGradientClippingMixin, GRPOToolCallMixin, L.LightningModule):
     """Lightning module for local-rollout GRPO, reasoning RL, and agentic RL."""
 
     def __init__(self, config: GRPOConfig) -> None:
