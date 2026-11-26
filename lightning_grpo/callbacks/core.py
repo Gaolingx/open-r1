@@ -385,6 +385,21 @@ class PeriodicSampleGenerationCallback(Callback):
         completion_ids = generated_ids[:, prompt_length:]
         return tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
 
+    def _render_prompts(self, prompts: list[str]) -> tuple[list[str], bool]:
+        """Render sample prompts through the chat template when the tokenizer has one."""
+
+        if not getattr(self.tokenizer, "chat_template", None):
+            return prompts, True
+        rendered = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for prompt in prompts
+        ]
+        return rendered, False
+
     def on_train_batch_end(
         self,
         trainer: L.Trainer,
@@ -404,7 +419,13 @@ class PeriodicSampleGenerationCallback(Callback):
         if not prompts:
             return
 
-        tokenized = self.tokenizer(prompts, padding=True, return_tensors="pt")
+        texts, add_special_tokens = self._render_prompts(prompts)
+        tokenized = self.tokenizer(
+            texts,
+            padding=True,
+            add_special_tokens=add_special_tokens,
+            return_tensors="pt",
+        )
         device = pl_module.device
         prompt_ids = tokenized["input_ids"].to(device)
         attention_mask = tokenized["attention_mask"].to(device)

@@ -266,6 +266,10 @@ logging:
   sample_max_token: 128
 ```
 
+`sample_prompts` 填裸的用户输入即可：采样时会先用 tokenizer 的 chat template
+渲染（`add_generation_prompt=True`）再送进模型；tokenizer 没有 chat template 时才原样
+tokenize。写死的 `<｜User｜>`/`<|im_start|>` 之类的标记不要自己加，否则会渲染两次。
+
 ### wandb 登录
 
 ```bash
