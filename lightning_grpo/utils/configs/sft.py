@@ -32,10 +32,6 @@ class SFTDataConfig(ChatDataConfig):
 
     completion_only_loss: Optional[bool] = None
     assistant_only_loss: bool = False
-    assistant_response_template: Optional[str] = None
-    assistant_response_template_ids: Optional[list[int]] = None
-    instruction_template: Optional[str] = None
-    instruction_template_ids: Optional[list[int]] = None
     ignore_index: int = -100
     packing_enabled: bool = True
 
